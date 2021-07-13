@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+pub(crate) mod storage;
+
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::fs::{File, OpenOptions};
