@@ -50,12 +50,12 @@ impl Page for Block {
         get_u32(&self.buf, 4)
     }
 
-    fn slots(&self) -> u32 {
+    fn size(&self) -> u32 {
         get_u32(&self.buf, 8)
     }
 
     fn slot(&self, idx: u32) -> Option<Slot> {
-        if idx > self.slots() {
+        if idx > self.size() {
             return None;
         }
         let i =  12 + U32 * 4 * idx as usize;
@@ -87,12 +87,12 @@ impl Page for Block {
     }
 
     fn find(&self, key: &[u8]) -> Option<u32> {
-        let n = self.slots();
+        let n = self.size();
         if n == 0 {
             return None;
         }
 
-        let n = self.slots();
+        let n = self.size();
         let k = bsearch(key, 0, n-1, |i| self.key(i));
         if self.key(k) == key {
             Some(k)
@@ -102,12 +102,12 @@ impl Page for Block {
     }
 
     fn ceil(&self, key: &[u8]) -> Option<u32> {
-        let n = self.slots();
+        let n = self.size();
         if n == 0 {
             return None;
         }
 
-        let n = self.slots();
+        let n = self.size();
         let k = bsearch(key, 0, n-1, |i| self.key(i));
 
         if self.key(k) >= key {
@@ -118,7 +118,7 @@ impl Page for Block {
     }
 
     fn free(&self) -> u32 {
-        let n = self.slots();
+        let n = self.size();
         if n == 0 {
             return self.len() - 3 * U32 as u32;
         }
@@ -144,7 +144,7 @@ impl Page for Block {
         self.find(key).into_iter()
             .for_each(|idx| self.remove(idx));
 
-        let n = self.slots();
+        let n = self.size();
         let mut slots = (0..n).into_iter()
             .filter_map(|idx| self.slot(idx))
             .collect::<Vec<_>>();
@@ -175,7 +175,7 @@ impl Page for Block {
             .enumerate()
             .for_each(|(idx, slot)| put_slot(&mut self.buf, idx as u32, &slot));
 
-        (0..self.slots()).into_iter()
+        (0..self.size()).into_iter()
             .find(|i| self.key(*i as u32) == key)
             .map(|i| i as u32)
     }
@@ -187,7 +187,7 @@ impl Page for Block {
         self.find(key).into_iter()
             .for_each(|idx| self.remove(idx));
 
-        let n = self.slots();
+        let n = self.size();
         let mut slots = (0..n).into_iter()
             .filter_map(|idx| self.slot(idx))
             .collect::<Vec<_>>();
@@ -216,13 +216,13 @@ impl Page for Block {
             .enumerate()
             .for_each(|(idx, slot)| put_slot(&mut self.buf, idx as u32, &slot));
 
-        (0..self.slots()).into_iter()
+        (0..self.size()).into_iter()
             .find(|i| self.key(*i as u32) == key)
             .map(|i| i as u32)
     }
 
     fn remove(&mut self, idx: u32) {
-        let n = self.slots();
+        let n = self.size();
         if idx >= n {
             return;
         }
@@ -260,7 +260,7 @@ impl Page for Block {
     }
 
     fn copy(&self) -> Vec<(Vec<u8>, Vec<u8>, u32)> {
-        (0..self.slots()).into_iter()
+        (0..self.size()).into_iter()
             .filter_map(|idx| self.slot(idx))
             .map(|slot| (
                     get_key(&self.buf, &slot).to_vec(),
@@ -371,7 +371,7 @@ mod tests {
         assert_eq!(page.put_val(k2, v2), Some(0));
         assert_eq!(page.put_ref(k3, p3), Some(2));
 
-        let slots = (0..page.slots())
+        let slots = (0..page.size())
             .into_iter()
             .filter_map(|idx| page.slot(idx))
             .collect::<Vec<_>>();

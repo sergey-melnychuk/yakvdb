@@ -15,7 +15,7 @@ impl Slot {
 pub(crate) trait Page {
     fn id(&self) -> u32;
     fn len(&self) -> u32;
-    fn slots(&self) -> u32;
+    fn size(&self) -> u32;
 
     fn slot(&self, idx: u32) -> Option<Slot>;
 
