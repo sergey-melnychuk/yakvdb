@@ -174,13 +174,13 @@ impl OnDisk {
         format!("{:08x}.dat", file_id.0)
     }
 
-    fn id(path: &PathBuf) -> FileId {
+    fn id(path: &Path) -> FileId {
         let name = path
             .file_name()
             .unwrap()
             .to_str()
             .unwrap()
-            .split(".")
+            .split('.')
             .next()
             .unwrap();
         let id: u32 = u32::from_str_radix(name, 16).unwrap();
@@ -234,7 +234,7 @@ impl OnDisk {
         let path = Path::new(&self.base).join(OnDisk::name(file_id));
         if !self.files.contains_key(file_id) {
             let file = OnDisk::open(&path)?;
-            self.files.insert(file_id.clone(), file);
+            self.files.insert(*file_id, file);
         }
         Ok(self.files.get_mut(file_id).unwrap())
     }

@@ -63,7 +63,7 @@ impl Block {
             .iter()
             .map(|slot| slot.offset)
             .min()
-            .unwrap_or(self.len());
+            .unwrap_or_else(|| self.len());
         let offset = end - klen - vlen;
         let slot = Slot::new(offset, klen, vlen, page);
 
@@ -74,7 +74,7 @@ impl Block {
         put_size(&mut self.buf, size + 1);
 
         put_slice(&mut self.buf, offset as usize, key);
-        if val.len() > 0 {
+        if !val.is_empty() {
             put_slice(&mut self.buf, offset as usize + key.len(), val);
         }
 
@@ -215,21 +215,21 @@ impl Page for Block {
         let total: u32 = slots.iter().map(|slot| slot.klen + slot.vlen).sum();
         let mut offset = self.len() - total;
 
-        let copy: Vec<(Vec<u8>, Vec<u8>)> = slots
+        let copy = slots
             .iter()
             .map(|slot| {
                 (
-                    get_key(&mut self.buf, slot).to_vec(),
-                    get_val(&mut self.buf, slot).to_vec(),
+                    get_key(&self.buf, slot).to_vec(),
+                    get_val(&self.buf, slot).to_vec(),
                 )
             })
             .collect::<Vec<_>>();
 
-        for (i, (key, val)) in copy.into_iter().enumerate().rev() {
+        for (i, (key, val)) in copy.iter().enumerate().rev() {
             slots.get_mut(i).unwrap().offset = offset;
-            put_slice(&mut self.buf, offset as usize, &key);
+            put_slice(&mut self.buf, offset as usize, key);
             offset += key.len() as u32;
-            put_slice(&mut self.buf, offset as usize, &val);
+            put_slice(&mut self.buf, offset as usize, val);
             offset += val.len() as u32;
         }
 
@@ -289,7 +289,7 @@ fn put_size(buf: &mut BytesMut, val: u32) {
 
 fn put_slot(buf: &mut BytesMut, idx: u32, slot: &Slot) {
     let pos = HEAD + idx as usize * SLOT;
-    put_u32(buf, pos + 0, slot.offset);
+    put_u32(buf, pos, slot.offset);
     put_u32(buf, pos + 4, slot.klen);
     put_u32(buf, pos + 8, slot.vlen);
     put_u32(buf, pos + 12, slot.page);

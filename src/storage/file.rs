@@ -68,11 +68,19 @@ impl Tree for File {
         todo!()
     }
 
-    fn root(&self) -> &mut dyn Page {
+    fn root(&self) -> &dyn Page {
         todo!()
     }
 
-    fn page(&self, _id: u32) -> Option<&mut dyn Page> {
+    fn root_mut(&mut self) -> &mut dyn Page {
+        todo!()
+    }
+
+    fn page(&self, _id: u32) -> Option<&dyn Page> {
+        todo!()
+    }
+
+    fn page_mut(&mut self, _id: u32) -> Option<&mut dyn Page> {
         todo!()
     }
 

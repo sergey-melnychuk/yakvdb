@@ -5,8 +5,12 @@ pub(crate) trait Tree {
     fn insert(&mut self, key: &[u8], val: &[u8]);
     fn remove(&mut self, key: &[u8]);
 
-    fn root(&self) -> &mut dyn Page;            // TODO wrap in api::error::Result<>?
-    fn page(&self, id: u32) -> Option<&mut dyn Page>;
+    fn root(&self) -> &dyn Page;                // TODO wrap in api::error::Result<>?
+    fn root_mut(&mut self) -> &mut dyn Page;    // TODO wrap in api::error::Result<>?
+
+    fn page(&self, id: u32) -> Option<&dyn Page>;               // TODO wrap in api::error::Result<>?
+    fn page_mut(&mut self, id: u32) -> Option<&mut dyn Page>;   // TODO wrap in api::error::Result<>?
+
     fn push<P: Page>(&mut self, page: &P);      // TODO return api::error::Result<()>?
 
     /// Return next available page id.
