@@ -15,14 +15,14 @@ impl AsMut<[u8]> for Block {
 
 impl AsRef<[u8]> for Block {
     fn as_ref(&self) -> &[u8] {
-        self.buf.as_ref()
+        &self.buf[..]
     }
 }
 
 impl Block {
-    pub(crate) fn reserve(capacity: usize) -> Self {
-        let mut buf = BytesMut::with_capacity(capacity);
-        buf.extend_from_slice(&vec![0u8; capacity]);
+    pub(crate) fn reserve(capacity: u32) -> Self {
+        let mut buf = BytesMut::with_capacity(capacity as usize);
+        buf.extend_from_slice(&vec![0u8; capacity as usize]);
         Self { buf }
     }
 

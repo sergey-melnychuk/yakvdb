@@ -37,7 +37,7 @@ impl Slot {
     }
 }
 
-pub(crate) trait Page {
+pub(crate) trait Page: AsRef<[u8]> {
     fn id(&self) -> u32;
 
     /// Current page's length in bytes.
