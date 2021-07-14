@@ -15,6 +15,26 @@ impl Slot {
             page,
         }
     }
+
+    pub(crate) fn empty() -> Self {
+        Self {
+            offset: 0,
+            klen: 0,
+            vlen: 0,
+            page: 0,
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.offset == 0 && self.klen == 0 && self.vlen == 0 && self.page == 0
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.offset = 0;
+        self.klen = 0;
+        self.vlen = 0;
+        self.page = 0;
+    }
 }
 
 pub(crate) trait Page {

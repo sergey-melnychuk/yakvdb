@@ -35,6 +35,54 @@ impl Block {
         buf.extend_from_slice(&vec![0u8; len as usize - HEAD]);
         Self { buf }
     }
+
+    fn put_val_or_ref(&mut self, key: &[u8], val: &[u8], page: u32) -> Option<u32> {
+        if !self.fits((key.len() + val.len()) as u32) {
+            return None;
+        }
+        self.find(key).into_iter().for_each(|idx| self.remove(idx));
+
+        let n = self.size();
+        let mut slots = (0..n)
+            .into_iter()
+            .filter_map(|idx| self.slot(idx))
+            .collect::<Vec<_>>();
+
+        let klen = key.len() as u32;
+        let vlen = val.len() as u32;
+        let end = slots
+            .iter()
+            .map(|slot| slot.offset)
+            .min()
+            .unwrap_or(self.len());
+        let offset = end - klen - vlen;
+
+        put_slice(&mut self.buf, offset as usize, key);
+        if val.len() > 0 {
+            put_slice(&mut self.buf, offset as usize + key.len(), val);
+        }
+
+        let slot = Slot::new(offset, klen, vlen, page);
+        slots.push(slot);
+        // TODO Avoid sorting, use ceil + insert instead
+        slots.sort_by_key(|slot| {
+            let lo = slot.offset as usize;
+            let hi = lo + slot.klen as usize;
+            &self.buf[lo..hi]
+        });
+
+        put_u32(&mut self.buf, 8, n + 1);
+
+        slots
+            .into_iter()
+            .enumerate()
+            .for_each(|(idx, slot)| put_slot(&mut self.buf, idx as u32, &slot));
+
+        (0..self.size())
+            .into_iter()
+            .find(|i| self.key(*i as u32) == key)
+            .map(|i| i as u32)
+    }
 }
 
 impl Page for Block {
@@ -135,93 +183,11 @@ impl Page for Block {
     }
 
     fn put_val(&mut self, key: &[u8], val: &[u8]) -> Option<u32> {
-        if !self.fits((key.len() + val.len()) as u32) {
-            return None;
-        }
-        self.find(key).into_iter().for_each(|idx| self.remove(idx));
-
-        let n = self.size();
-        let mut slots = (0..n)
-            .into_iter()
-            .filter_map(|idx| self.slot(idx))
-            .collect::<Vec<_>>();
-
-        let klen = key.len() as u32;
-        let vlen = val.len() as u32;
-        let end = slots
-            .iter()
-            .map(|slot| slot.offset)
-            .min()
-            .unwrap_or(self.len());
-        let offset = end - klen - vlen;
-
-        put_slice(&mut self.buf, offset as usize, key);
-        put_slice(&mut self.buf, offset as usize + key.len(), val);
-
-        let slot = Slot::new(offset, klen, vlen, 0);
-        slots.push(slot);
-        // TODO Avoid sorting, use ceil + insert instead
-        slots.sort_by_key(|slot| {
-            let lo = slot.offset as usize;
-            let hi = lo + slot.klen as usize;
-            &self.buf[lo..hi]
-        });
-
-        put_u32(&mut self.buf, 8, n + 1);
-
-        slots
-            .into_iter()
-            .enumerate()
-            .for_each(|(idx, slot)| put_slot(&mut self.buf, idx as u32, &slot));
-
-        (0..self.size())
-            .into_iter()
-            .find(|i| self.key(*i as u32) == key)
-            .map(|i| i as u32)
+        self.put_val_or_ref(key, val, 0)
     }
 
     fn put_ref(&mut self, key: &[u8], page: u32) -> Option<u32> {
-        if !self.fits(key.len() as u32) {
-            return None;
-        }
-        self.find(key).into_iter().for_each(|idx| self.remove(idx));
-
-        let n = self.size();
-        let mut slots = (0..n)
-            .into_iter()
-            .filter_map(|idx| self.slot(idx))
-            .collect::<Vec<_>>();
-
-        let klen = key.len() as u32;
-        let end = slots
-            .iter()
-            .map(|slot| slot.offset)
-            .min()
-            .unwrap_or(self.len());
-        let offset = end - klen;
-
-        put_slice(&mut self.buf, offset as usize, key);
-
-        let slot = Slot::new(offset, klen, 0, page);
-        slots.push(slot);
-        // TODO Avoid sorting, use ceil + insert instead
-        slots.sort_by_key(|slot| {
-            let lo = slot.offset as usize;
-            let hi = lo + slot.klen as usize;
-            &self.buf[lo..hi]
-        });
-
-        put_u32(&mut self.buf, 8, n + 1);
-
-        slots
-            .into_iter()
-            .enumerate()
-            .for_each(|(idx, slot)| put_slot(&mut self.buf, idx as u32, &slot));
-
-        (0..self.size())
-            .into_iter()
-            .find(|i| self.key(*i as u32) == key)
-            .map(|i| i as u32)
+        self.put_val_or_ref(key, &[], page)
     }
 
     fn remove(&mut self, idx: u32) {
@@ -321,6 +287,7 @@ fn put_slot(buf: &mut BytesMut, idx: u32, slot: &Slot) {
 // unsigned int trait bound inspired by:
 // https://users.rust-lang.org/t/difficulty-creating-numeric-trait/34345/4
 // https://play.rust-lang.org/?version=stable&mode=debug&edition=2018&gist=1d5c85adec6bdc0eae9f57c74d123dd1
+// TODO extract to utils?
 trait UInt:
     Copy
     + Ord
@@ -341,6 +308,7 @@ impl UInt for u32 {}
 impl UInt for u64 {}
 impl UInt for u128 {}
 
+// TODO extract to utils?
 fn bsearch<T: Ord, I: UInt, F: Fn(I) -> T>(key: T, mut lo: I, mut hi: I, f: F) -> I {
     while lo < hi {
         let mid = lo + (hi - lo) / I::from(2);
@@ -362,10 +330,112 @@ fn bsearch<T: Ord, I: UInt, F: Fn(I) -> T>(key: T, mut lo: I, mut hi: I, f: F) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::prelude::*;
+    use std::collections::HashSet;
 
     #[test]
-    fn test_slot_size() {
-        assert_eq!(size_of::<Slot>(), 4 * size_of::<u32>());
+    fn test_sizes() {
+        assert_eq!(U32, 4);
+        assert_eq!(SLOT, 16);
+        assert_eq!(HEAD, 12);
+    }
+
+    #[test]
+    fn test_sorted() {
+        let mut rng = thread_rng();
+
+        let size = 32;
+        let len = size * size_of::<u64>() * 4;
+
+        let mut keys = (0..size).into_iter()
+            .map(|_| rng.gen::<u64>().to_be_bytes().to_vec())
+            .collect::<Vec<_>>();
+
+        let mut page = Block::create(42, len as u32);
+
+        for (i, key) in keys.iter().enumerate() {
+            if i % 2 == 0 {
+                page.put_ref(key, 42).unwrap();
+            } else {
+                page.put_val(key, b"undefined").unwrap();
+            }
+        }
+
+        keys.sort();
+
+        let read = (0..size).into_iter()
+            .map(|idx| page.key(idx as u32).to_vec())
+            .collect::<Vec<_>>();
+
+        assert_eq!(read, keys);
+    }
+
+    #[test]
+    fn test_find() {
+        let mut rng = thread_rng();
+
+        let size = 64;
+        let len = size * size_of::<u64>() * 10;
+
+        let keys = (0..size).into_iter()
+            .map(|_| rng.gen::<u64>())
+            .collect::<HashSet<_>>();
+
+        let pairs = keys.iter()
+            .map(|k|
+                (
+                    k.to_be_bytes().to_vec(),
+                    rng.gen::<u64>().to_be_bytes().to_vec()
+                )
+            )
+            .collect::<Vec<_>>();
+
+        let mut page = Block::create(42, len as u32);
+        for (key, val) in pairs.iter() {
+            page.put_val(key, val).unwrap();
+        }
+
+        for (key, val) in pairs.iter() {
+            let idx = page.find(key).unwrap();
+            assert_eq!(page.key(idx), key);
+            assert_eq!(page.val(idx), val);
+        }
+
+    }
+
+    #[test]
+    fn test_ceil() {
+        let mut rng = thread_rng();
+
+        let size = 64;
+        let len = size * size_of::<u64>() * 10;
+
+        let keys = (0..size).into_iter()
+            .map(|_| {
+                let x = rng.gen::<u64>();
+                x - (x % 100)
+            })
+            .collect::<Vec<_>>();
+
+        let mut page = Block::create(42, len as u32);
+        for key in keys.iter() {
+            page.put_ref(&key.to_be_bytes(), 42).unwrap();
+        }
+
+        for k in keys.iter() {
+            let r = rng.gen::<u64>() % 100;
+            let key = &(k - r).to_be_bytes();
+
+            let exp = &k.to_be_bytes();
+            let idx = page.ceil(key).unwrap();
+            assert_eq!(page.key(idx), exp);
+
+            let idx = page.ceil(exp).unwrap();
+            assert_eq!(page.key(idx), exp);
+        }
+
+        let missing = keys.iter().max().cloned().unwrap() + 1;
+        assert_eq!(page.ceil(&missing.to_be_bytes()), None);
     }
 
     #[test]
@@ -449,8 +519,8 @@ mod tests {
         assert_eq!(page.ceil(b"z"), None);
 
         let free = len
-            - 3 * U32 as u32   // header: 3 x u32
-            - 3 * SLOT as u32  // 3 slots: 3 x 4 x u32
+            - HEAD as u32
+            - 3 * SLOT as u32
             - k1.len() as u32 - v1.len() as u32
             - k2.len() as u32 - v2.len() as u32
             - k3.len() as u32;
