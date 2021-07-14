@@ -34,7 +34,7 @@ pub(crate) trait Page {
     fn ceil(&self, key: &[u8]) -> Option<u32>;
 
     /// Get total number of unoccupied bytes in the page.
-    /// This does not mean payload of same size can fit the page.
+    /// Use `fits` to check if page really has enough free space to store a key-value pair.
     fn free(&self) -> u32;
 
     /// Check if payload (key and value) of given size can fit the page,
@@ -50,7 +50,7 @@ pub(crate) trait Page {
     fn put_ref(&mut self, key: &[u8], page: u32) -> Option<u32>;
 
     /// Remove the slot of a given index and return key-value stored there.
-    /// Automatic defragmentation is performed then to maximize available capacity.
+    /// Automatic defragmentation is performed to maximize available capacity.
     fn remove(&mut self, idx: u32);
 
     fn copy(&self) -> Vec<(Vec<u8>, Vec<u8>, u32)>;
