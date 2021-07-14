@@ -1,5 +1,5 @@
+use crate::api::page::Page;
 use crate::storage::block::Block;
-use crate::storage::page::Page;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io;

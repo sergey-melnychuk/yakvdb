@@ -2,6 +2,7 @@
 
 pub(crate) mod storage;
 pub(crate) mod util;
+pub(crate) mod api;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;

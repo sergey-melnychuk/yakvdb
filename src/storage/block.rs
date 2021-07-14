@@ -1,4 +1,4 @@
-use crate::storage::page::{Page, Slot};
+use crate::api::page::{Page, Slot};
 use crate::util::bsearch::bsearch;
 use bytes::{BufMut, BytesMut};
 use std::mem::size_of;
