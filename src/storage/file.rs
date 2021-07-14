@@ -11,14 +11,13 @@ struct File {
 }
 
 impl File {
-    fn open(path: &Path) -> Self {
+    fn open(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
-            .open(path)
-            .unwrap();
-        Self { file }
+            .open(path)?;
+        Ok(Self { file })
     }
 
     fn load(&mut self, offset: usize, length: usize) -> io::Result<impl Page> {
@@ -45,8 +44,11 @@ mod tests {
     }
 
     #[test]
-    fn test_file() {
+    fn test_file() -> io::Result<()> {
         let path = Path::new("target/file_test.tmp");
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
         let size: u32 = 256;
 
         {
@@ -59,12 +61,12 @@ mod tests {
             page.put_ref(b"yyy", 2222);
             page.put_ref(b"xxx", 3333);
 
-            let mut file = File::open(path);
+            let mut file = File::open(path)?;
             file.save(&page).unwrap();
         }
 
         let mut page = {
-            let mut file = File::open(path);
+            let mut file = File::open(path)?;
             file.load(0, size as usize).unwrap()
         };
 
@@ -94,5 +96,7 @@ mod tests {
 
         page.remove(page.find(b"zzz").unwrap());
         assert_eq!(get(&page, b"zzz"), None);
+
+        Ok(())
     }
 }
