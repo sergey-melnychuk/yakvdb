@@ -31,6 +31,8 @@ impl Block {
         buf.put_u32(id);
         buf.put_u32(len);
         buf.put_u32(0);
+        buf.put_u32(0);
+        assert_eq!(buf.len(), HEAD);
         buf.extend_from_slice(&vec![0u8; len as usize - HEAD]);
         Self { buf }
     }
@@ -125,6 +127,32 @@ impl Page for Block {
             .unwrap_or_default()
     }
 
+    fn free(&self) -> u32 {
+        let size = self.size();
+        if size == 0 {
+            return self.len() - HEAD as u32;
+        }
+        let lo = HEAD as u32 + size * SLOT as u32;
+        let hi = (0..size)
+            .into_iter()
+            .filter_map(|idx| self.slot(idx))
+            .map(|slot| slot.offset)
+            .min()
+            .unwrap_or(lo);
+
+        assert!(lo <= hi);
+        hi - lo
+    }
+
+    fn full(&self) -> u8 {
+        let len = self.len() - HEAD as u32;
+        ((len - self.free()) * 100 / len) as u8
+    }
+
+    fn fits(&self, len: u32) -> bool {
+        self.free() >= len + SLOT as u32
+    }
+
     fn find(&self, key: &[u8]) -> Option<u32> {
         let n = self.size();
         if n == 0 {
@@ -151,27 +179,6 @@ impl Page for Block {
         } else {
             None
         }
-    }
-
-    fn free(&self) -> u32 {
-        let size = self.size();
-        if size == 0 {
-            return self.len() - 3 * U32 as u32;
-        }
-        let lo = (3 + size * 4) * U32 as u32;
-        let hi = (0..size)
-            .into_iter()
-            .filter_map(|idx| self.slot(idx))
-            .map(|slot| slot.offset)
-            .min()
-            .unwrap_or(lo);
-
-        assert!(lo <= hi);
-        hi - lo
-    }
-
-    fn fits(&self, len: u32) -> bool {
-        self.free() >= len + 4 * U32 as u32
     }
 
     fn put_val(&mut self, key: &[u8], val: &[u8]) -> Option<u32> {
@@ -241,7 +248,7 @@ impl Page for Block {
 
 const U32: usize = size_of::<u32>();
 const SLOT: usize = size_of::<Slot>();
-const HEAD: usize = 3 * U32;    // page header: id, length and size
+const HEAD: usize = 4 * U32;    // page header: id, length, size, reserved
 
 fn get_u32(buf: &BytesMut, pos: usize) -> u32 {
     let mut src = [0u8; U32];
@@ -290,7 +297,7 @@ mod tests {
     fn test_sizes() {
         assert_eq!(U32, 4);
         assert_eq!(SLOT, 16);
-        assert_eq!(HEAD, 12);
+        assert_eq!(HEAD, 16);
     }
 
     #[test]
@@ -392,6 +399,43 @@ mod tests {
     }
 
     #[test]
+    fn test_size() {
+        let mut rng = thread_rng();
+        let count = 32;
+
+        let pairs = (0..count).into_iter()
+            .map(|_| (
+                rng.next_u64().to_be_bytes().to_vec(),
+                rng.next_u64().to_be_bytes().to_vec()
+            ))
+            .collect::<Vec<_>>();
+
+        let len = pairs.iter()
+            .map(|(k, v)| k.len() + v.len())
+            .sum::<usize>()
+            + HEAD
+            + pairs.len() * SLOT;
+
+        let mut page = Block::create(42, len as u32);
+        assert_eq!(page.free(), len as u32 - HEAD as u32);
+        assert_eq!(page.full(), 0);
+
+        let half = count / 2;
+        for (k, v) in pairs.iter().take(half) {
+            page.put_val(k, v).unwrap();
+        }
+        let free = half * (size_of::<u64>() * 2 + SLOT);
+        assert_eq!(page.free(), free as u32);
+        assert_eq!(page.full(), 50);
+
+        for (k, v) in pairs.iter().skip(half) {
+            page.put_val(k, v).unwrap();
+        }
+        assert_eq!(page.free(), 0);
+        assert_eq!(page.full(), 100);
+    }
+
+    #[test]
     fn test_page() {
         let k1 = b"bb-cc-dd-ee";
         let v1 = b"0000-1111-2222";
@@ -410,7 +454,7 @@ mod tests {
         assert_eq!(page.buf.len(), len as usize);
         assert_eq!(
             &page.buf[0..HEAD],
-            &[0, 0, 0, id as u8, 0, 0, 0, len as u8, 0, 0, 0, 0]
+            &[0, 0, 0, id as u8, 0, 0, 0, len as u8, 0, 0, 0, 0, 0, 0, 0, 0]
         );
 
         assert_eq!(page.put_val(k1, v1), Some(0));

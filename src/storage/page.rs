@@ -39,27 +39,34 @@ impl Slot {
 
 pub(crate) trait Page {
     fn id(&self) -> u32;
+
+    /// Current page's length in bytes.
     fn len(&self) -> u32;
+
+    /// Number of entries (and slots) stored in the page.
     fn size(&self) -> u32;
 
     fn slot(&self, idx: u32) -> Option<Slot>;
-
     fn key(&self, idx: u32) -> &[u8];
     fn val(&self, idx: u32) -> &[u8];
+
+    /// Get total number of unoccupied bytes in the page.
+    /// Use `fits` to check if page really has enough free space to store a key-value pair.
+    fn free(&self) -> u32;
+
+    /// Get integer percent value (0..=100) of how full the page is.
+    /// Effectively this is equal to `(len() - free() * 100) / len()`.
+    fn full(&self) -> u8;
+
+    /// Check if payload (key and value) of given size can fit the page,
+    /// taking into account necessary housekeeping overhead.
+    fn fits(&self, len: u32) -> bool;
 
     /// Find a slot with exact match to a given key (if any).
     fn find(&self, key: &[u8]) -> Option<u32>;
 
     /// Find a slot with the smallest key greater or equal to a given key.
     fn ceil(&self, key: &[u8]) -> Option<u32>;
-
-    /// Get total number of unoccupied bytes in the page.
-    /// Use `fits` to check if page really has enough free space to store a key-value pair.
-    fn free(&self) -> u32;
-
-    /// Check if payload (key and value) of given size can fit the page,
-    /// taking into account necessary housekeeping overhead.
-    fn fits(&self, len: u32) -> bool;
 
     /// Put a key-value pair into the page.
     /// Returns slot index if operation was successful.
@@ -73,5 +80,6 @@ pub(crate) trait Page {
     /// Automatic defragmentation is performed to maximize available capacity.
     fn remove(&mut self, idx: u32);
 
+    /// Make an owned copy of all entries in the page: (key, val, page).
     fn copy(&self) -> Vec<(Vec<u8>, Vec<u8>, u32)>;
 }
