@@ -30,7 +30,7 @@ struct File {
 const MAGIC: &[u8] = b"YAKVDB42";
 
 const HEAD: usize = MAGIC.len() + size_of::<Head>();
-const ROOT: u32 = HEAD as u32;
+const ROOT: u32 = 1;
 
 #[derive(Debug)]
 #[repr(C)]
@@ -127,7 +127,7 @@ impl File {
         Ok(this)
     }
 
-    fn load(&self, offset: usize, length: u32) -> io::Result<impl Page> {
+    fn load(&self, offset: usize, length: u32) -> io::Result<Block> {
         let mut page = Block::reserve(length as u32);
         self.file.borrow_mut().seek(SeekFrom::Start(offset as u64))?;
         self.file.borrow_mut().read_exact(page.as_mut())?;
@@ -135,9 +135,13 @@ impl File {
     }
 
     fn save(&self, page: &dyn Page) -> io::Result<()> {
-        let offset = page.id() as u64;
+        let offset = self.offset(page.id()) as u64;
         self.file.borrow_mut().seek(SeekFrom::Start(offset))?;
         self.file.borrow_mut().write_all(page.as_ref())
+    }
+
+    fn offset(&self, id: u32) -> usize {
+        HEAD + (id - 1) as usize * self.head.page_bytes as usize
     }
 }
 
@@ -154,7 +158,7 @@ impl Tree for File {
             if slot.page == 0 {
                 // Log how deep the lookup went into the tree depth: seen.len()
                 return page.find(key)
-                    .map(move |idx| page.key(idx));
+                    .map(|idx| page.key(idx));
             } else {
                 if seen.contains(&slot.page) {
                     // TODO log error: circular reference is detected between pages
@@ -253,9 +257,7 @@ impl Tree for File {
 
     fn page_mut(&mut self, id: u32) -> Option<&mut dyn Page> {
         if !self.cache.contains_key(&id) {
-            let mut page = Block::reserve(self.head.page_bytes);
-            self.file.borrow_mut().seek(SeekFrom::Start(id as u64)).ok()?;
-            self.file.borrow_mut().read_exact(page.as_mut()).ok()?;
+            let page = self.load(self.offset(id), self.head.page_bytes).ok()?;
             self.cache.insert(id, page);
         }
         let page: &mut dyn Page = self.cache.get_mut(&id).unwrap();
@@ -318,7 +320,7 @@ mod tests {
 
         let mut page = {
             let file = File::open(path).unwrap();
-            file.load(HEAD, size).unwrap()
+            file.load(file.offset(ROOT), size).unwrap()
         };
 
         assert_eq!(
