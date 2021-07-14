@@ -1,6 +1,6 @@
 use crate::api::page::Page;
 use crate::api::tree::Tree;
-use crate::storage::block::Block;
+use crate::disk::block::Block;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io;
