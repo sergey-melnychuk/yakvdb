@@ -32,7 +32,7 @@ impl Block {
         buf.put_u32(id);
         buf.put_u32(len);
         buf.put_u32(0);
-        buf.extend_from_slice(&vec![0u8; (len - 12) as usize]);
+        buf.extend_from_slice(&vec![0u8; len as usize - HEAD]);
         Self { buf }
     }
 }
@@ -54,7 +54,7 @@ impl Page for Block {
         if idx > self.size() {
             return None;
         }
-        let i = 12 + U32 * 4 * idx as usize;
+        let i = HEAD + U32 * 4 * idx as usize;
         let offset = get_u32(&self.buf, i);
         let klen = get_u32(&self.buf, i + 4);
         let vlen = get_u32(&self.buf, i + 8);
@@ -283,6 +283,7 @@ impl Page for Block {
 
 const U32: usize = size_of::<u32>();
 const SLOT: usize = size_of::<Slot>();
+const HEAD: usize = 3 * U32;    // page header: id, length and size
 
 fn get_u32(buf: &BytesMut, pos: usize) -> u32 {
     let mut src = [0u8; U32];
@@ -310,7 +311,7 @@ fn put_slice(buf: &mut BytesMut, pos: usize, src: &[u8]) {
 }
 
 fn put_slot(buf: &mut BytesMut, idx: u32, slot: &Slot) {
-    let pos = (12 + idx * SLOT as u32) as usize;
+    let pos = HEAD + idx as usize * SLOT;
     put_u32(buf, pos + 0, slot.offset);
     put_u32(buf, pos + 4, slot.klen);
     put_u32(buf, pos + 8, slot.vlen);
@@ -385,7 +386,7 @@ mod tests {
         assert_eq!(page.len(), len);
         assert_eq!(page.buf.len(), len as usize);
         assert_eq!(
-            &page.buf[0..12],
+            &page.buf[0..HEAD],
             &[0, 0, 0, id as u8, 0, 0, 0, len as u8, 0, 0, 0, 0]
         );
 
@@ -448,8 +449,8 @@ mod tests {
         assert_eq!(page.ceil(b"z"), None);
 
         let free = len
-            - 12        // header: 3 x u32
-            - 3 * 16    // 3 slots: 3 x 4 x u32
+            - 3 * U32 as u32   // header: 3 x u32
+            - 3 * SLOT as u32  // 3 slots: 3 x 4 x u32
             - k1.len() as u32 - v1.len() as u32
             - k2.len() as u32 - v2.len() as u32
             - k3.len() as u32;
