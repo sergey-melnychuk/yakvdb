@@ -84,7 +84,7 @@ impl Tree for File {
         todo!()
     }
 
-    fn push<P: Page>(&mut self, _page: &P) {
+    fn flush<P: Page>(&mut self, _page: &P) {
         todo!()
     }
 
