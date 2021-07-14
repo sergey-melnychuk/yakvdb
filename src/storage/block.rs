@@ -42,8 +42,9 @@ impl Block {
         }
         self.find(key).into_iter().for_each(|idx| self.remove(idx));
 
-        let n = self.size();
-        let mut slots = (0..n)
+        let size = self.size();
+
+        let mut slots = (0..size)
             .into_iter()
             .filter_map(|idx| self.slot(idx))
             .collect::<Vec<_>>();
@@ -71,7 +72,7 @@ impl Block {
             &self.buf[lo..hi]
         });
 
-        put_u32(&mut self.buf, 8, n + 1);
+        put_size(&mut self.buf, size + 1);
 
         slots
             .into_iter()
@@ -200,7 +201,7 @@ impl Page for Block {
 
         slots.remove(idx as usize);
 
-        put_u32(&mut self.buf, 8, size - 1);
+        put_size(&mut self.buf, size - 1);
 
         let total: u32 = slots.iter().map(|slot| slot.klen + slot.vlen).sum();
         let mut offset = self.len() - total;
@@ -271,6 +272,10 @@ fn put_u32(buf: &mut BytesMut, pos: usize, val: u32) {
 fn put_slice(buf: &mut BytesMut, pos: usize, src: &[u8]) {
     let dst = &mut buf[pos..(pos + src.len())];
     dst.copy_from_slice(src);
+}
+
+fn put_size(buf: &mut BytesMut, val: u32) {
+    put_u32(buf, 8, val);
 }
 
 fn put_slot(buf: &mut BytesMut, idx: u32, slot: &Slot) {
