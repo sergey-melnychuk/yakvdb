@@ -5,6 +5,8 @@ use std::fs::OpenOptions;
 use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use crate::api::tree::Tree;
+use std::collections::HashSet;
 
 struct File {
     file: fs::File,
@@ -31,6 +33,71 @@ impl File {
         let offset = page.id() as u64;
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.write_all(page.as_ref())
+    }
+}
+
+impl Tree for File {
+    fn lookup(&self, key: &[u8]) -> Option<&[u8]> {
+        // Keeps track of visited pages to avoid possible circular reference navigation.
+        let mut seen = HashSet::with_capacity(8);
+        let mut page = self.root();
+        seen.insert(page.id());
+        loop {
+            let idx = page.ceil(key)?;
+
+            let slot = page.slot(idx).unwrap();
+            if slot.page == 0 {
+                // Log how deep the lookup went into the tree depth: seen.len()
+                return page.find(key)
+                    .map(move |idx| page.key(idx));
+            } else {
+                if seen.contains(&slot.page) {
+                    return None;
+                }
+                seen.insert(slot.page);
+                page = self.page(slot.page)?;
+            }
+        }
+    }
+
+    fn insert(&mut self, _key: &[u8], _val: &[u8]) {
+        todo!()
+    }
+
+    fn remove(&mut self, _key: &[u8]) {
+        todo!()
+    }
+
+    fn root(&self) -> &mut dyn Page {
+        todo!()
+    }
+
+    fn page(&self, _id: u32) -> Option<&mut dyn Page> {
+        todo!()
+    }
+
+    fn push<P: Page>(&mut self, _page: &P) {
+        todo!()
+    }
+
+    fn next_id(&mut self) -> u32 {
+        todo!()
+    }
+
+    fn take_id(&mut self, _id: u32) {
+        todo!()
+    }
+
+    fn free_id(&mut self, _id: u32) {
+        todo!()
+    }
+
+    fn split<P: Page>(&mut self, _page: &P) -> (u32, u32) {
+        todo!()
+    }
+
+    fn merge<P: Page>(&mut self, _this: &mut P, _that: &P) -> u32 {
+        todo!()
     }
 }
 
