@@ -36,13 +36,20 @@ impl Block {
         Self { buf }
     }
 
-    fn put_val_or_ref(&mut self, key: &[u8], val: &[u8], page: u32) -> Option<u32> {
+    fn put_entry(&mut self, key: &[u8], val: &[u8], page: u32) -> Option<u32> {
         if !self.fits((key.len() + val.len()) as u32) {
             return None;
         }
-        self.find(key).into_iter().for_each(|idx| self.remove(idx));
 
         let size = self.size();
+
+        let ceil_opt = self.ceil(key);
+        if let Some(idx) = &ceil_opt {
+            if self.key(*idx) == key {
+                self.remove(*idx);
+            }
+        }
+        let idx = ceil_opt.unwrap_or(size);
 
         let mut slots = (0..size)
             .into_iter()
@@ -57,32 +64,20 @@ impl Block {
             .min()
             .unwrap_or(self.len());
         let offset = end - klen - vlen;
+        let slot = Slot::new(offset, klen, vlen, page);
+
+        slots.insert(idx as usize, slot);
+        slots.into_iter().enumerate()
+            .for_each(|(idx, slot)| put_slot(&mut self.buf, idx as u32, &slot));
+
+        put_size(&mut self.buf, size + 1);
 
         put_slice(&mut self.buf, offset as usize, key);
         if val.len() > 0 {
             put_slice(&mut self.buf, offset as usize + key.len(), val);
         }
 
-        let slot = Slot::new(offset, klen, vlen, page);
-        slots.push(slot);
-        // TODO Avoid sorting, use ceil + insert instead
-        slots.sort_by_key(|slot| {
-            let lo = slot.offset as usize;
-            let hi = lo + slot.klen as usize;
-            &self.buf[lo..hi]
-        });
-
-        put_size(&mut self.buf, size + 1);
-
-        slots
-            .into_iter()
-            .enumerate()
-            .for_each(|(idx, slot)| put_slot(&mut self.buf, idx as u32, &slot));
-
-        (0..self.size())
-            .into_iter()
-            .find(|i| self.key(*i as u32) == key)
-            .map(|i| i as u32)
+        Some(idx)
     }
 }
 
@@ -181,11 +176,11 @@ impl Page for Block {
     }
 
     fn put_val(&mut self, key: &[u8], val: &[u8]) -> Option<u32> {
-        self.put_val_or_ref(key, val, 0)
+        self.put_entry(key, val, 0)
     }
 
     fn put_ref(&mut self, key: &[u8], page: u32) -> Option<u32> {
-        self.put_val_or_ref(key, &[], page)
+        self.put_entry(key, &[], page)
     }
 
     fn remove(&mut self, idx: u32) {
