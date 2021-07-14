@@ -6,12 +6,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::io::{Read, Seek, SeekFrom, Write, BufReader};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 struct FileId(u32);
@@ -37,16 +37,11 @@ enum TableEntry {
 
 impl TableEntry {
     fn insert(key: Vec<u8>, val: Vec<u8>) -> Self {
-        Self::Insert {
-            key,
-            val,
-        }
+        Self::Insert { key, val }
     }
 
     fn remove(key: Vec<u8>) -> Self {
-        Self::Remove {
-            key,
-        }
+        Self::Remove { key }
     }
 }
 
@@ -58,10 +53,7 @@ struct IndexEntry {
 
 impl IndexEntry {
     fn new(key: Vec<u8>, loc: Location) -> Self {
-        Self {
-            key,
-            loc
-        }
+        Self { key, loc }
     }
 }
 
@@ -106,10 +98,7 @@ impl<S: Storage, I: Index> KVStore for Durable<S, I> {
 
 impl<S: Storage, I: Index> Durable<S, I> {
     fn new(storage: S, index: I) -> Self {
-        Self {
-            storage,
-            index,
-        }
+        Self { storage, index }
     }
 }
 
@@ -184,7 +173,8 @@ impl OnDisk {
     }
 
     fn id(path: &PathBuf) -> FileId {
-        let name = path.file_name()
+        let name = path
+            .file_name()
             .unwrap()
             .to_str()
             .unwrap()
@@ -195,12 +185,19 @@ impl OnDisk {
         FileId(id)
     }
 
-    fn list(path: &Path, suffix: &str) -> io::Result<impl Iterator<Item=PathBuf>> {
+    fn list(path: &Path, suffix: &str) -> io::Result<impl Iterator<Item = PathBuf>> {
         let owned_suffix = suffix.to_owned();
         Ok(fs::read_dir(path)?
             .into_iter()
             .filter_map(|r| r.ok().map(|d| d.path()))
-            .filter(move |p| p.is_file() && p.file_name().unwrap().to_str().unwrap().ends_with(&owned_suffix)))
+            .filter(move |p| {
+                p.is_file()
+                    && p.file_name()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .ends_with(&owned_suffix)
+            }))
     }
 
     fn append(file: &mut File, val: &[u8]) -> io::Result<u32> {
@@ -240,13 +237,15 @@ impl OnDisk {
         Ok(self.files.get_mut(file_id).unwrap())
     }
 
-    fn entries<T: DeserializeOwned>(path: &Path, suffix: &str) -> io::Result<impl Iterator<Item=T>> {
-        Ok(OnDisk::list(path, suffix)?
-            .flat_map(|p| {
-                let br = BufReader::new(File::open(p).unwrap());
-                let entries: Vec<T> = bincode::deserialize_from(br).unwrap();
-                entries
-            }))
+    fn entries<T: DeserializeOwned>(
+        path: &Path,
+        suffix: &str,
+    ) -> io::Result<impl Iterator<Item = T>> {
+        Ok(OnDisk::list(path, suffix)?.flat_map(|p| {
+            let br = BufReader::new(File::open(p).unwrap());
+            let entries: Vec<T> = bincode::deserialize_from(br).unwrap();
+            entries
+        }))
     }
 }
 
@@ -298,7 +297,7 @@ mod tests {
         let n = 8 + key.len() + 8 + 4;
         assert_eq!(&buf[n..(n + 7)], b"it's 42");
 
-        if let TableEntry::Insert { key: k, val: v} = bincode::deserialize(&buf).unwrap() {
+        if let TableEntry::Insert { key: k, val: v } = bincode::deserialize(&buf).unwrap() {
             assert_eq!(k, key);
             assert_eq!(v, val);
         } else {
@@ -310,7 +309,8 @@ mod tests {
     fn test_index_entry() {
         let entry = IndexEntry::new(
             b"what is the answer to life?".to_vec(),
-            Location::of(FileId(42), 123, 456));
+            Location::of(FileId(42), 123, 456),
+        );
 
         let buf = bincode::serialize(&entry).unwrap();
         let e: IndexEntry = bincode::deserialize(&buf).unwrap();
@@ -339,10 +339,21 @@ mod tests {
     #[test]
     fn test_table_entries() {
         let entries = vec![
-            TableEntry::Insert { key: b"qweqwe-asdasd-zxcxzc".to_vec(), val: b"123123-567576-8890890".to_vec() },
-            TableEntry::Insert { key: b"asdasd-qweqwe-zxcxzc".to_vec(), val: b"567576-123123-8890890".to_vec() },
-            TableEntry::Insert { key: b"zxcxzc-qweqwe-asdasd".to_vec(), val: b"8890890-123123-567576".to_vec() },
-            TableEntry::Remove { key: b"asdasd-qweqwe-zxcxzc".to_vec() },
+            TableEntry::Insert {
+                key: b"qweqwe-asdasd-zxcxzc".to_vec(),
+                val: b"123123-567576-8890890".to_vec(),
+            },
+            TableEntry::Insert {
+                key: b"asdasd-qweqwe-zxcxzc".to_vec(),
+                val: b"567576-123123-8890890".to_vec(),
+            },
+            TableEntry::Insert {
+                key: b"zxcxzc-qweqwe-asdasd".to_vec(),
+                val: b"8890890-123123-567576".to_vec(),
+            },
+            TableEntry::Remove {
+                key: b"asdasd-qweqwe-zxcxzc".to_vec(),
+            },
         ];
 
         let path = Path::new("target/test_table_entries");
@@ -350,7 +361,8 @@ mod tests {
             fs::create_dir_all(path).unwrap();
         }
 
-        OnDisk::list(path, ".dat").unwrap()
+        OnDisk::list(path, ".dat")
+            .unwrap()
             .for_each(|d| fs::remove_file(d.as_path()).unwrap());
 
         let disk = OnDisk::new("target/test_table_entries").unwrap();
@@ -360,20 +372,23 @@ mod tests {
         for e in &entries {
             match e {
                 TableEntry::Insert { key, val } => db.insert(key, val),
-                TableEntry::Remove { key } => db.remove(key)
+                TableEntry::Remove { key } => db.remove(key),
             }
         }
 
         {
             // Manually patch the length of entries vector to deserialize
             // Bincode writes collection length prefix as u64, does not provide an easy way to just parse stream of entries from file
-            let mut f = OpenOptions::new().write(true).open(Path::new("target/test_table_entries/00000000.dat")).unwrap();
+            let mut f = OpenOptions::new()
+                .write(true)
+                .open(Path::new("target/test_table_entries/00000000.dat"))
+                .unwrap();
             f.seek(SeekFrom::Start(0)).unwrap();
             f.write_all(&[entries.len() as u8]).unwrap();
         }
 
-        let deserialized: Vec<TableEntry> = OnDisk::entries(path, ".dat").unwrap()
-            .into_iter().collect();
+        let deserialized: Vec<TableEntry> =
+            OnDisk::entries(path, ".dat").unwrap().into_iter().collect();
 
         assert_eq!(deserialized, entries);
     }

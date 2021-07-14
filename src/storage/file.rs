@@ -1,10 +1,10 @@
+use crate::storage::block::Block;
+use crate::storage::page::Page;
 use std::fs;
+use std::fs::OpenOptions;
 use std::io;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use crate::storage::page::Page;
-use crate::storage::block::Block;
-use std::fs::OpenOptions;
 
 struct File {
     file: fs::File,
@@ -18,9 +18,7 @@ impl File {
             .write(true)
             .open(path)
             .unwrap();
-        Self {
-            file
-        }
+        Self { file }
     }
 
     fn load_page(&mut self, offset: usize, length: usize) -> io::Result<impl Page> {
@@ -70,15 +68,18 @@ mod tests {
             file.load_page(0, size as usize).unwrap()
         };
 
-        assert_eq!(page.copy(), vec![
-            (b"aaa".to_vec(), b"zxczxczxc".to_vec(), 0),
-            (b"bbb".to_vec(), b"asdasdasd".to_vec(), 0),
-            (b"ccc".to_vec(), b"qweqweqwe".to_vec(), 0),
-            (b"ddd".to_vec(), b"123123123".to_vec(), 0),
-            (b"xxx".to_vec(), vec![], 3333),
-            (b"yyy".to_vec(), vec![], 2222),
-            (b"zzz".to_vec(), vec![], 1111),
-        ]);
+        assert_eq!(
+            page.copy(),
+            vec![
+                (b"aaa".to_vec(), b"zxczxczxc".to_vec(), 0),
+                (b"bbb".to_vec(), b"asdasdasd".to_vec(), 0),
+                (b"ccc".to_vec(), b"qweqweqwe".to_vec(), 0),
+                (b"ddd".to_vec(), b"123123123".to_vec(), 0),
+                (b"xxx".to_vec(), vec![], 3333),
+                (b"yyy".to_vec(), vec![], 2222),
+                (b"zzz".to_vec(), vec![], 1111),
+            ]
+        );
 
         assert_eq!(get(&page, b"aaa"), Some((b"zxczxczxc".to_vec(), 0)));
         assert_eq!(get(&page, b"bbb"), Some((b"asdasdasd".to_vec(), 0)));

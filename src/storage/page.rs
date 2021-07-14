@@ -2,13 +2,18 @@
 pub(crate) struct Slot {
     pub(crate) offset: u32,
     pub(crate) klen: u32,
-    pub(crate) vlen: u32,  // if >0 value is stored in the same page as a key (leaf page)
-    pub(crate) page: u32,  // if >0 key holds a reference to another page (node page)
+    pub(crate) vlen: u32, // if >0 value is stored in the same page as a key (leaf page)
+    pub(crate) page: u32, // if >0 key holds a reference to another page (node page)
 }
 
 impl Slot {
     pub(crate) fn new(offset: u32, klen: u32, vlen: u32, page: u32) -> Self {
-        Self { offset, klen, vlen, page }
+        Self {
+            offset,
+            klen,
+            vlen,
+            page,
+        }
     }
 }
 
