@@ -107,6 +107,14 @@ impl Page for Block {
         Some(Slot::new(offset, klen, vlen, page))
     }
 
+    fn min(&self) -> &[u8] {
+        self.key(0)
+    }
+
+    fn max(&self) -> &[u8] {
+        self.key(self.size() - 1)
+    }
+
     fn key(&self, idx: u32) -> &[u8] {
         self.slot(idx)
             .map(|slot| {

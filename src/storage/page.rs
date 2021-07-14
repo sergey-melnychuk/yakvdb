@@ -47,6 +47,9 @@ pub(crate) trait Page {
     fn size(&self) -> u32;
 
     fn slot(&self, idx: u32) -> Option<Slot>;
+
+    fn min(&self) -> &[u8];
+    fn max(&self) -> &[u8];
     fn key(&self, idx: u32) -> &[u8];
     fn val(&self, idx: u32) -> &[u8];
 
@@ -55,7 +58,7 @@ pub(crate) trait Page {
     fn free(&self) -> u32;
 
     /// Get integer percent value (0..=100) of how full the page is.
-    /// Effectively this is equal to `(len() - free() * 100) / len()`.
+    /// Effectively this is equal to `((len() - HEAD) - free()) * 100 / (len() - HEAD)`.
     fn full(&self) -> u8;
 
     /// Check if payload (key and value) of given size can fit the page,
