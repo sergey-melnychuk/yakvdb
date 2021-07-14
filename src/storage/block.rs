@@ -99,14 +99,14 @@ impl Page for Block {
     }
 
     fn slot(&self, idx: u32) -> Option<Slot> {
-        if idx > self.size() {
+        if idx >= self.size() {
             return None;
         }
-        let i = HEAD + U32 * 4 * idx as usize;
-        let offset = get_u32(&self.buf, i);
-        let klen = get_u32(&self.buf, i + 4);
-        let vlen = get_u32(&self.buf, i + 8);
-        let page = get_u32(&self.buf, i + 12);
+        let pos = HEAD + U32 * 4 * idx as usize;
+        let offset = get_u32(&self.buf, pos);
+        let klen = get_u32(&self.buf, pos + 4);
+        let vlen = get_u32(&self.buf, pos + 8);
+        let page = get_u32(&self.buf, pos + 12);
         Some(Slot::new(offset, klen, vlen, page))
     }
 
@@ -136,7 +136,6 @@ impl Page for Block {
             return None;
         }
 
-        let n = self.size();
         let k = bsearch(key, 0, n - 1, |i| self.key(i));
         if self.key(k) == key {
             Some(k)
@@ -151,9 +150,7 @@ impl Page for Block {
             return None;
         }
 
-        let n = self.size();
         let k = bsearch(key, 0, n - 1, |i| self.key(i));
-
         if self.key(k) >= key {
             Some(k)
         } else {
@@ -162,12 +159,12 @@ impl Page for Block {
     }
 
     fn free(&self) -> u32 {
-        let n = self.size();
-        if n == 0 {
+        let size = self.size();
+        if size == 0 {
             return self.len() - 3 * U32 as u32;
         }
-        let lo = (3 + n * 4) * U32 as u32;
-        let hi = (0..n)
+        let lo = (3 + size * 4) * U32 as u32;
+        let hi = (0..size)
             .into_iter()
             .filter_map(|idx| self.slot(idx))
             .map(|slot| slot.offset)
@@ -191,19 +188,19 @@ impl Page for Block {
     }
 
     fn remove(&mut self, idx: u32) {
-        let n = self.size();
-        if idx >= n {
+        let size = self.size();
+        if idx >= size {
             return;
         }
 
-        let mut slots = (0..n)
+        let mut slots = (0..size)
             .into_iter()
             .filter_map(|idx| self.slot(idx))
             .collect::<Vec<_>>();
 
         slots.remove(idx as usize);
 
-        put_u32(&mut self.buf, 8, n - 1);
+        put_u32(&mut self.buf, 8, size - 1);
 
         let total: u32 = slots.iter().map(|slot| slot.klen + slot.vlen).sum();
         let mut offset = self.len() - total;
@@ -526,7 +523,7 @@ mod tests {
             - k3.len() as u32;
         assert_eq!(page.free(), free);
 
-        page.remove(1); // remove k1-v1
+        page.remove(1); // remove (k1, v1)
         assert_eq!(page.free(), free + 16 + k1.len() as u32 + v1.len() as u32);
 
         assert_eq!(page.find(k2).unwrap(), 0);
