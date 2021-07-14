@@ -1,7 +1,6 @@
 use crate::storage::page::{Page, Slot};
+use crate::util::bsearch::bsearch;
 use bytes::{BufMut, BytesMut};
-use std::cmp::Ordering;
-use std::fmt::Debug;
 use std::mem::size_of;
 
 pub(crate) struct Block {
@@ -279,49 +278,6 @@ fn put_slot(buf: &mut BytesMut, idx: u32, slot: &Slot) {
     put_u32(buf, pos + 4, slot.klen);
     put_u32(buf, pos + 8, slot.vlen);
     put_u32(buf, pos + 12, slot.page);
-}
-
-// unsigned int trait bound inspired by:
-// https://users.rust-lang.org/t/difficulty-creating-numeric-trait/34345/4
-// https://play.rust-lang.org/?version=stable&mode=debug&edition=2018&gist=1d5c85adec6bdc0eae9f57c74d123dd1
-// TODO extract to utils?
-trait UInt:
-    Copy
-    + Ord
-    + Sized
-    + Debug
-    + From<u8>
-    + std::ops::Add<Output = Self>
-    + std::ops::Sub<Output = Self>
-    + std::ops::Div<Output = Self>
-    + std::cmp::Eq
-    + std::cmp::PartialEq<Self>
-{
-}
-
-impl UInt for u8 {}
-impl UInt for u16 {}
-impl UInt for u32 {}
-impl UInt for u64 {}
-impl UInt for u128 {}
-
-// TODO extract to utils?
-fn bsearch<T: Ord, I: UInt, F: Fn(I) -> T>(key: T, mut lo: I, mut hi: I, f: F) -> I {
-    while lo < hi {
-        let mid = lo + (hi - lo) / I::from(2);
-        let mid_key = f(mid);
-        match Ord::cmp(&key, &mid_key) {
-            Ordering::Less => {
-                hi = mid;
-            }
-            Ordering::Greater => {
-                lo = mid + I::from(1);
-            }
-            Ordering::Equal => return mid,
-        }
-    }
-    assert_eq!(lo, hi);
-    lo
 }
 
 #[cfg(test)]
