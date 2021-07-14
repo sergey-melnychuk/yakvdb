@@ -21,14 +21,14 @@ impl File {
         Self { file }
     }
 
-    fn load_page(&mut self, offset: usize, length: usize) -> io::Result<impl Page> {
+    fn load(&mut self, offset: usize, length: usize) -> io::Result<impl Page> {
         let mut page = Block::reserve(length);
         self.file.seek(SeekFrom::Start(offset as u64))?;
         self.file.read_exact(page.as_mut())?;
         Ok(page)
     }
 
-    fn dump_page<P: Page + AsRef<[u8]>>(&mut self, page: &P) -> io::Result<()> {
+    fn save<P: Page + AsRef<[u8]>>(&mut self, page: &P) -> io::Result<()> {
         let offset = page.id() as u64;
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.write_all(page.as_ref())
@@ -60,12 +60,12 @@ mod tests {
             page.put_ref(b"xxx", 3333);
 
             let mut file = File::open(path);
-            file.dump_page(&page).unwrap();
+            file.save(&page).unwrap();
         }
 
         let mut page = {
             let mut file = File::open(path);
-            file.load_page(0, size as usize).unwrap()
+            file.load(0, size as usize).unwrap()
         };
 
         assert_eq!(
