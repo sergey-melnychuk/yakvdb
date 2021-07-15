@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
+pub(crate) mod api;
 pub(crate) mod disk;
 pub(crate) mod util;
-pub(crate) mod api;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;

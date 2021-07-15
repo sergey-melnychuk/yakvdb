@@ -1,6 +1,6 @@
+use std::fmt::Formatter;
 use std::io;
 use std::result;
-use std::fmt::Formatter;
 
 #[derive(Debug)]
 pub enum Error {
@@ -16,7 +16,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::IO(io) => write!(f, "IO error: '{}'.", io),
             Error::Tree(id, msg) => write!(f, "Tree error (page: {}): '{}'.", id, msg),
-            Error::Other(msg) => write!(f, "Other error: '{}'.", msg)
+            Error::Other(msg) => write!(f, "Other error: '{}'.", msg),
         }
     }
 }

@@ -51,7 +51,9 @@ impl Block {
         let slot = Slot::new(offset, klen, vlen, page);
 
         slots.insert(idx as usize, slot);
-        slots.into_iter().enumerate()
+        slots
+            .into_iter()
+            .enumerate()
             .for_each(|(idx, slot)| put_slot(&mut self.buf, idx as u32, &slot));
 
         put_size(&mut self.buf, size + 1);
@@ -256,7 +258,7 @@ impl Page for Block {
 
 const U32: usize = size_of::<u32>();
 const SLOT: usize = size_of::<Slot>();
-const HEAD: usize = 4 * U32;    // page header: id, length, size, reserved
+const HEAD: usize = 4 * U32; // page header: id, length, size, reserved
 
 fn get_u32(buf: &BytesMut, pos: usize) -> u32 {
     let mut src = [0u8; U32];
@@ -315,7 +317,8 @@ mod tests {
         let size = 32;
         let len = size * size_of::<u64>() * 4;
 
-        let mut keys = (0..size).into_iter()
+        let mut keys = (0..size)
+            .into_iter()
             .map(|_| rng.gen::<u64>().to_be_bytes().to_vec())
             .collect::<Vec<_>>();
 
@@ -331,7 +334,8 @@ mod tests {
 
         keys.sort();
 
-        let read = (0..size).into_iter()
+        let read = (0..size)
+            .into_iter()
             .map(|idx| page.key(idx as u32).to_vec())
             .collect::<Vec<_>>();
 
@@ -345,17 +349,19 @@ mod tests {
         let size = 64;
         let len = size * size_of::<u64>() * 10;
 
-        let keys = (0..size).into_iter()
+        let keys = (0..size)
+            .into_iter()
             .map(|_| rng.gen::<u64>())
             .collect::<HashSet<_>>();
 
-        let pairs = keys.iter()
-            .map(|k|
+        let pairs = keys
+            .iter()
+            .map(|k| {
                 (
                     k.to_be_bytes().to_vec(),
-                    rng.gen::<u64>().to_be_bytes().to_vec()
+                    rng.gen::<u64>().to_be_bytes().to_vec(),
                 )
-            )
+            })
             .collect::<Vec<_>>();
 
         let mut page = Block::create(42, len as u32);
@@ -368,7 +374,6 @@ mod tests {
             assert_eq!(page.key(idx), key);
             assert_eq!(page.val(idx), val);
         }
-
     }
 
     #[test]
@@ -378,7 +383,8 @@ mod tests {
         let size = 64;
         let len = size * size_of::<u64>() * 10;
 
-        let keys = (0..size).into_iter()
+        let keys = (0..size)
+            .into_iter()
             .map(|_| {
                 let x = rng.gen::<u64>();
                 x - (x % 100)
@@ -411,18 +417,18 @@ mod tests {
         let mut rng = thread_rng();
         let count = 32;
 
-        let pairs = (0..count).into_iter()
-            .map(|_| (
-                rng.next_u64().to_be_bytes().to_vec(),
-                rng.next_u64().to_be_bytes().to_vec()
-            ))
+        let pairs = (0..count)
+            .into_iter()
+            .map(|_| {
+                (
+                    rng.next_u64().to_be_bytes().to_vec(),
+                    rng.next_u64().to_be_bytes().to_vec(),
+                )
+            })
             .collect::<Vec<_>>();
 
-        let len = pairs.iter()
-            .map(|(k, v)| k.len() + v.len())
-            .sum::<usize>()
-            + HEAD
-            + pairs.len() * SLOT;
+        let len =
+            pairs.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>() + HEAD + pairs.len() * SLOT;
 
         let mut page = Block::create(42, len as u32);
         assert_eq!(page.free(), len as u32 - HEAD as u32);
@@ -526,8 +532,10 @@ mod tests {
         let free = len
             - HEAD as u32
             - 3 * SLOT as u32
-            - k1.len() as u32 - v1.len() as u32
-            - k2.len() as u32 - v2.len() as u32
+            - k1.len() as u32
+            - v1.len() as u32
+            - k2.len() as u32
+            - v2.len() as u32
             - k3.len() as u32;
         assert_eq!(page.free(), free);
 

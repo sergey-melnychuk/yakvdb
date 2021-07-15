@@ -21,7 +21,8 @@ pub(crate) fn bsearch<T: Ord, I: UInt, F: Fn(I) -> T>(key: T, mut lo: I, mut hi:
 
 // Trait to use as a bound for unsigned integer, inspired by:
 // https://users.rust-lang.org/t/difficulty-creating-numeric-trait/34345/4
-pub(crate) trait UInt: Copy
+pub(crate) trait UInt:
+    Copy
     + Ord
     + Sized
     + Debug
@@ -30,7 +31,9 @@ pub(crate) trait UInt: Copy
     + std::ops::Sub<Output = Self>
     + std::ops::Div<Output = Self>
     + std::cmp::Eq
-    + std::cmp::PartialEq<Self> {}
+    + std::cmp::PartialEq<Self>
+{
+}
 
 impl UInt for u8 {}
 impl UInt for u16 {}
