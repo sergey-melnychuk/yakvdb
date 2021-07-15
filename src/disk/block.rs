@@ -20,23 +20,6 @@ impl AsRef<[u8]> for Block {
 }
 
 impl Block {
-    pub(crate) fn reserve(capacity: u32) -> Self {
-        let mut buf = BytesMut::with_capacity(capacity as usize);
-        buf.extend_from_slice(&vec![0u8; capacity as usize]);
-        Self { buf }
-    }
-
-    pub(crate) fn create(id: u32, len: u32) -> Self {
-        let mut buf = BytesMut::with_capacity(len as usize);
-        buf.put_u32(id);
-        buf.put_u32(len);
-        buf.put_u32(0);
-        buf.put_u32(0);
-        assert_eq!(buf.len(), HEAD);
-        buf.extend_from_slice(&vec![0u8; len as usize - HEAD]);
-        Self { buf }
-    }
-
     fn put_entry(&mut self, key: &[u8], val: &[u8], page: u32) -> Option<u32> {
         if !self.fits((key.len() + val.len()) as u32) {
             return None;
@@ -83,6 +66,23 @@ impl Block {
 }
 
 impl Page for Block {
+    fn reserve(capacity: u32) -> Self {
+        let mut buf = BytesMut::with_capacity(capacity as usize);
+        buf.extend_from_slice(&vec![0u8; capacity as usize]);
+        Self { buf }
+    }
+
+    fn create(id: u32, len: u32) -> Self {
+        let mut buf = BytesMut::with_capacity(len as usize);
+        buf.put_u32(id);
+        buf.put_u32(len);
+        buf.put_u32(0);
+        buf.put_u32(0);
+        assert_eq!(buf.len(), HEAD);
+        buf.extend_from_slice(&vec![0u8; len as usize - HEAD]);
+        Self { buf }
+    }
+
     fn id(&self) -> u32 {
         get_u32(&self.buf, 0)
     }

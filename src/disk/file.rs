@@ -1,24 +1,21 @@
 use crate::api::page::Page;
 use crate::api::tree::Tree;
-use crate::disk::block::Block;
-use std::fs;
-use std::fs::OpenOptions;
-use std::io;
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
-use std::collections::{HashSet, HashMap, BinaryHeap};
+use bytes::{Buf, BufMut, BytesMut};
+use std::cell::{Ref, RefCell, RefMut};
 use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
-use bytes::{BytesMut, Buf, BufMut};
-use std::cell::RefCell;
+use std::path::Path;
 
-struct File {
+struct File<P: Page> {
     /// Underlying file reference where all data is physically stored.
     file: RefCell<fs::File>,
     head: Head,
 
     /// In-memory page cache. All page access happens only through cached page representation.
-    cache: HashMap<u32, Block>,
+    cache: RefCell<HashMap<u32, P>>,
 
     /// Set of pages that requires flushing to the disk for durability.
     dirty: HashSet<u32>,
@@ -39,10 +36,13 @@ struct Head {
     page_count: u32,
 }
 
-impl File {
+impl<P: Page> File<P> {
     fn make(path: &Path, page_bytes: u32) -> io::Result<Self> {
         if path.exists() {
-            return Err(io::Error::new(io::ErrorKind::Other, format!("File exists: {:?}", path)));
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("File exists: {:?}", path),
+            ));
         }
 
         let mut file = OpenOptions::new()
@@ -61,7 +61,7 @@ impl File {
         buf.put_u32(head.page_bytes);
         buf.put_u32(head.page_count);
 
-        let root = Block::create(ROOT, head.page_bytes);
+        let root = P::create(ROOT, head.page_bytes);
         buf.put_slice(root.as_ref());
 
         file.write_all(buf.as_ref())?;
@@ -70,7 +70,7 @@ impl File {
         Ok(Self {
             file: RefCell::new(file),
             head,
-            cache: HashMap::with_capacity(32),
+            cache: RefCell::new(HashMap::with_capacity(32)),
             dirty: HashSet::with_capacity(32),
             empty: BinaryHeap::with_capacity(16),
         })
@@ -95,7 +95,10 @@ impl File {
         let mut magic = [0u8; 8];
         buf.copy_to_slice(&mut magic);
         if magic != MAGIC {
-            return Err(io::Error::new(io::ErrorKind::Other, format!("MAGIC mismatch: {:?}", magic)));
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("MAGIC mismatch: {:?}", magic),
+            ));
         }
 
         let head = Head {
@@ -104,37 +107,45 @@ impl File {
         };
 
         if head.page_bytes > u16::MAX as u32 {
-            return Err(io::Error::new(io::ErrorKind::Other, format!("Page size too large: {}", head.page_bytes)));
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("Page size too large: {}", head.page_bytes),
+            ));
         }
 
         if len < HEAD + head.page_bytes as usize {
-            return Err(io::Error::new(io::ErrorKind::Other, format!("File does not contain one full page")));
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "File does not contain one full page".to_string(),
+            ));
         }
 
-        let mut root = Block::reserve(head.page_bytes);
+        let mut root = P::reserve(head.page_bytes);
         file.read_exact(root.as_mut())?;
 
-        let mut this = Self {
+        let this = Self {
             file: RefCell::new(file),
             head,
-            cache: HashMap::with_capacity(32),
+            cache: RefCell::new(HashMap::with_capacity(32)),
             dirty: HashSet::with_capacity(32),
             empty: BinaryHeap::with_capacity(16),
         };
 
-        this.cache.insert(ROOT, root);
+        this.cache.borrow_mut().insert(ROOT, root);
 
         Ok(this)
     }
 
-    fn load(&self, offset: usize, length: u32) -> io::Result<Block> {
-        let mut page = Block::reserve(length as u32);
-        self.file.borrow_mut().seek(SeekFrom::Start(offset as u64))?;
+    fn load(&self, offset: usize, length: u32) -> io::Result<P> {
+        let mut page = P::reserve(length as u32);
+        self.file
+            .borrow_mut()
+            .seek(SeekFrom::Start(offset as u64))?;
         self.file.borrow_mut().read_exact(page.as_mut())?;
         Ok(page)
     }
 
-    fn save(&self, page: &dyn Page) -> io::Result<()> {
+    fn save(&self, page: &P) -> io::Result<()> {
         let offset = self.offset(page.id()) as u64;
         self.file.borrow_mut().seek(SeekFrom::Start(offset))?;
         self.file.borrow_mut().write_all(page.as_ref())
@@ -145,8 +156,8 @@ impl File {
     }
 }
 
-impl Tree for File {
-    fn lookup(&self, key: &[u8]) -> Option<&[u8]> {
+impl<P: Page> Tree<P> for File<P> {
+    fn lookup(&self, key: &[u8]) -> Option<Ref<[u8]>> {
         // Keeps track of visited pages to avoid possible circular reference navigation.
         let mut seen = HashSet::with_capacity(8);
         let mut page = self.root();
@@ -157,8 +168,9 @@ impl Tree for File {
             let slot = page.slot(idx)?;
             if slot.page == 0 {
                 // Log how deep the lookup went into the tree depth: seen.len()
-                return page.find(key)
-                    .map(|idx| page.key(idx));
+                if let Some(idx) = page.find(key) {
+                    return Some(Ref::map(page, |p| p.val(idx)));
+                }
             } else {
                 if seen.contains(&slot.page) {
                     // TODO log error: circular reference is detected between pages
@@ -237,50 +249,49 @@ impl Tree for File {
         }
     }
 
-    fn root(&self) -> &dyn Page {
+    fn root(&self) -> Ref<P> {
         self.page(ROOT).unwrap()
     }
 
-    fn page(&self, id: u32) -> Option<&dyn Page> {
-        if !self.cache.contains_key(&id) {
-            let mut page = Block::reserve(self.head.page_bytes);
-            self.file.borrow_mut().read_exact(page.as_mut()).ok()?;
+    fn page(&self, id: u32) -> Option<Ref<P>> {
+        if !self.cache.borrow().contains_key(&id) {
+            let page = self.load(self.offset(id), self.head.page_bytes).ok()?;
+            self.cache.borrow_mut().insert(id, page);
         }
-        let page: &dyn Page = self.cache.get(&id).unwrap();
-        // TODO Find a way to insert the page into a cache!
+        let page = Ref::map(self.cache.borrow(), |cache| cache.get(&id).unwrap());
         Some(page)
     }
 
-    fn root_mut(&mut self) -> &mut dyn Page {
+    fn root_mut(&self) -> RefMut<P> {
         self.page_mut(ROOT).unwrap()
     }
 
-    fn page_mut(&mut self, id: u32) -> Option<&mut dyn Page> {
-        if !self.cache.contains_key(&id) {
+    fn page_mut(&self, id: u32) -> Option<RefMut<P>> {
+        if !self.cache.borrow().contains_key(&id) {
             let page = self.load(self.offset(id), self.head.page_bytes).ok()?;
-            self.cache.insert(id, page);
+            self.cache.borrow_mut().insert(id, page);
         }
-        let page: &mut dyn Page = self.cache.get_mut(&id).unwrap();
+        let page = RefMut::map(self.cache.borrow_mut(), |cache| cache.get_mut(&id).unwrap());
         Some(page)
     }
 
-    fn flush<P: Page>(&mut self, page: &P) -> crate::api::error::Result<()> {
+    fn flush(&mut self, page: &P) -> crate::api::error::Result<()> {
         self.save(page).map_err(|e| e.into())
     }
 
-    fn next_id(&mut self) {
-        self.empty.peek().cloned().unwrap().0;
+    fn next_id(&mut self) -> u32 {
+        self.empty.peek().cloned().unwrap().0
     }
 
     fn free_id(&mut self, id: u32) {
         self.empty.push(Reverse(id))
     }
 
-    fn split<P: Page>(&mut self, _page: &P) -> (u32, u32) {
+    fn split(&mut self, _page: &P) -> (u32, u32) {
         todo!()
     }
 
-    fn merge<P: Page>(&mut self, _this: &mut P, _that: &P) -> u32 {
+    fn merge(&mut self, _this: &mut P, _that: &P) -> u32 {
         todo!()
     }
 }
@@ -288,8 +299,10 @@ impl Tree for File {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::disk::block::Block;
+    use std::ops::Deref;
 
-    fn get(page: &dyn Page, key: &[u8]) -> Option<(Vec<u8>, u32)> {
+    fn get<P: Page>(page: &P, key: &[u8]) -> Option<(Vec<u8>, u32)> {
         page.find(key)
             .map(|idx| (page.val(idx).to_vec(), page.slot(idx).unwrap().page))
     }
@@ -302,47 +315,47 @@ mod tests {
         }
         let size: u32 = 256;
 
+        let data = vec![
+            (b"aaa".to_vec(), b"zxczxczxc".to_vec(), 0),
+            (b"bbb".to_vec(), b"asdasdasd".to_vec(), 0),
+            (b"ccc".to_vec(), b"qweqweqwe".to_vec(), 0),
+            (b"ddd".to_vec(), b"123123123".to_vec(), 0),
+            (b"xxx".to_vec(), vec![], 3333),
+            (b"yyy".to_vec(), vec![], 2222),
+            (b"zzz".to_vec(), vec![], 1111),
+        ];
+
         {
-            let mut file = File::make(path, size).unwrap();
+            let file: File<Block> = File::make(path, size).unwrap();
             {
-                let page = file.root_mut();
-                page.put_val(b"ddd", b"123123123");
-                page.put_val(b"ccc", b"qweqweqwe");
-                page.put_val(b"bbb", b"asdasdasd");
-                page.put_val(b"aaa", b"zxczxczxc");
-                page.put_ref(b"zzz", 1111);
-                page.put_ref(b"yyy", 2222);
-                page.put_ref(b"xxx", 3333);
+                let mut page = file.root_mut();
+                for (k, v, p) in data.iter() {
+                    if *p == 0 {
+                        page.put_val(k, v);
+                    } else {
+                        page.put_ref(k, *p);
+                    }
+                }
             };
             let page = file.root();
-            file.save(page).unwrap();
+            file.save(page.deref()).unwrap();
         }
 
-        let mut page = {
-            let file = File::open(path).unwrap();
-            file.load(file.offset(ROOT), size).unwrap()
-        };
+        let file: File<Block> = File::open(path).unwrap();
+        let mut page = file.load(file.offset(ROOT), size).unwrap();
 
-        assert_eq!(
-            page.copy(),
-            vec![
-                (b"aaa".to_vec(), b"zxczxczxc".to_vec(), 0),
-                (b"bbb".to_vec(), b"asdasdasd".to_vec(), 0),
-                (b"ccc".to_vec(), b"qweqweqwe".to_vec(), 0),
-                (b"ddd".to_vec(), b"123123123".to_vec(), 0),
-                (b"xxx".to_vec(), vec![], 3333),
-                (b"yyy".to_vec(), vec![], 2222),
-                (b"zzz".to_vec(), vec![], 1111),
-            ]
-        );
+        assert_eq!(page.copy(), data);
 
-        assert_eq!(get(&page, b"aaa"), Some((b"zxczxczxc".to_vec(), 0)));
-        assert_eq!(get(&page, b"bbb"), Some((b"asdasdasd".to_vec(), 0)));
-        assert_eq!(get(&page, b"ccc"), Some((b"qweqweqwe".to_vec(), 0)));
-        assert_eq!(get(&page, b"ddd"), Some((b"123123123".to_vec(), 0)));
-        assert_eq!(get(&page, b"xxx"), Some((vec![], 3333)));
-        assert_eq!(get(&page, b"yyy"), Some((vec![], 2222)));
-        assert_eq!(get(&page, b"zzz"), Some((vec![], 1111)));
+        for (k, v, _) in data.iter().filter(|(_, _, p)| *p == 0)
+        // TODO remove filter for multi-page lookup
+        {
+            let x = file.lookup(k).unwrap();
+            assert_eq!(x.deref(), v);
+        }
+
+        for (k, v, p) in data.iter() {
+            assert_eq!(get(&page, k), Some((v.to_vec(), *p)));
+        }
 
         page.remove(page.find(b"aaa").unwrap());
         assert_eq!(get(&page, b"aaa"), None);
