@@ -39,9 +39,10 @@ impl Slot {
 
 pub(crate) trait Page: AsRef<[u8]> + AsMut<[u8]> {
     fn reserve(capacity: u32) -> Self;
-    fn create(id: u32, len: u32) -> Self;
+    fn create(id: u32, parent: u32, len: u32) -> Self;
 
     fn id(&self) -> u32;
+    fn parent(&self) -> u32;
 
     /// Current page's length in bytes.
     fn len(&self) -> u32;
@@ -88,4 +89,6 @@ pub(crate) trait Page: AsRef<[u8]> + AsMut<[u8]> {
 
     /// Make an owned copy of all entries in the page: (key, val, page).
     fn copy(&self) -> Vec<(Vec<u8>, Vec<u8>, u32)>;
+
+    fn clear(&mut self);
 }

@@ -74,11 +74,11 @@ impl Page for Block {
         Self { buf }
     }
 
-    fn create(id: u32, len: u32) -> Self {
+    fn create(id: u32, parent: u32, len: u32) -> Self {
         let mut buf = BytesMut::with_capacity(len as usize);
         buf.put_u32(id);
+        buf.put_u32(parent);
         buf.put_u32(len);
-        buf.put_u32(0);
         buf.put_u32(0);
         assert_eq!(buf.len(), HEAD);
         buf.extend_from_slice(&vec![0u8; len as usize - HEAD]);
@@ -89,12 +89,16 @@ impl Page for Block {
         get_u32(&self.buf, 0)
     }
 
-    fn len(&self) -> u32 {
+    fn parent(&self) -> u32 {
         get_u32(&self.buf, 4)
     }
 
-    fn size(&self) -> u32 {
+    fn len(&self) -> u32 {
         get_u32(&self.buf, 8)
+    }
+
+    fn size(&self) -> u32 {
+        get_u32(&self.buf, 12)
     }
 
     fn slot(&self, idx: u32) -> Option<Slot> {
@@ -254,6 +258,12 @@ impl Page for Block {
             })
             .collect::<Vec<_>>()
     }
+
+    fn clear(&mut self) {
+        let len = self.len() as usize;
+        let blank = vec![0u8; len];
+        self.buf.copy_from_slice(&blank);
+    }
 }
 
 const U32: usize = size_of::<u32>();
@@ -286,7 +296,7 @@ fn put_slice(buf: &mut BytesMut, pos: usize, src: &[u8]) {
 }
 
 fn put_size(buf: &mut BytesMut, val: u32) {
-    put_u32(buf, 8, val);
+    put_u32(buf, 12, val);
 }
 
 fn put_slot(buf: &mut BytesMut, idx: u32, slot: &Slot) {
@@ -322,7 +332,7 @@ mod tests {
             .map(|_| rng.gen::<u64>().to_be_bytes().to_vec())
             .collect::<Vec<_>>();
 
-        let mut page = Block::create(42, len as u32);
+        let mut page = Block::create(42, 101, len as u32);
 
         for (i, key) in keys.iter().enumerate() {
             if i % 2 == 0 {
@@ -364,7 +374,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let mut page = Block::create(42, len as u32);
+        let mut page = Block::create(42, 101, len as u32);
         for (key, val) in pairs.iter() {
             page.put_val(key, val).unwrap();
         }
@@ -391,7 +401,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let mut page = Block::create(42, len as u32);
+        let mut page = Block::create(42, 101, len as u32);
         for key in keys.iter() {
             page.put_ref(&key.to_be_bytes(), 42).unwrap();
         }
@@ -430,7 +440,7 @@ mod tests {
         let len =
             pairs.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>() + HEAD + pairs.len() * SLOT;
 
-        let mut page = Block::create(42, len as u32);
+        let mut page = Block::create(42, 101, len as u32);
         assert_eq!(page.free(), len as u32 - HEAD as u32);
         assert_eq!(page.full(), 0);
 
@@ -461,14 +471,15 @@ mod tests {
         let p3 = 142;
 
         let id = 42;
+        let parent = 101;
         let len = 128;
-        let mut page = Block::create(id, len);
+        let mut page = Block::create(id, parent, len);
         assert_eq!(page.id(), id);
         assert_eq!(page.len(), len);
         assert_eq!(page.buf.len(), len as usize);
         assert_eq!(
             &page.buf[0..HEAD],
-            &[0, 0, 0, id as u8, 0, 0, 0, len as u8, 0, 0, 0, 0, 0, 0, 0, 0]
+            &[0, 0, 0, id as u8, 0, 0, 0, parent as u8, 0, 0, 0, len as u8, 0, 0, 0, 0]
         );
 
         assert_eq!(page.put_val(k1, v1), Some(0));
@@ -545,5 +556,37 @@ mod tests {
         assert_eq!(page.find(k2).unwrap(), 0);
         assert_eq!(page.find(k3).unwrap(), 1);
         assert_eq!(page.find(b"no-such-key"), None);
+    }
+
+    #[test]
+    fn test_put_find_3() {
+        let data = vec![
+            (b"uno".to_vec(), b"la squadra azzurra".to_vec()),
+            (b"due".to_vec(), b"it's coming home".to_vec()),
+            (b"tre".to_vec(), b"red devils".to_vec()),
+        ];
+
+        let id = 42;
+        let len = 256;
+        let mut page = Block::create(id, 101, len);
+
+        for (k, v) in data.iter() {
+            page.put_val(k, v);
+        }
+
+        let mut copy = data.clone();
+        copy.sort_by_key(|x| x.0.clone());
+
+        assert_eq!(
+            page.copy()
+                .into_iter()
+                .map(|(k, v, _)| (k, v))
+                .collect::<Vec<_>>(),
+            copy
+        );
+
+        assert_eq!(page.find(&data[0].0), Some(2));
+        assert_eq!(page.find(&data[1].0), Some(0));
+        assert_eq!(page.find(&data[2].0), Some(1));
     }
 }

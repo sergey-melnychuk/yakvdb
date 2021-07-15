@@ -7,7 +7,9 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
+use std::ops::Deref;
 use std::path::Path;
+use crate::api::error::{Error, Result};
 
 struct File<P: Page> {
     /// Underlying file reference where all data is physically stored.
@@ -61,7 +63,7 @@ impl<P: Page> File<P> {
         buf.put_u32(head.page_bytes);
         buf.put_u32(head.page_count);
 
-        let root = P::create(ROOT, head.page_bytes);
+        let root = P::create(ROOT, 0, head.page_bytes);
         buf.put_slice(root.as_ref());
 
         file.write_all(buf.as_ref())?;
@@ -157,93 +159,145 @@ impl<P: Page> File<P> {
 }
 
 impl<P: Page> Tree<P> for File<P> {
-    fn lookup(&self, key: &[u8]) -> Option<Ref<[u8]>> {
-        // Keeps track of visited pages to avoid possible circular reference navigation.
+    fn lookup(&self, key: &[u8]) -> Result<Option<Ref<[u8]>>> {
         let mut seen = HashSet::with_capacity(8);
         let mut page = self.root();
-        seen.insert(page.id());
-        loop {
-            let idx = page.ceil(key)?;
-
-            let slot = page.slot(idx)?;
-            if slot.page == 0 {
-                // Log how deep the lookup went into the tree depth: seen.len()
-                if let Some(idx) = page.find(key) {
-                    return Some(Ref::map(page, |p| p.val(idx)));
-                }
-            } else {
-                if seen.contains(&slot.page) {
-                    // TODO log error: circular reference is detected between pages
-                    return None;
-                }
-                seen.insert(slot.page);
-                page = self.page(slot.page)?;
-            }
-        }
-    }
-
-    fn insert(&mut self, key: &[u8], val: &[u8]) {
-        let mut page = self.root_mut();
-        let mut path = Vec::with_capacity(8);
-        path.push(page.id());
         loop {
             let idx_opt = page.ceil(key);
             if idx_opt.is_none() {
-                // TODO inserting max value - page needs to be updated
-                return;
+                return Ok(None);
             }
-
             let idx = idx_opt.unwrap();
 
-            let slot = page.slot(idx).unwrap();
-            if slot.page == 0 {
-                let fits = page.fits((key.len() + val.len()) as u32);
-                if !fits {
-                    // TODO this page needs to be split into two
-                }
-                page.put_val(key, val);
-            } else {
-                path.push(page.id());
-                let page_opt = self.page_mut(slot.page);
-                if page_opt.is_none() {
-                    // TODO log error: referenced child page not found!
-                    return;
-                }
+            let slot_opt = page.slot(idx);
+            if slot_opt.is_none() {
+                return Err(Error::Tree(page.id(), format!("Slot not found: {}", idx)));
+            }
+            let slot = slot_opt.unwrap();
 
+            if slot.page == 0 {
+                // Log how deep the lookup went into the tree depth: seen.len()
+                return if key == page.key(idx) {
+                    Ok(Some(Ref::map(page, |p| p.val(idx))))
+                } else {
+                    Ok(None)
+                };
+            } else {
+                if seen.contains(&slot.page) {
+                    return Err(Error::Tree(page.id(), "Cyclic reference detected".to_string()));
+                }
+                seen.insert(page.id());
+
+                let page_opt = self.page(slot.page);
+                if page_opt.is_none() {
+                    return Err(Error::Tree(page.id(), format!("Page not found: {}", slot.page)));
+                }
                 page = page_opt.unwrap();
             }
         }
     }
 
-    fn remove(&mut self, key: &[u8]) {
+    fn insert(&mut self, key: &[u8], val: &[u8]) -> Result<()> {
         let mut page = self.root_mut();
+        let mut seen = HashSet::with_capacity(8);
         let mut path = Vec::with_capacity(8);
-        path.push(page.id());
+        loop {
+            if page.size() == 0 {
+                page.put_val(key, val);
+                self.flush(page.deref())?;
+                return Ok(());
+            }
+
+            let idx = page.ceil(key)
+                .unwrap_or_else(|| page.size() - 1);
+
+            if let Some((parent_id, parent_idx)) = path.last().cloned() {
+                // TODO test it!
+                let mut parent_page = self.page_mut(parent_id).unwrap();
+                let parent_key = parent_page.key(parent_idx);
+                if key > parent_key {
+                    let parent_key_copy = &parent_key.to_vec();
+                    parent_page.put_ref(&parent_key_copy, page.id());
+                    self.flush(parent_page.deref())?;
+                }
+            }
+
+            let slot_opt = page.slot(idx);
+            if slot_opt.is_none() {
+                return Err(Error::Tree(page.id(), format!("Slot not found: {}", idx)));
+            }
+            let slot = slot_opt.unwrap();
+
+            if slot.page == 0 {
+                let len = (key.len() + val.len()) as u32;
+                if page.fits(len) {
+                    page.put_val(key, val);
+                    self.flush(page.deref())?;
+                    return Ok(());
+                } else {
+                    // TODO this page needs to be split into two
+                    return Err(Error::Tree(page.id(), format!("Entry does not fit into the page: size={} free={}", len, page.free())))
+                }
+            } else {
+                path.push((page.id(), idx));
+                if seen.contains(&slot.page) {
+                    return Err(Error::Tree(page.id(), "Cyclic reference detected".to_string()));
+                }
+                seen.insert(page.id());
+
+                let page_opt = self.page_mut(slot.page);
+                if page_opt.is_none() {
+                    return Err(Error::Tree(page.id(), format!("Page not found: {}", slot.page)));
+                }
+                page = page_opt.unwrap();
+            }
+        }
+    }
+
+    fn remove(&mut self, key: &[u8]) -> Result<()>  {
+        let mut page = self.root_mut();
+        let mut seen = HashSet::with_capacity(8);
+        let mut path = Vec::with_capacity(8);
         loop {
             let idx_opt = page.ceil(key);
             if idx_opt.is_none() {
-                return;
+                return Ok(());
             }
-
             let idx = idx_opt.unwrap();
 
-            if page.key(idx) == page.max() {
-                // TODO Override page's highest key, as current highest is being removed
+            let slot_opt = page.slot(idx);
+            if slot_opt.is_none() {
+                return Err(Error::Tree(page.id(), format!("Slot not found: {}", idx)));
             }
+            let slot = slot_opt.unwrap();
 
-            let slot = page.slot(idx).unwrap();
             if slot.page == 0 {
-                // TODO Check if the page become too small and needs to be merged into another one
-                // TODO Check if the destination page (where current one can be merged) exists first
                 page.remove(idx);
-            } else {
-                path.push(page.id());
-                let page_opt = self.page_mut(slot.page);
-                if page_opt.is_none() {
-                    // TODO log error: referenced child page not found!
-                    return;
+
+                if page.size() > 0 && idx == page.size() - 1 {
+                    // TODO test it!
+                    if let Some((parent_id, parent_idx)) = path.last().cloned() {
+                        let mut parent_page = self.page_mut(parent_id).unwrap();
+                        parent_page.remove(parent_idx);
+                        parent_page.put_ref(page.max(), page.id());
+                        self.flush(parent_page.deref())?;
+                    }
                 }
 
+                // TODO Check if the page become too small and needs to be merged into another one
+                // TODO Check if the destination page (where current one can be merged) exists
+                return Ok(());
+            } else {
+                path.push((page.id(), idx));
+                if seen.contains(&slot.page) {
+                    return Err(Error::Tree(page.id(), "Cyclic reference detected".to_string()));
+                }
+                seen.insert(page.id());
+
+                let page_opt = self.page_mut(slot.page);
+                if page_opt.is_none() {
+                    return Err(Error::Tree(page.id(), format!("Page not found: {}", slot.page)));
+                }
                 page = page_opt.unwrap();
             }
         }
@@ -275,11 +329,12 @@ impl<P: Page> Tree<P> for File<P> {
         Some(page)
     }
 
-    fn flush(&mut self, page: &P) -> crate::api::error::Result<()> {
+    fn flush(&self, page: &P) -> crate::api::error::Result<()> {
         self.save(page).map_err(|e| e.into())
     }
 
     fn next_id(&mut self) -> u32 {
+        // TODO Append new page if necessary (and initialize it)!
         self.empty.peek().cloned().unwrap().0
     }
 
@@ -287,12 +342,101 @@ impl<P: Page> Tree<P> for File<P> {
         self.empty.push(Reverse(id))
     }
 
-    fn split(&mut self, _page: &P) -> (u32, u32) {
-        todo!()
+    // TODO test it!
+    fn split(&mut self, page: &mut P) -> Result<()> {
+        let id = page.id();
+        if id == ROOT {
+            let lo_id = self.next_id();
+            let hi_id = self.next_id();
+            let mut lo = self.page_mut(lo_id).unwrap();
+            let mut hi = self.page_mut(hi_id).unwrap();
+
+            let size = page.size();
+            let half = size / 2;
+
+            (0..half).for_each(|idx| {
+                let p = page.slot(idx).unwrap().page;
+                let k = page.key(idx);
+                if p == 0 {
+                    let v = page.val(idx);
+                    lo.put_val(k, v);
+                } else {
+                    lo.put_ref(k, p);
+                }
+            });
+
+            (half..size).for_each(|idx| {
+                let p = page.slot(idx).unwrap().page;
+                let k = page.key(idx);
+                if p == 0 {
+                    let v = page.val(idx);
+                    hi.put_val(k, v);
+                } else {
+                    hi.put_ref(k, p);
+                }
+            });
+
+            page.clear();
+            page.put_ref(lo.max(), lo_id);
+            page.put_ref(hi.max(), hi_id);
+
+            self.flush(lo.deref())?;
+            self.flush(hi.deref())?;
+            self.flush(page.deref())?;
+            Ok(())
+        } else {
+            let peer_id = self.next_id();
+            let mut peer = self.page_mut(peer_id).unwrap();
+
+            let size = page.size();
+            let half = size / 2;
+
+            (half..size).for_each(|idx| {
+               let p = page.slot(idx).unwrap().page;
+                let k = page.key(idx);
+                if p == 0 {
+                    let v = page.val(idx);
+                    peer.put_val(k, v);
+                } else {
+                    peer.put_ref(k, p);
+                }
+                page.remove(idx);
+            });
+
+            let parent_id = page.parent();
+            let mut parent = self.page_mut(parent_id).unwrap();
+
+            parent.put_ref(page.max(), page.id());
+            parent.put_ref(peer.max(), peer_id);
+
+            self.flush(parent.deref())?;
+            self.flush(peer.deref())?;
+            self.flush(page.deref())?;
+
+            Ok(())
+        }
     }
 
-    fn merge(&mut self, _this: &mut P, _that: &P) -> u32 {
-        todo!()
+    // TODO test it!
+    fn merge(&mut self, this: &mut P, that: &mut P) -> Result<()> {
+        (0..that.size()).into_iter()
+            .for_each(|idx| {
+                let slot = that.slot(idx).unwrap();
+                let k = that.key(idx);
+                if slot.page == 0 {
+                    let v = that.val(idx);
+                    this.put_val(k, v);
+                } else {
+                    let p = slot.page;
+                    this.put_ref(k, p);
+                }
+            });
+        self.free_id(that.id());
+        that.clear();
+
+        self.flush(this.deref())?;
+        self.flush(that.deref())?;
+        Ok(())
     }
 }
 
@@ -308,8 +452,8 @@ mod tests {
     }
 
     #[test]
-    fn test_file() {
-        let path = Path::new("target/file_test.tmp");
+    fn test_page() {
+        let path = Path::new("target/page_test.tmp");
         if path.exists() {
             fs::remove_file(path).unwrap();
         }
@@ -346,13 +490,6 @@ mod tests {
 
         assert_eq!(page.copy(), data);
 
-        for (k, v, _) in data.iter().filter(|(_, _, p)| *p == 0)
-        // TODO remove filter for multi-page lookup
-        {
-            let x = file.lookup(k).unwrap();
-            assert_eq!(x.deref(), v);
-        }
-
         for (k, v, p) in data.iter() {
             assert_eq!(get(&page, k), Some((v.to_vec(), *p)));
         }
@@ -362,5 +499,35 @@ mod tests {
 
         page.remove(page.find(b"zzz").unwrap());
         assert_eq!(get(&page, b"zzz"), None);
+    }
+
+    #[test]
+    fn test_file() {
+        let path = Path::new("target/file_test.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        let size: u32 = 256;
+
+        let data = vec![
+            (b"uno".to_vec(), b"la squadra azzurra".to_vec()),
+            (b"due".to_vec(), b"it's coming home".to_vec()),
+            (b"tre".to_vec(), b"red devils".to_vec()),
+        ];
+
+        let mut file: File<Block> = File::make(path, size).unwrap();
+
+        for (k, v) in data.iter() {
+            file.insert(k, v).unwrap();
+        }
+
+        for (k, v) in data.iter() {
+            assert_eq!(file.lookup(k).unwrap().unwrap().deref(), v);
+            file.remove(k).unwrap();
+        }
+
+        for (k, _) in data.iter() {
+            assert!(file.lookup(k).unwrap().is_none());
+        }
     }
 }
