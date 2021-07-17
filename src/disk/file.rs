@@ -1,6 +1,7 @@
 use crate::api::error::{Error, Result};
 use crate::api::page::Page;
 use crate::api::tree::Tree;
+use crate::util::hex::hex;
 use bytes::{Buf, BufMut, BytesMut};
 use std::cell::{Ref, RefCell, RefMut};
 use std::cmp::Reverse;
@@ -10,7 +11,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::ops::Deref;
 use std::path::Path;
-use crate::util::hex::hex;
+use log::{debug, trace};
 
 pub(crate) struct File<P: Page> {
     /// Underlying file reference where all data is physically stored.
@@ -300,7 +301,7 @@ impl<P: Page> Tree<P> for File<P> {
 
             let id = page.id();
             if slot.page == 0 {
-                println!("remove: key={} page={} idx={}", hex(key), id, idx);
+                debug!("remove: key={} page={} idx={}", hex(key), id, idx);
                 page.remove(idx);
                 drop(page);
 
@@ -337,16 +338,16 @@ impl<P: Page> Tree<P> for File<P> {
                                 .map(|(peer_id, _)| peer_id)
                         };
                         if let Some(peer_id) = peer_id {
-                            println!("merge: found peer_id={} to merge page_id={} (parent_id={})", peer_id, page_id, parent_id);
+                            trace!("merge: found peer_id={} to merge page_id={} (parent_id={})", peer_id, page_id, parent_id);
                             let peer_max = {
                                 let peer = self.page(peer_id).unwrap();
                                 peer.max().to_vec()
                             };
-                            println!("\t merge: peer_max={}", hex(&peer_max));
+                            trace!("\t merge: peer_max={}", hex(&peer_max));
                             let mut parent = self.page_mut(parent_id).unwrap();
                             parent.remove(idx);
                             let peer_idx = parent.ceil(&peer_max).unwrap();
-                            println!("\t merge: parent remove: peer_idx={} idx={}", peer_idx, idx);
+                            trace!("\t merge: parent remove: peer_idx={} idx={}", peer_idx, idx);
                             parent.remove(peer_idx);
                             drop(parent);
 
@@ -355,9 +356,9 @@ impl<P: Page> Tree<P> for File<P> {
                                 let peer = self.page(peer_id).unwrap();
                                 peer.max().to_vec()
                             };
-                            println!("\t merge: page_max={}", hex(&page_max));
+                            trace!("\t merge: page_max={}", hex(&page_max));
                             let mut parent = self.page_mut(parent_id).unwrap();
-                            println!("\t merge: parent insert: page_max={}, peer_id={}", hex(&page_max), peer_id);
+                            trace!("\t merge: parent insert: page_max={}, peer_id={}", hex(&page_max), peer_id);
                             parent.put_ref(&page_max, peer_id);
                             idx = parent.ceil(&page_max).unwrap();
                             page_id = peer_id;
@@ -482,7 +483,7 @@ impl<P: Page> Tree<P> for File<P> {
             {
                 let mut lo = self.page_mut(lo_id).unwrap();
                 copy.iter().take(half).for_each(|(key, val, page)| {
-                    println!("split: move k={} v={} p={} from {} to {}", hex(key), hex(val), *page, id, lo_id);
+                    trace!("split: move k={} v={} p={} from {} to {}", hex(key), hex(val), *page, id, lo_id);
                     if *page == 0 {
                         lo.put_val(key, val);
                     } else {
@@ -494,7 +495,7 @@ impl<P: Page> Tree<P> for File<P> {
             {
                 let mut hi = self.page_mut(hi_id).unwrap();
                 copy.iter().skip(half).for_each(|(key, val, page)| {
-                    println!("split: move k={} v={} p={} from {} to {}", hex(key), hex(val), *page, id, hi_id);
+                    trace!("split: move k={} v={} p={} from {} to {}", hex(key), hex(val), *page, id, hi_id);
                     if *page == 0 {
                         hi.put_val(key, val);
                     } else {
@@ -534,7 +535,7 @@ impl<P: Page> Tree<P> for File<P> {
             let peer_max = {
                 let mut peer = self.page_mut(peer_id).unwrap();
                 copy.iter().skip(half).for_each(|(key, val, p)| {
-                    println!("split: move k={} v={} p={} from {} to {}", hex(key), hex(val), *p, id, peer_id);
+                    trace!("split: move k={} v={} p={} from {} to {}", hex(key), hex(val), *p, id, peer_id);
                     if *p == 0 {
                         peer.put_val(key, val);
                     } else {
@@ -569,7 +570,7 @@ impl<P: Page> Tree<P> for File<P> {
         {
             let mut page = self.page_mut(dst_id).unwrap();
             for (key, val, p) in src_copy {
-                println!("merge: move k={} v={} p={} from {} to {}", hex(&key), hex(&val), p, src_id, dst_id);
+                trace!("merge: move k={} v={} p={} from {} to {}", hex(&key), hex(&val), p, src_id, dst_id);
                 if p == 0 {
                     page.put_val(&key, &val);
                 } else {
@@ -745,10 +746,10 @@ mod tests {
         };
 
         for (k, v) in data.iter() {
-            println!("insert: key={} val={}", hex(k), hex(v));
+            debug!("insert: key={} val={}", hex(k), hex(v));
             file.insert(k, v).unwrap();
         }
-        println!("{}", dump(&file));
+        debug!("{}", dump(&file));
 
         let keys = {
             let mut rng = StdRng::seed_from_u64(3);
@@ -759,26 +760,21 @@ mod tests {
             result.shuffle(&mut rng);
             result
         };
-        for k in keys.iter() {
-            println!("remove: key={}", hex(k));
-            file.remove(k).unwrap();
-            println!("{}", dump(&file));
-        }
 
-        // TODO
-        /*
-        for (i, (key, _)) in data.iter().enumerate() {
-            println!("remove: key={}", hex(key));
+        let mut removed = HashSet::with_capacity(size as usize);
+        for key in keys.iter() {
+            debug!("remove: key={}", hex(key));
             file.remove(key).unwrap();
-            for (k, _) in data.iter().take(i + 1) {
-                assert!(file.lookup(k).unwrap().is_none());
-            }
-            for (k, v) in data.iter().skip(i + 1) {
-                assert_eq!(file.lookup(k).unwrap().unwrap().deref(), v);
+            removed.insert(key.to_vec());
+            for (k, v) in data.iter() {
+                if removed.contains(k) {
+                    assert!(file.lookup(k).unwrap().is_none());
+                } else {
+                    assert_eq!(file.lookup(k).unwrap().unwrap().deref(), v);
+                }
             }
         }
-        */
-        println!("{}", dump(&file));
+        debug!("{}", dump(&file));
 
         let root = file.root();
         let copy = root.copy();
@@ -809,7 +805,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         for (i, (k, v)) in data.iter().enumerate() {
-            println!("({:05}) insert: key={} val={}", i, hex(k), hex(v));
+            debug!("({:05}) insert: key={} val={}", i, hex(k), hex(v));
             file.insert(k, v).unwrap();
         }
 
@@ -818,12 +814,12 @@ mod tests {
         }
 
         for (i, (key, _)) in data.iter().enumerate() {
-            println!("({:05}) remove: key={}", i, hex(key));
+            debug!("({:05}) remove: key={}", i, hex(key));
             file.remove(key).unwrap();
         }
 
         for (i, (key, _)) in data.iter().enumerate() {
-            println!("({:05}) lookup: key={}", i, hex(key));
+            debug!("({:05}) lookup: key={}", i, hex(key));
             let found = file.lookup(key).unwrap()
                 .map(|v| v.borrow().to_vec())
                 .map(|v| hex(&v));
@@ -831,7 +827,7 @@ mod tests {
         }
 
         let copy = file.root().copy();
-        println!("{}", dump(&file));
+        debug!("{}", dump(&file));
         assert!(copy.is_empty());
     }
 
