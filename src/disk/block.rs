@@ -19,6 +19,11 @@ impl AsRef<[u8]> for Block {
     }
 }
 
+const ID_OFFSET: usize = 0;
+const CAP_OFFSET: usize = 4;
+const SIZE_OFFSET: usize = 8;
+const RESERVED: u32 = 0xC0DE1542;
+
 impl Block {
     fn put_entry(&mut self, key: &[u8], val: &[u8], page: u32) -> Option<u32> {
         if !self.fits((key.len() + val.len()) as u32) {
@@ -48,7 +53,7 @@ impl Block {
             .iter()
             .map(|slot| slot.offset)
             .min()
-            .unwrap_or_else(|| self.len());
+            .unwrap_or_else(|| self.cap());
         let offset = end - klen - vlen;
         let slot = Slot::new(offset, klen, vlen, page);
 
@@ -77,31 +82,27 @@ impl Page for Block {
         Self { buf }
     }
 
-    fn create(id: u32, parent: u32, len: u32) -> Self {
-        let mut buf = BytesMut::with_capacity(len as usize);
+    fn create(id: u32, cap: u32) -> Self {
+        let mut buf = BytesMut::with_capacity(cap as usize);
         buf.put_u32(id);
-        buf.put_u32(parent);
-        buf.put_u32(len);
+        buf.put_u32(cap);
         buf.put_u32(0);
+        buf.put_u32(RESERVED);
         assert_eq!(buf.len(), HEAD);
-        buf.extend_from_slice(&vec![0u8; len as usize - HEAD]);
+        buf.extend_from_slice(&vec![0u8; cap as usize - HEAD]);
         Self { buf }
     }
 
     fn id(&self) -> u32 {
-        get_u32(&self.buf, 0)
+        get_u32(&self.buf, ID_OFFSET)
     }
 
-    fn parent(&self) -> u32 {
-        get_u32(&self.buf, 4)
-    }
-
-    fn len(&self) -> u32 {
-        get_u32(&self.buf, 8)
+    fn cap(&self) -> u32 {
+        get_u32(&self.buf, CAP_OFFSET)
     }
 
     fn size(&self) -> u32 {
-        get_u32(&self.buf, 12)
+        get_u32(&self.buf, SIZE_OFFSET)
     }
 
     fn slot(&self, idx: u32) -> Option<Slot> {
@@ -147,7 +148,7 @@ impl Page for Block {
     fn free(&self) -> u32 {
         let size = self.size();
         if size == 0 {
-            return self.len() - HEAD as u32;
+            return self.cap() - HEAD as u32;
         }
         let lo = HEAD as u32 + size * SLOT as u32;
         let hi = (0..size)
@@ -162,7 +163,7 @@ impl Page for Block {
     }
 
     fn full(&self) -> u8 {
-        let len = self.len() - HEAD as u32;
+        let len = self.cap() - HEAD as u32;
         ((len - self.free()) * 100 / len) as u8
     }
 
@@ -224,7 +225,7 @@ impl Page for Block {
         put_size(&mut self.buf, size - 1);
 
         let total: u32 = slots.iter().map(|slot| slot.klen + slot.vlen).sum();
-        let mut offset = self.len() - total;
+        let mut offset = self.cap() - total;
 
         let copy = slots
             .iter()
@@ -268,12 +269,12 @@ impl Page for Block {
     }
 
     fn clear(&mut self) {
-        let len = self.len() as usize;
+        let len = self.cap() as usize;
         let mut tmp = BytesMut::with_capacity(len);
         tmp.put_u32(self.id());
-        tmp.put_u32(self.parent());
-        tmp.put_u32(self.len());
+        tmp.put_u32(self.cap());
         tmp.put_u32(0);
+        tmp.put_u32(RESERVED);
         self.buf[..HEAD].copy_from_slice(tmp.as_ref());
         let blank = vec![0xFFu8; len - HEAD];
         self.buf[HEAD..].copy_from_slice(&blank);
@@ -310,7 +311,7 @@ fn put_slice(buf: &mut BytesMut, pos: usize, src: &[u8]) {
 }
 
 fn put_size(buf: &mut BytesMut, val: u32) {
-    put_u32(buf, 12, val);
+    put_u32(buf, SIZE_OFFSET, val);
 }
 
 fn put_slot(buf: &mut BytesMut, idx: u32, slot: &Slot) {
@@ -346,7 +347,7 @@ mod tests {
             .map(|_| rng.gen::<u64>().to_be_bytes().to_vec())
             .collect::<Vec<_>>();
 
-        let mut page = Block::create(42, 101, len as u32);
+        let mut page = Block::create(42, len as u32);
 
         for (i, key) in keys.iter().enumerate() {
             if i % 2 == 0 {
@@ -388,7 +389,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let mut page = Block::create(42, 101, len as u32);
+        let mut page = Block::create(42, len as u32);
         for (key, val) in pairs.iter() {
             page.put_val(key, val).unwrap();
         }
@@ -415,7 +416,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let mut page = Block::create(42, 101, len as u32);
+        let mut page = Block::create(42, len as u32);
         for key in keys.iter() {
             page.put_ref(&key.to_be_bytes(), 42).unwrap();
         }
@@ -454,7 +455,7 @@ mod tests {
         let len =
             pairs.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>() + HEAD + pairs.len() * SLOT;
 
-        let mut page = Block::create(42, 101, len as u32);
+        let mut page = Block::create(42, len as u32);
         assert_eq!(page.free(), len as u32 - HEAD as u32);
         assert_eq!(page.full(), 0);
 
@@ -485,11 +486,10 @@ mod tests {
         let p3 = 142;
 
         let id = 42;
-        let parent = 101;
         let len = 128;
-        let mut page = Block::create(id, parent, len);
+        let mut page = Block::create(id, len);
         assert_eq!(page.id(), id);
-        assert_eq!(page.len(), len);
+        assert_eq!(page.cap(), len);
         assert_eq!(page.buf.len(), len as usize);
         assert_eq!(
             &page.buf[0..HEAD],
@@ -501,15 +501,15 @@ mod tests {
                 0,
                 0,
                 0,
-                parent as u8,
-                0,
-                0,
-                0,
                 len as u8,
                 0,
                 0,
                 0,
-                0
+                0,
+                0xC0,
+                0xDE,
+                0x15,
+                0x42,
             ]
         );
 
@@ -599,7 +599,7 @@ mod tests {
 
         let id = 42;
         let len = 256;
-        let mut page = Block::create(id, 101, len);
+        let mut page = Block::create(id, len);
 
         for (k, v) in data.iter() {
             page.put_val(k, v);

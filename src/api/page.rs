@@ -23,13 +23,12 @@ impl Slot {
 
 pub(crate) trait Page: AsRef<[u8]> + AsMut<[u8]> {
     fn reserve(capacity: u32) -> Self;
-    fn create(id: u32, parent: u32, len: u32) -> Self;
+    fn create(id: u32, cap: u32) -> Self;
 
     fn id(&self) -> u32;
-    fn parent(&self) -> u32;
 
-    /// Current page's length in bytes.
-    fn len(&self) -> u32;
+    /// Current page's capacity in bytes.
+    fn cap(&self) -> u32;
 
     /// Number of entries (and slots) stored in the page.
     fn size(&self) -> u32;

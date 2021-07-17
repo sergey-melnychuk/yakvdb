@@ -17,14 +17,16 @@ pub(crate) trait Tree<P: Page> {
     fn flush(&self, id: u32) -> Result<()>;
 
     /// Reserve the provided page id - such id will never be returned by `next_id` until freed.
-    fn next_id(&self, parent_id: u32) -> u32;
+    fn next_id(&self) -> u32;
 
     /// Un-reserve the provided page id making it available for future via `next_id`.
     fn free_id(&self, id: u32);
 
     /// Split given page into two subpages containing ~equal number of entries.
-    fn split(&self, id: u32) -> Result<()>;
+    fn split(&self, id: u32, parent_id: u32) -> Result<()>;
 
     /// Merge page `src_id` into page `dst_id`, effectively removing page `src_id`.
     fn merge(&self, src_id: u32, dst_id: u32) -> Result<()>;
+
+    fn dump(&self) -> String;
 }

@@ -1,11 +1,12 @@
 use std::path::Path;
-use log::{error, info};
+use log::{debug, error, info};
 use rand::prelude::StdRng;
 use rand::{RngCore, SeedableRng};
 use crate::api::tree::Tree;
 use crate::disk::block::Block;
 use crate::disk::file::File;
 use crate::util::hex::hex;
+use crate::api::page::Page;
 
 pub(crate) mod api;
 pub(crate) mod disk;
@@ -24,7 +25,7 @@ fn setup_logger() -> Result<(), fern::InitError> {
         })
         .level(log::LevelFilter::Info)
         .chain(std::io::stdout())
-        .chain(fern::log_file("yakvdb.log")?)
+        //.chain(fern::log_file("yakvdb.log")?) // TODO set up log rotation here?
         .apply()?;
     Ok(())
 }
@@ -32,21 +33,19 @@ fn setup_logger() -> Result<(), fern::InitError> {
 fn main() {
     setup_logger().expect("logger");
 
-    let path = Path::new("target/main_10k.tmp");
+    let path = Path::new("target/main_100k.tmp");
     let size: u32 = 4096;
 
     let mut file: File<Block> = if path.exists() {
-        if path.exists() {
-            std::fs::remove_file(path).unwrap();
-        }
-        //File::open(path).unwrap() // TODO perform cleanup/compaction when opening existing file
-        File::make(path, size).unwrap()
+        let file = File::open(path).unwrap();
+        // TODO perform cleanup/compaction when opening existing file
+        file
     } else {
         File::make(path, size).unwrap()
     };
 
     let mut rng = StdRng::seed_from_u64(42);
-    let count = 11918 + 1;  // TODO Still works on 11918, but fails on 11919 (seed: 42)
+    let count = 100 * 1000;
     let data = (0..count)
         .into_iter()
         .map(|_| {
@@ -58,8 +57,15 @@ fn main() {
         .collect::<Vec<_>>();
 
     for (k, v) in data.iter() {
+        debug!("insert: key='{}' val='{}'", hex(k), hex(v));
         file.insert(k, v).unwrap();
     }
+
+    let full = {
+        let root = file.root();
+        root.full()
+    };
+    debug!("root.full={}", full);
 
     for (k, v) in data.iter() {
         let opt = file.lookup(k).unwrap();
