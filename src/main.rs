@@ -1,12 +1,12 @@
-use std::path::Path;
-use log::{debug, error, info};
-use rand::prelude::StdRng;
-use rand::{RngCore, SeedableRng};
+use crate::api::page::Page;
 use crate::api::tree::Tree;
 use crate::disk::block::Block;
 use crate::disk::file::File;
 use crate::util::hex::hex;
-use crate::api::page::Page;
+use log::{debug, error, info};
+use rand::prelude::StdRng;
+use rand::{RngCore, SeedableRng};
+use std::path::Path;
 
 pub(crate) mod api;
 pub(crate) mod disk;
@@ -72,7 +72,12 @@ fn main() {
         if let Some(r) = opt {
             let val = r.to_vec();
             if val != v.to_vec() {
-                error!("key='{}' expected val='{}' but got '{}'", hex(k), hex(v), hex(&val));
+                error!(
+                    "key='{}' expected val='{}' but got '{}'",
+                    hex(k),
+                    hex(v),
+                    hex(&val)
+                );
             }
         } else {
             error!("key='{}' not found", hex(k));

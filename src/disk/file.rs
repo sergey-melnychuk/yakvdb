@@ -3,6 +3,7 @@ use crate::api::page::Page;
 use crate::api::tree::Tree;
 use crate::util::hex::hex;
 use bytes::{Buf, BufMut, BytesMut};
+use log::{debug, trace};
 use std::cell::{Ref, RefCell, RefMut};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -11,7 +12,6 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::ops::Deref;
 use std::path::Path;
-use log::{debug, trace};
 
 pub(crate) struct File<P: Page> {
     /// Underlying file reference where all data is physically stored.
@@ -212,9 +212,7 @@ impl<P: Page> Tree<P> for File<P> {
         let mut path = Vec::with_capacity(8);
         loop {
             let id = page.id();
-            let parent_id = path.last().cloned()
-                .map(|(id, _)| id)
-                .unwrap_or_default();
+            let parent_id = path.last().cloned().map(|(id, _)| id).unwrap_or_default();
 
             if page.size() == 0 {
                 page.put_val(key, val);
@@ -356,7 +354,12 @@ impl<P: Page> Tree<P> for File<P> {
                                 .map(|(peer_id, _)| peer_id)
                         };
                         if let Some(peer_id) = peer_id {
-                            trace!("merge: found peer_id={} to merge page_id={} (parent_id={})", peer_id, page_id, parent_id);
+                            trace!(
+                                "merge: found peer_id={} to merge page_id={} (parent_id={})",
+                                peer_id,
+                                page_id,
+                                parent_id
+                            );
                             let peer_max = {
                                 let peer = self.page(peer_id).unwrap();
                                 peer.max().to_vec()
@@ -376,7 +379,11 @@ impl<P: Page> Tree<P> for File<P> {
                             };
                             trace!("\t merge: page_max={}", hex(&page_max));
                             let mut parent = self.page_mut(parent_id).unwrap();
-                            trace!("\t merge: parent insert: page_max={}, peer_id={}", hex(&page_max), peer_id);
+                            trace!(
+                                "\t merge: parent insert: page_max={}, peer_id={}",
+                                hex(&page_max),
+                                peer_id
+                            );
                             parent.put_ref(&page_max, peer_id);
                             idx = parent.ceil(&page_max).unwrap();
                             page_id = peer_id;
@@ -457,9 +464,7 @@ impl<P: Page> Tree<P> for File<P> {
 
     fn flush(&self) -> crate::api::error::Result<()> {
         let pages = {
-            let result = self.dirty.borrow().iter()
-                .cloned()
-                .collect::<Vec<_>>();
+            let result = self.dirty.borrow().iter().cloned().collect::<Vec<_>>();
             self.dirty.borrow_mut().clear();
             result
         };
@@ -504,7 +509,10 @@ impl<P: Page> Tree<P> for File<P> {
         if id == ROOT {
             let lo_id = self.next_id()?;
             let hi_id = self.next_id()?;
-            debug!("split: root={} into lo={} and hi={} (parent={})", id, lo_id, hi_id, parent_id);
+            debug!(
+                "split: root={} into lo={} and hi={} (parent={})",
+                id, lo_id, hi_id, parent_id
+            );
 
             let (copy, lo_max, hi_max) = {
                 let page = self.page(id).unwrap();
@@ -519,7 +527,14 @@ impl<P: Page> Tree<P> for File<P> {
             {
                 let mut lo = self.page_mut(lo_id).unwrap();
                 copy.iter().take(half).for_each(|(key, val, page)| {
-                    trace!("split: move k={} v={} p={} from {} to {}", hex(key), hex(val), *page, id, lo_id);
+                    trace!(
+                        "split: move k={} v={} p={} from {} to {}",
+                        hex(key),
+                        hex(val),
+                        *page,
+                        id,
+                        lo_id
+                    );
                     if *page == 0 {
                         lo.put_val(key, val);
                     } else {
@@ -531,7 +546,14 @@ impl<P: Page> Tree<P> for File<P> {
             {
                 let mut hi = self.page_mut(hi_id).unwrap();
                 copy.iter().skip(half).for_each(|(key, val, page)| {
-                    trace!("split: move k={} v={} p={} from {} to {}", hex(key), hex(val), *page, id, hi_id);
+                    trace!(
+                        "split: move k={} v={} p={} from {} to {}",
+                        hex(key),
+                        hex(val),
+                        *page,
+                        id,
+                        hi_id
+                    );
                     if *page == 0 {
                         hi.put_val(key, val);
                     } else {
@@ -558,7 +580,10 @@ impl<P: Page> Tree<P> for File<P> {
             };
             let half = copy.len() / 2;
             let peer_id = self.next_id()?;
-            debug!("split: page={} into peer={} (parent={})", id, peer_id, parent_id);
+            debug!(
+                "split: page={} into peer={} (parent={})",
+                id, peer_id, parent_id
+            );
 
             let page_max = {
                 let mut page = self.page_mut(id).unwrap();
@@ -572,7 +597,14 @@ impl<P: Page> Tree<P> for File<P> {
             let peer_max = {
                 let mut peer = self.page_mut(peer_id).unwrap();
                 copy.iter().skip(half).for_each(|(key, val, p)| {
-                    trace!("split: move k={} v={} p={} from {} to {}", hex(key), hex(val), *p, id, peer_id);
+                    trace!(
+                        "split: move k={} v={} p={} from {} to {}",
+                        hex(key),
+                        hex(val),
+                        *p,
+                        id,
+                        peer_id
+                    );
                     if *p == 0 {
                         peer.put_val(key, val);
                     } else {
@@ -584,7 +616,7 @@ impl<P: Page> Tree<P> for File<P> {
 
             {
                 let mut parent = self.page_mut(parent_id).unwrap();
-                let idx= parent.find(&max).unwrap();
+                let idx = parent.find(&max).unwrap();
                 parent.remove(idx);
                 parent.put_ref(&page_max, id);
                 parent.put_ref(&peer_max, peer_id);
@@ -607,7 +639,14 @@ impl<P: Page> Tree<P> for File<P> {
         {
             let mut page = self.page_mut(dst_id).unwrap();
             for (key, val, p) in src_copy {
-                trace!("merge: move k={} v={} p={} from {} to {}", hex(&key), hex(&val), p, src_id, dst_id);
+                trace!(
+                    "merge: move k={} v={} p={} from {} to {}",
+                    hex(&key),
+                    hex(&val),
+                    p,
+                    src_id,
+                    dst_id
+                );
                 if p == 0 {
                     page.put_val(&key, &val);
                 } else {
@@ -630,7 +669,14 @@ impl<P: Page> Tree<P> for File<P> {
     }
 
     fn dump(&self) -> String {
-        fn dump_page<P: Page>(file: &File<P>, page_id: u32, parent_id: u32, acc: &mut String, prefix: String, tab: String) {
+        fn dump_page<P: Page>(
+            file: &File<P>,
+            page_id: u32,
+            parent_id: u32,
+            acc: &mut String,
+            prefix: String,
+            tab: String,
+        ) {
             if page_id == 0 {
                 return;
             } else {
@@ -641,30 +687,30 @@ impl<P: Page> Tree<P> for File<P> {
                 acc.push_str(&if copy.is_empty() {
                     format!("{}page={}: empty", prefix, page_id)
                 } else {
-                    let entries = copy.iter()
+                    let entries = copy
+                        .iter()
                         .map(|(k, v, p)| format!("{}{}, {}, {}", prefix, hex(&k), hex(&v), p))
                         .collect::<Vec<_>>()
                         .join("\n");
-                    format!("{}page={}: (parent={}) {}% full\n{}", prefix, page_id, parent_id, full, entries)
+                    format!(
+                        "{}page={}: (parent={}) {}% full\n{}",
+                        prefix, page_id, parent_id, full, entries
+                    )
                 });
 
                 acc.push('\n');
-                let links = copy.iter()
-                    .map(|(_, _, p)| p)
-                    .cloned()
-                    .collect::<Vec<_>>();
+                let links = copy.iter().map(|(_, _, p)| p).cloned().collect::<Vec<_>>();
 
-                links.into_iter()
-                    .for_each(|id| {
-                        let mut p = prefix.clone();
-                        p.push_str(&tab);
-                        dump_page(file, id, page_id, acc, p, tab.clone());
-                    });
+                links.into_iter().for_each(|id| {
+                    let mut p = prefix.clone();
+                    p.push_str(&tab);
+                    dump_page(file, id, page_id, acc, p, tab.clone());
+                });
             }
         }
 
         let mut acc = String::with_capacity(1024);
-        dump_page(&self,ROOT, 0, &mut acc, "".to_string(), "\t".to_string());
+        dump_page(&self, ROOT, 0, &mut acc, "".to_string(), "\t".to_string());
         acc
     }
 }
@@ -673,12 +719,12 @@ impl<P: Page> Tree<P> for File<P> {
 mod tests {
     use super::*;
     use crate::disk::block::Block;
-    use rand::prelude::StdRng;
-    use rand::{RngCore, SeedableRng, thread_rng};
-    use std::ops::Deref;
-    use std::borrow::Borrow;
     use crate::util::hex::hex;
+    use rand::prelude::StdRng;
     use rand::seq::SliceRandom;
+    use rand::{thread_rng, RngCore, SeedableRng};
+    use std::borrow::Borrow;
+    use std::ops::Deref;
 
     fn get<P: Page>(page: &P, key: &[u8]) -> Option<(Vec<u8>, u32)> {
         page.find(key)
@@ -828,10 +874,7 @@ mod tests {
 
         let keys = {
             let mut rng = StdRng::seed_from_u64(3);
-            let mut result = data.iter()
-                .map(|(k, _)| k)
-                .cloned()
-                .collect::<Vec<_>>();
+            let mut result = data.iter().map(|(k, _)| k).cloned().collect::<Vec<_>>();
             result.shuffle(&mut rng);
             result
         };
@@ -895,7 +938,9 @@ mod tests {
 
         for (i, (key, _)) in data.iter().enumerate() {
             debug!("({:05}) lookup: key={}", i, hex(key));
-            let found = file.lookup(key).unwrap()
+            let found = file
+                .lookup(key)
+                .unwrap()
                 .map(|v| v.borrow().to_vec())
                 .map(|v| hex(&v));
             assert_eq!(found, None);
