@@ -221,7 +221,6 @@ impl<P: Page> Tree<P> for File<P> {
 
             drop(page);
             if let Some((parent_id, parent_idx)) = path.last().cloned() {
-                // TODO test it!
                 let mut parent_page = self.page_mut(parent_id).unwrap();
                 let parent_key = parent_page.key(parent_idx);
                 if key > parent_key {
@@ -301,6 +300,7 @@ impl<P: Page> Tree<P> for File<P> {
 
             let id = page.id();
             if slot.page == 0 {
+                println!("remove: key={} page={} idx={}", hex(key), id, idx);
                 page.remove(idx);
                 drop(page);
 
@@ -311,12 +311,16 @@ impl<P: Page> Tree<P> for File<P> {
                     if full < MERGE_THRESHOLD {
                         let peer_id = {
                             let parent = self.page(parent_id).unwrap();
-                            let peers = (0..parent.size())
-                                .into_iter()
-                                .map(|idx| parent.slot(idx).unwrap().page)
-                                .filter(|p| *p > 0)
-                                .filter(|p| *p != page_id)
-                                .collect::<Vec<_>>();
+                            let mut peers = Vec::with_capacity(2);
+                            if idx > 0 {
+                                let peer = parent.slot(idx - 1).unwrap().page;
+                                peers.push(peer);
+                            }
+                            if idx < parent.size() - 1 {
+                                let peer = parent.slot(idx + 1).unwrap().page;
+                                peers.push(peer);
+                            }
+                            drop(parent);
 
                             peers
                                 .into_iter()
@@ -333,14 +337,17 @@ impl<P: Page> Tree<P> for File<P> {
                                 .map(|(peer_id, _)| peer_id)
                         };
                         if let Some(peer_id) = peer_id {
+                            println!("merge: found peer_id={} to merge page_id={} (parent_id={})", peer_id, page_id, parent_id);
                             let peer_max = {
                                 let peer = self.page(peer_id).unwrap();
                                 peer.max().to_vec()
                             };
+                            println!("\t merge: peer_max={}", hex(&peer_max));
                             let mut parent = self.page_mut(parent_id).unwrap();
-                            let peer_idx = parent.ceil(&peer_max).unwrap();
-                            parent.remove(peer_idx);
                             parent.remove(idx);
+                            let peer_idx = parent.ceil(&peer_max).unwrap();
+                            println!("\t merge: parent remove: peer_idx={} idx={}", peer_idx, idx);
+                            parent.remove(peer_idx);
                             drop(parent);
 
                             self.merge(page_id, peer_id)?;
@@ -348,7 +355,9 @@ impl<P: Page> Tree<P> for File<P> {
                                 let peer = self.page(peer_id).unwrap();
                                 peer.max().to_vec()
                             };
+                            println!("\t merge: page_max={}", hex(&page_max));
                             let mut parent = self.page_mut(parent_id).unwrap();
+                            println!("\t merge: parent insert: page_max={}, peer_id={}", hex(&page_max), peer_id);
                             parent.put_ref(&page_max, peer_id);
                             idx = parent.ceil(&page_max).unwrap();
                             page_id = peer_id;
@@ -455,7 +464,6 @@ impl<P: Page> Tree<P> for File<P> {
         self.empty.borrow_mut().push(Reverse(id))
     }
 
-    // TODO test it!
     fn split(&self, id: u32) -> Result<()> {
         if id == ROOT {
             let lo_id = self.next_id(ROOT);
@@ -474,6 +482,7 @@ impl<P: Page> Tree<P> for File<P> {
             {
                 let mut lo = self.page_mut(lo_id).unwrap();
                 copy.iter().take(half).for_each(|(key, val, page)| {
+                    println!("split: move k={} v={} p={} from {} to {}", hex(key), hex(val), *page, id, lo_id);
                     if *page == 0 {
                         lo.put_val(key, val);
                     } else {
@@ -485,6 +494,7 @@ impl<P: Page> Tree<P> for File<P> {
             {
                 let mut hi = self.page_mut(hi_id).unwrap();
                 copy.iter().skip(half).for_each(|(key, val, page)| {
+                    println!("split: move k={} v={} p={} from {} to {}", hex(key), hex(val), *page, id, hi_id);
                     if *page == 0 {
                         hi.put_val(key, val);
                     } else {
@@ -524,6 +534,7 @@ impl<P: Page> Tree<P> for File<P> {
             let peer_max = {
                 let mut peer = self.page_mut(peer_id).unwrap();
                 copy.iter().skip(half).for_each(|(key, val, p)| {
+                    println!("split: move k={} v={} p={} from {} to {}", hex(key), hex(val), *p, id, peer_id);
                     if *p == 0 {
                         peer.put_val(key, val);
                     } else {
@@ -591,6 +602,7 @@ mod tests {
     use std::ops::Deref;
     use std::borrow::Borrow;
     use crate::util::hex::hex;
+    use rand::seq::SliceRandom;
 
     fn get<P: Page>(page: &P, key: &[u8]) -> Option<(Vec<u8>, u32)> {
         page.find(key)
@@ -719,23 +731,44 @@ mod tests {
         let mut file: File<Block> = File::make(path, size).unwrap();
 
         let count = 25;
-        let data = (0..count)
-            .into_iter()
-            .map(|i| {
-                let c = 'a' as u8 + (i % ('z' as u8 - 'a' as u8 + 1) as u8 as u64) as u8;
-                (vec![c; 8], vec![c; 8])
-            })
-            .collect::<Vec<_>>();
+        let data = {
+            let mut rng = StdRng::seed_from_u64(3);
+            let mut result = (0..count)
+                .into_iter()
+                .map(|i| {
+                    let c = 'a' as u8 + (i % ('z' as u8 - 'a' as u8 + 1) as u8 as u64) as u8;
+                    (vec![c; 8], vec![c; 8])
+                })
+                .collect::<Vec<_>>();
+            result.shuffle(&mut rng);
+            result
+        };
 
         for (k, v) in data.iter() {
+            println!("insert: key={} val={}", hex(k), hex(v));
             file.insert(k, v).unwrap();
         }
+        println!("{}", dump(&file));
 
-        for (k, v) in data.iter() {
-            assert_eq!(file.lookup(k).unwrap().unwrap().deref(), v);
+        let keys = {
+            let mut rng = StdRng::seed_from_u64(3);
+            let mut result = data.iter()
+                .map(|(k, _)| k)
+                .cloned()
+                .collect::<Vec<_>>();
+            result.shuffle(&mut rng);
+            result
+        };
+        for k in keys.iter() {
+            println!("remove: key={}", hex(k));
+            file.remove(k).unwrap();
+            println!("{}", dump(&file));
         }
 
+        // TODO
+        /*
         for (i, (key, _)) in data.iter().enumerate() {
+            println!("remove: key={}", hex(key));
             file.remove(key).unwrap();
             for (k, _) in data.iter().take(i + 1) {
                 assert!(file.lookup(k).unwrap().is_none());
@@ -744,6 +777,8 @@ mod tests {
                 assert_eq!(file.lookup(k).unwrap().unwrap().deref(), v);
             }
         }
+        */
+        println!("{}", dump(&file));
 
         let root = file.root();
         let copy = root.copy();
@@ -752,7 +787,6 @@ mod tests {
 
     #[test]
     fn test_1k() {
-        // let mut rng = StdRng::seed_from_u64(3);
         let mut rng = thread_rng();
 
         let path = Path::new("target/test_1k.tmp");
@@ -793,42 +827,50 @@ mod tests {
             let found = file.lookup(key).unwrap()
                 .map(|v| v.borrow().to_vec())
                 .map(|v| hex(&v));
-            //assert_eq!(found, None);
+            assert_eq!(found, None);
         }
 
-        {
-            let root = file.root();
-            let copy = root.copy();
+        let copy = file.root().copy();
+        println!("{}", dump(&file));
+        assert!(copy.is_empty());
+    }
 
-            let pages = copy.iter().map(|(_, _, p)| *p).collect::<Vec<_>>();
-            println!(
-                "pages: {}",
-                copy.iter()
-                    .map(|(k, v, p)| format!("\t{}, {}, {}", hex(&k), hex(&v), *p))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            );
-
-            pages.into_iter().for_each(|id| {
+    fn dump<P: Page>(file: &File<P>) -> String {
+        fn dump_page<P: Page>(file: &File<P>, id: u32, acc: &mut String, prefix: String, tab: String) {
+            if id == 0 {
+                return;
+            } else {
                 let page = file.page(id).unwrap();
                 let copy = page.copy();
 
-                if !copy.is_empty() {
-                    println!(
-                        "page={}\n{}",
-                        page.id(),
-                        copy.into_iter()
-                            .map(|(k, v, p)| format!("\t{}, {}, {}", hex(&k), hex(&v), p))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    );
+                acc.push_str(&if copy.is_empty() {
+                    format!("{}page={}: empty", prefix, id)
                 } else {
-                    println!("page={} is empty", page.id());
-                }
-            });
+                    let entries = copy.iter()
+                        .map(|(k, v, p)| format!("{}{}, {}, {}", prefix, hex(&k), hex(&v), p))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!("{}page={}:\n{}", prefix, id, entries)
+                });
 
-            assert!(copy.is_empty());
+                acc.push('\n');
+                let links = copy.iter()
+                    .map(|(_, _, p)| p)
+                    .cloned()
+                    .collect::<Vec<_>>();
+
+                links.into_iter()
+                    .for_each(|id| {
+                        let mut p = prefix.clone();
+                        p.push_str(&tab);
+                        dump_page(file, id, acc, p, tab.clone());
+                    });
+            }
         }
+
+        let mut acc = String::with_capacity(1024);
+        dump_page(file,ROOT, &mut acc, "".to_string(), "\t".to_string());
+        acc
     }
 
     // TODO Test with key bigger than page size (won't fit any page)
