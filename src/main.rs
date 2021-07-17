@@ -1,9 +1,9 @@
-use std::path::Path;
-use std::ops::Deref;
-use rand::{thread_rng, RngCore};
+use crate::api::tree::Tree;
 use crate::disk::block::Block;
 use crate::disk::file::File;
-use crate::api::tree::Tree;
+use rand::{thread_rng, RngCore};
+use std::ops::Deref;
+use std::path::Path;
 
 pub(crate) mod api;
 pub(crate) mod disk;
@@ -26,11 +26,14 @@ fn main() {
 
     let mut rng = thread_rng();
     let count = 10000;
-    let data = (0..count).into_iter()
-        .map(|_| (
-            rng.next_u64().to_be_bytes().to_vec(),
-            rng.next_u64().to_be_bytes().to_vec()
-        ))
+    let data = (0..count)
+        .into_iter()
+        .map(|_| {
+            (
+                rng.next_u64().to_be_bytes().to_vec(),
+                rng.next_u64().to_be_bytes().to_vec(),
+            )
+        })
         .collect::<Vec<_>>();
 
     for (k, v) in data.iter() {
@@ -41,7 +44,7 @@ fn main() {
         assert_eq!(file.lookup(k).unwrap().unwrap().deref(), v);
     }
 
-    for(key, _) in data.iter() {
+    for (key, _) in data.iter() {
         file.remove(key).unwrap();
         assert!(file.lookup(key).unwrap().is_none());
     }

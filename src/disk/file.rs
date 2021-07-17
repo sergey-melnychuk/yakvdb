@@ -1,3 +1,4 @@
+use crate::api::error::{Error, Result};
 use crate::api::page::Page;
 use crate::api::tree::Tree;
 use bytes::{Buf, BufMut, BytesMut};
@@ -9,7 +10,6 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::ops::Deref;
 use std::path::Path;
-use crate::api::error::{Error, Result};
 
 pub(crate) struct File<P: Page> {
     /// Underlying file reference where all data is physically stored.
@@ -183,13 +183,19 @@ impl<P: Page> Tree<P> for File<P> {
                 };
             } else {
                 if seen.contains(&slot.page) {
-                    return Err(Error::Tree(page.id(), "Cyclic reference detected".to_string()));
+                    return Err(Error::Tree(
+                        page.id(),
+                        "Cyclic reference detected".to_string(),
+                    ));
                 }
                 seen.insert(page.id());
 
                 let page_opt = self.page(slot.page);
                 if page_opt.is_none() {
-                    return Err(Error::Tree(page.id(), format!("Page not found: {}", slot.page)));
+                    return Err(Error::Tree(
+                        page.id(),
+                        format!("Page not found: {}", slot.page),
+                    ));
                 }
                 page = page_opt.unwrap();
             }
@@ -210,8 +216,7 @@ impl<P: Page> Tree<P> for File<P> {
                 return Ok(());
             }
 
-            let idx = page.ceil(key)
-                .unwrap_or_else(|| page.size() - 1);
+            let idx = page.ceil(key).unwrap_or_else(|| page.size() - 1);
 
             drop(page);
             if let Some((parent_id, parent_idx)) = path.last().cloned() {
@@ -236,7 +241,14 @@ impl<P: Page> Tree<P> for File<P> {
             if slot.page == 0 {
                 let len = (key.len() + val.len()) as u32;
                 if !page.fits(len) {
-                    return Err(Error::Tree(page.id(), format!("Entry does not fit into the page: size={} free={}", len, page.free())))
+                    return Err(Error::Tree(
+                        page.id(),
+                        format!(
+                            "Entry does not fit into the page: size={} free={}",
+                            len,
+                            page.free()
+                        ),
+                    ));
                 }
                 page.put_val(key, val);
 
@@ -259,14 +271,17 @@ impl<P: Page> Tree<P> for File<P> {
                 drop(page);
                 let page_opt = self.page_mut(slot.page);
                 if page_opt.is_none() {
-                    return Err(Error::Tree(slot.page, format!("Page not found: {}", slot.page)));
+                    return Err(Error::Tree(
+                        slot.page,
+                        format!("Page not found: {}", slot.page),
+                    ));
                 }
                 page = page_opt.unwrap();
             }
         }
     }
 
-    fn remove(&mut self, key: &[u8]) -> Result<()>  {
+    fn remove(&mut self, key: &[u8]) -> Result<()> {
         let mut page = self.root_mut();
         let mut seen = HashSet::with_capacity(8);
         loop {
@@ -314,13 +329,15 @@ impl<P: Page> Tree<P> for File<P> {
                     // TODO Find where to merge the current page!
                     let peer_id = {
                         let parent = self.page(parent_id).unwrap();
-                        let peers = (0..parent.size()).into_iter()
+                        let peers = (0..parent.size())
+                            .into_iter()
                             .map(|idx| parent.slot(idx).unwrap().page)
                             .filter(|p| *p > 0)
                             .filter(|p| *p != id)
                             .collect::<Vec<_>>();
 
-                        peers.into_iter()
+                        peers
+                            .into_iter()
                             .filter_map(|peer_id| {
                                 let peer = self.page(peer_id).unwrap();
                                 let full = peer.full();
@@ -403,8 +420,8 @@ impl<P: Page> Tree<P> for File<P> {
         let page = P::create(id, parent_id, self.head.page_bytes);
         {
             let mut f = self.file.borrow_mut();
-            f.seek(SeekFrom::End(0)).unwrap();      // TODO deal with possible panic
-            f.write_all(page.as_ref()).unwrap();    // TODO deal with possible panic
+            f.seek(SeekFrom::End(0)).unwrap(); // TODO deal with possible panic
+            f.write_all(page.as_ref()).unwrap(); // TODO deal with possible panic
         }
 
         id
@@ -428,14 +445,8 @@ impl<P: Page> Tree<P> for File<P> {
                 let page = self.page(id).unwrap();
                 let copy = page.copy();
                 let half = page.size() as usize / 2;
-                let lo_max = copy.get(half - 1)
-                    .map(|(k, _, _)| k)
-                    .cloned()
-                    .unwrap();
-                let hi_max = copy.last()
-                    .map(|(k, _, _)| k)
-                    .cloned()
-                    .unwrap();
+                let lo_max = copy.get(half - 1).map(|(k, _, _)| k).cloned().unwrap();
+                let hi_max = copy.last().map(|(k, _, _)| k).cloned().unwrap();
                 (copy, lo_max, hi_max)
             };
             let half = copy.len() / 2;
@@ -551,9 +562,9 @@ impl<P: Page> Tree<P> for File<P> {
 mod tests {
     use super::*;
     use crate::disk::block::Block;
-    use std::ops::Deref;
     use rand::prelude::StdRng;
-    use rand::{SeedableRng, RngCore};
+    use rand::{RngCore, SeedableRng};
+    use std::ops::Deref;
 
     fn get<P: Page>(page: &P, key: &[u8]) -> Option<(Vec<u8>, u32)> {
         page.find(key)
@@ -654,7 +665,8 @@ mod tests {
         let mut file: File<Block> = File::make(path, size).unwrap();
 
         let count = 25;
-        let data = (0..count).into_iter()
+        let data = (0..count)
+            .into_iter()
             .map(|i| {
                 let c = 'a' as u8 + (i % ('z' as u8 - 'a' as u8 + 1) as u8 as u64) as u8;
                 (vec![c; 8], vec![c; 8])
@@ -681,7 +693,8 @@ mod tests {
         let mut file: File<Block> = File::make(path, size).unwrap();
 
         let count = 25;
-        let data = (0..count).into_iter()
+        let data = (0..count)
+            .into_iter()
             .map(|i| {
                 let c = 'a' as u8 + (i % ('z' as u8 - 'a' as u8 + 1) as u8 as u64) as u8;
                 (vec![c; 8], vec![c; 8])
@@ -712,7 +725,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // TODO FIXME
     fn test_1k() {
         let mut rng = StdRng::seed_from_u64(3);
 
@@ -725,11 +737,14 @@ mod tests {
         let mut file: File<Block> = File::make(path, size).unwrap();
 
         let count = 1000;
-        let data = (0..count).into_iter()
-            .map(|_| (
-                rng.next_u64().to_be_bytes().to_vec(),
-                rng.next_u64().to_be_bytes().to_vec()
-            ))
+        let data = (0..count)
+            .into_iter()
+            .map(|_| {
+                (
+                    rng.next_u64().to_be_bytes().to_vec(),
+                    rng.next_u64().to_be_bytes().to_vec(),
+                )
+            })
             .collect::<Vec<_>>();
 
         for (k, v) in data.iter() {
@@ -745,33 +760,44 @@ mod tests {
             assert!(file.lookup(key).unwrap().is_none());
         }
 
-        let root = file.root();
-        let copy = root.copy();
-        //assert_eq!(copy, vec![]); // TODO FIXME
+        {
+            let root = file.root();
+            let copy = root.copy();
 
-        let pages = copy.iter().map(|(_, _, p)| *p).collect::<Vec<_>>();
-        println!("pages: {}", copy.iter()
-            .map(|(k, v, p)| format!("\t{}, {}, {}", hex(&k), hex(&v), *p))
-            .collect::<Vec<_>>()
-            .join("\n"));
-
-        pages.into_iter().for_each(|id| {
-            let page = file.page(id).unwrap();
-            let copy = page.copy();
-
-            if !copy.is_empty() {
-                println!("page={}\n{}", page.id(), copy.into_iter()
-                    .map(|(k, v, p)| format!("\t{}, {}, {}", hex(&k), hex(&v), p))
+            let pages = copy.iter().map(|(_, _, p)| *p).collect::<Vec<_>>();
+            println!(
+                "pages: {}",
+                copy.iter()
+                    .map(|(k, v, p)| format!("\t{}, {}, {}", hex(&k), hex(&v), *p))
                     .collect::<Vec<_>>()
-                    .join("\n"));
-            } else {
-                println!("page={} is empty", page.id());
-            }
-        });
+                    .join("\n")
+            );
+
+            pages.into_iter().for_each(|id| {
+                let page = file.page(id).unwrap();
+                let copy = page.copy();
+
+                if !copy.is_empty() {
+                    println!(
+                        "page={}\n{}",
+                        page.id(),
+                        copy.into_iter()
+                            .map(|(k, v, p)| format!("\t{}, {}, {}", hex(&k), hex(&v), p))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    );
+                } else {
+                    println!("page={} is empty", page.id());
+                }
+            });
+
+            assert!(copy.is_empty());
+        }
     }
 
     fn hex(src: &[u8]) -> String {
-        src.into_iter().cloned()
+        src.into_iter()
+            .cloned()
             .map(|x| format!("{:02x}", x))
             .collect::<Vec<_>>()
             .concat()

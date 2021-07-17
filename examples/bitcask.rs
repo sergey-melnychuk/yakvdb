@@ -190,10 +190,10 @@ impl OnDisk {
             .filter(move |p| {
                 p.is_file()
                     && p.file_name()
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .ends_with(&owned_suffix)
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .ends_with(&owned_suffix)
             }))
     }
 

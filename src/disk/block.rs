@@ -493,7 +493,24 @@ mod tests {
         assert_eq!(page.buf.len(), len as usize);
         assert_eq!(
             &page.buf[0..HEAD],
-            &[0, 0, 0, id as u8, 0, 0, 0, parent as u8, 0, 0, 0, len as u8, 0, 0, 0, 0]
+            &[
+                0,
+                0,
+                0,
+                id as u8,
+                0,
+                0,
+                0,
+                parent as u8,
+                0,
+                0,
+                0,
+                len as u8,
+                0,
+                0,
+                0,
+                0
+            ]
         );
 
         assert_eq!(page.put_val(k1, v1), Some(0));
