@@ -454,13 +454,13 @@ impl<P: Page> Tree<P> for File<P> {
         }
     }
 
-    fn next_id(&self) -> u32 {
+    fn next_id(&self) -> Result<u32> {
         if !self.empty.borrow().is_empty() {
             let id = self.empty.borrow_mut().pop().unwrap().0;
             let temp = P::create(id, self.head.page_bytes);
             let mut page = self.page_mut(id).unwrap();
             page.as_mut().copy_from_slice(temp.as_ref());
-            return id;
+            return Ok(id);
         }
 
         let len = self.file.borrow_mut().metadata().unwrap().len();
@@ -468,11 +468,11 @@ impl<P: Page> Tree<P> for File<P> {
         let page = P::create(id, self.head.page_bytes);
         {
             let mut f = self.file.borrow_mut();
-            f.seek(SeekFrom::End(0)).unwrap(); // TODO deal with possible panic
-            f.write_all(page.as_ref()).unwrap(); // TODO deal with possible panic
+            f.seek(SeekFrom::End(0))?;
+            f.write_all(page.as_ref())?;
         }
 
-        id
+        Ok(id)
     }
 
     fn free_id(&self, id: u32) {
@@ -481,8 +481,8 @@ impl<P: Page> Tree<P> for File<P> {
 
     fn split(&self, id: u32, parent_id: u32) -> Result<()> {
         if id == ROOT {
-            let lo_id = self.next_id();
-            let hi_id = self.next_id();
+            let lo_id = self.next_id()?;
+            let hi_id = self.next_id()?;
             debug!("split: root={} into lo={} and hi={} (parent={})", id, lo_id, hi_id, parent_id);
 
             let (copy, lo_max, hi_max) = {
@@ -536,7 +536,7 @@ impl<P: Page> Tree<P> for File<P> {
                 (page.copy(), page.max().to_vec())
             };
             let half = copy.len() / 2;
-            let peer_id = self.next_id();
+            let peer_id = self.next_id()?;
             debug!("split: page={} into peer={} (parent={})", id, peer_id, parent_id);
 
             let page_max = {

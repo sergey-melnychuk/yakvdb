@@ -17,7 +17,7 @@ pub(crate) trait Tree<P: Page> {
     fn flush(&self, id: u32) -> Result<()>;
 
     /// Reserve the provided page id - such id will never be returned by `next_id` until freed.
-    fn next_id(&self) -> u32;
+    fn next_id(&self) -> Result<u32>;
 
     /// Un-reserve the provided page id making it available for future via `next_id`.
     fn free_id(&self, id: u32);
