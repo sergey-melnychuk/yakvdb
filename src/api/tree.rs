@@ -13,8 +13,8 @@ pub(crate) trait Tree<P: Page> {
     fn root_mut(&self) -> RefMut<P>;
     fn page_mut(&self, id: u32) -> Option<RefMut<P>>;
 
-    // TODO Add mark(id) to mark page id as dirty and flush() to flush all changes at once
-    fn flush(&self, id: u32) -> Result<()>;
+    fn mark(&self, id: u32);
+    fn flush(&self) -> Result<()>;
 
     /// Reserve the provided page id - such id will never be returned by `next_id` until freed.
     fn next_id(&self) -> Result<u32>;

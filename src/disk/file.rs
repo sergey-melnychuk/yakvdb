@@ -20,6 +20,7 @@ pub(crate) struct File<P: Page> {
 
     /// In-memory page cache. All page access happens only through cached page representation.
     cache: RefCell<HashMap<u32, P>>,
+    dirty: RefCell<HashSet<u32>>,
 
     /// Min-heap of available page identifiers (this helps avoid "gaps": empty pages inside file).
     empty: RefCell<BinaryHeap<Reverse<u32>>>,
@@ -75,6 +76,7 @@ impl<P: Page> File<P> {
             file: RefCell::new(file),
             head,
             cache: RefCell::new(HashMap::with_capacity(32)),
+            dirty: RefCell::new(HashSet::with_capacity(32)),
             empty: RefCell::new(BinaryHeap::with_capacity(32)),
         })
     }
@@ -130,6 +132,7 @@ impl<P: Page> File<P> {
             file: RefCell::new(file),
             head,
             cache: RefCell::new(HashMap::with_capacity(32)),
+            dirty: RefCell::new(HashSet::with_capacity(32)),
             empty: RefCell::new(BinaryHeap::with_capacity(16)),
         };
 
@@ -216,7 +219,7 @@ impl<P: Page> Tree<P> for File<P> {
             if page.size() == 0 {
                 page.put_val(key, val);
                 drop(page);
-                self.flush(id)?;
+                self.mark(id);
                 return Ok(());
             }
 
@@ -230,7 +233,7 @@ impl<P: Page> Tree<P> for File<P> {
                     parent_page.remove(parent_idx);
                     parent_page.put_ref(key, id);
                     drop(parent_page);
-                    self.flush(parent_id)?;
+                    self.mark(parent_id);
                 }
             }
             page = self.page_mut(id).unwrap();
@@ -260,7 +263,7 @@ impl<P: Page> Tree<P> for File<P> {
                 if full > SPLIT_THRESHOLD {
                     self.split(id, parent_id)?;
                 } else {
-                    self.flush(id)?;
+                    self.mark(id);
                 }
 
                 while !path.is_empty() {
@@ -275,6 +278,7 @@ impl<P: Page> Tree<P> for File<P> {
                     }
                 }
 
+                self.flush()?;
                 return Ok(());
             } else {
                 path.push((id, idx));
@@ -398,10 +402,11 @@ impl<P: Page> Tree<P> for File<P> {
                         parent.remove(idx);
                     }
                     drop(parent);
-                    self.flush(parent_id)?;
+                    self.mark(parent_id);
                     page_id = parent_id;
                 }
 
+                self.flush()?;
                 return Ok(());
             } else {
                 path.push((id, idx));
@@ -446,12 +451,28 @@ impl<P: Page> Tree<P> for File<P> {
         Some(page)
     }
 
-    fn flush(&self, id: u32) -> crate::api::error::Result<()> {
-        if let Some(page) = self.page(id) {
-            self.save(page.deref()).map_err(|e| e.into())
-        } else {
-            Err(Error::Tree(id, "Page not found".to_string()))
+    fn mark(&self, id: u32) {
+        self.dirty.borrow_mut().insert(id);
+    }
+
+    fn flush(&self) -> crate::api::error::Result<()> {
+        let pages = {
+            let result = self.dirty.borrow().iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            self.dirty.borrow_mut().clear();
+            result
+        };
+        for id in pages {
+            if let Some(page) = self.page(id) {
+                self.save(page.deref())?;
+                debug!("flush: page={}", id);
+            } else {
+                return Err(Error::Tree(id, "Page not found".to_string()));
+            }
         }
+
+        Ok(())
     }
 
     fn next_id(&self) -> Result<u32> {
@@ -526,9 +547,9 @@ impl<P: Page> Tree<P> for File<P> {
                 page.put_ref(&hi_max, hi_id);
             }
 
-            self.flush(id)?;
-            self.flush(lo_id)?;
-            self.flush(hi_id)?;
+            self.mark(id);
+            self.mark(lo_id);
+            self.mark(hi_id);
             Ok(())
         } else {
             let (copy, max) = {
@@ -569,10 +590,9 @@ impl<P: Page> Tree<P> for File<P> {
                 parent.put_ref(&peer_max, peer_id);
             }
 
-            self.flush(parent_id)?;
-            self.flush(peer_id)?;
-            self.flush(id)?;
-
+            self.mark(parent_id);
+            self.mark(peer_id);
+            self.mark(id);
             Ok(())
         }
     }
@@ -602,8 +622,8 @@ impl<P: Page> Tree<P> for File<P> {
             page.clear();
         }
 
-        self.flush(dst_id)?;
-        self.flush(src_id)?;
+        self.mark(dst_id);
+        self.mark(src_id);
 
         self.free_id(src_id);
         Ok(())
@@ -885,6 +905,4 @@ mod tests {
         debug!("{}", file.dump());
         assert!(copy.is_empty());
     }
-
-    // TODO Test with key bigger than page size (won't fit any page)
 }
