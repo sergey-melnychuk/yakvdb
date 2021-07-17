@@ -25,15 +25,17 @@ impl Block {
             return None;
         }
 
-        let size = self.size();
-
         let ceil_opt = self.ceil(key);
         if let Some(idx) = &ceil_opt {
             if self.key(*idx) == key {
+                let n = self.size() - 1;
+                put_size(&mut self.buf, n);
                 self.remove(*idx);
             }
         }
-        let idx = ceil_opt.unwrap_or(size);
+
+        let size = self.size();
+        let idx = self.ceil(key).unwrap_or_else(|| size);
 
         let mut slots = (0..size)
             .into_iter()
@@ -56,7 +58,8 @@ impl Block {
             .enumerate()
             .for_each(|(idx, slot)| put_slot(&mut self.buf, idx as u32, &slot));
 
-        put_size(&mut self.buf, size + 1);
+        let n = self.size() + 1;
+        put_size(&mut self.buf, n);
 
         put_slice(&mut self.buf, offset as usize, key);
         if !val.is_empty() {
@@ -214,7 +217,9 @@ impl Page for Block {
             .filter_map(|idx| self.slot(idx))
             .collect::<Vec<_>>();
 
-        slots.remove(idx as usize);
+        let removed = slots.remove(idx as usize);
+        let blank = vec![0u8; (removed.klen + removed.vlen) as usize];
+        put_slice(&mut self.buf, removed.offset as usize, &blank);
 
         put_size(&mut self.buf, size - 1);
 
@@ -231,14 +236,17 @@ impl Page for Block {
             })
             .collect::<Vec<_>>();
 
-        for (i, (key, val)) in copy.iter().enumerate().rev() {
+        for (i, (key, val)) in copy.iter().enumerate() {
             slots.get_mut(i).unwrap().offset = offset;
             put_slice(&mut self.buf, offset as usize, key);
             offset += key.len() as u32;
-            put_slice(&mut self.buf, offset as usize, val);
-            offset += val.len() as u32;
+            if !val.is_empty() {
+                put_slice(&mut self.buf, offset as usize, val);
+                offset += val.len() as u32;
+            }
         }
 
+        slots.push(Slot::empty());
         slots
             .into_iter()
             .enumerate()
@@ -261,8 +269,14 @@ impl Page for Block {
 
     fn clear(&mut self) {
         let len = self.len() as usize;
-        let blank = vec![0u8; len];
-        self.buf.copy_from_slice(&blank);
+        let mut tmp = BytesMut::with_capacity(len);
+        tmp.put_u32(self.id());
+        tmp.put_u32(self.parent());
+        tmp.put_u32(self.len());
+        tmp.put_u32(0);
+        self.buf[..HEAD].copy_from_slice(tmp.as_ref());
+        let blank = vec![0xFFu8; len - HEAD];
+        self.buf[HEAD..].copy_from_slice(&blank);
     }
 }
 

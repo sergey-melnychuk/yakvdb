@@ -13,18 +13,17 @@ pub(crate) trait Tree<P: Page> {
     fn root_mut(&self) -> RefMut<P>;
     fn page_mut(&self, id: u32) -> Option<RefMut<P>>;
 
-    fn flush(&self, page: &P) -> Result<()>;
+    fn flush(&self, id: u32) -> Result<()>;
 
     /// Reserve the provided page id - such id will never be returned by `next_id` until freed.
-    fn next_id(&mut self) -> u32;
+    fn next_id(&self, parent_id: u32) -> u32;
 
     /// Un-reserve the provided page id making it available for future via `next_id`.
-    fn free_id(&mut self, id: u32);
+    fn free_id(&self, id: u32);
 
     /// Split given page into two subpages containing ~equal number of entries.
-    fn split(&mut self, page: &mut P) -> Result<()>;
+    fn split(&self, id: u32) -> Result<()>;
 
-    /// Merge page `that` into page `this`, effectively removing page `that`.
-    /// Return 'freed' id that previously identified `that` page.
-    fn merge(&mut self, this: &mut P, that: &mut P) -> Result<()>;
+    /// Merge page `that_id` into page `this_id`, effectively removing page `that_id`.
+    fn merge(&self, this_id: u32, that_id: u32) -> Result<()>;
 }
