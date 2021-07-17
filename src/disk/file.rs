@@ -10,6 +10,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::ops::Deref;
 use std::path::Path;
+use crate::util::hex::hex;
 
 pub(crate) struct File<P: Page> {
     /// Underlying file reference where all data is physically stored.
@@ -284,6 +285,7 @@ impl<P: Page> Tree<P> for File<P> {
     fn remove(&mut self, key: &[u8]) -> Result<()> {
         let mut page = self.root_mut();
         let mut seen = HashSet::with_capacity(8);
+        let mut path = Vec::with_capacity(8);
         loop {
             let idx_opt = page.ceil(key);
             if idx_opt.is_none() {
@@ -298,75 +300,93 @@ impl<P: Page> Tree<P> for File<P> {
             let slot = slot_opt.unwrap();
 
             let id = page.id();
-            let parent_id = page.parent();
-            let size = page.size();
-            let full = page.full();
             if slot.page == 0 {
                 page.remove(idx);
-                let max = if size > 1 {
-                    Some(page.max().to_vec())
-                } else {
-                    None
-                };
-                drop(page); // drop borrow on cache
+                drop(page);
 
-                if size > 0 && idx == size - 1 {
-                    // TODO test it!
-                    if parent_id > 0 {
-                        let mut parent = self.page_mut(parent_id).unwrap();
-                        if let Some(idx) = parent.ceil(key) {
+                // Navigate up-tree and remove/update references if needed
+                let mut page_id = id;
+                for (parent_id, mut idx) in path.iter().cloned().rev() {
+                    let full = self.page(page_id).unwrap().full();
+                    if full < MERGE_THRESHOLD {
+                        let peer_id = {
+                            let parent = self.page(parent_id).unwrap();
+                            let peers = (0..parent.size())
+                                .into_iter()
+                                .map(|idx| parent.slot(idx).unwrap().page)
+                                .filter(|p| *p > 0)
+                                .filter(|p| *p != page_id)
+                                .collect::<Vec<_>>();
+
+                            peers
+                                .into_iter()
+                                .filter_map(|peer_id| {
+                                    let peer = self.page(peer_id).unwrap();
+                                    let full = peer.full();
+                                    if peer.size() > 0 && full < MERGE_THRESHOLD {
+                                        Some((peer_id, full))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .min_by_key(|(_, full)| *full)
+                                .map(|(peer_id, _)| peer_id)
+                        };
+                        if let Some(peer_id) = peer_id {
+                            let peer_max = {
+                                let peer = self.page(peer_id).unwrap();
+                                peer.max().to_vec()
+                            };
+                            let mut parent = self.page_mut(parent_id).unwrap();
+                            let peer_idx = parent.ceil(&peer_max).unwrap();
+                            parent.remove(peer_idx);
                             parent.remove(idx);
-                            if let Some(max) = max {
-                                parent.put_ref(&max, id);
-                            }
                             drop(parent);
-                            self.flush(parent_id)?;
+
+                            self.merge(page_id, peer_id)?;
+                            let page_max = {
+                                let peer = self.page(peer_id).unwrap();
+                                peer.max().to_vec()
+                            };
+                            let mut parent = self.page_mut(parent_id).unwrap();
+                            parent.put_ref(&page_max, peer_id);
+                            idx = parent.ceil(&page_max).unwrap();
+                            page_id = peer_id;
                         }
                     }
-                }
 
-                if full < MERGE_THRESHOLD && parent_id > 0 {
-                    // TODO Find where to merge the current page!
-                    let peer_id = {
-                        let parent = self.page(parent_id).unwrap();
-                        let peers = (0..parent.size())
-                            .into_iter()
-                            .map(|idx| parent.slot(idx).unwrap().page)
-                            .filter(|p| *p > 0)
-                            .filter(|p| *p != id)
-                            .collect::<Vec<_>>();
-
-                        peers
-                            .into_iter()
-                            .filter_map(|peer_id| {
-                                let peer = self.page(peer_id).unwrap();
-                                let full = peer.full();
-                                if full < MERGE_THRESHOLD {
-                                    Some((peer_id, full))
-                                } else {
-                                    None
-                                }
-                            })
-                            .min_by_key(|(_, full)| *full)
-                            .map(|(peer_id, _)| peer_id)
+                    let max_opt = {
+                        let page = self.page(page_id).unwrap();
+                        if page.size() > 0 {
+                            Some(page.max().to_vec())
+                        } else {
+                            None
+                        }
                     };
-                    if let Some(peer_id) = peer_id {
-                        self.merge(id, peer_id)?;
+
+                    let mut parent = self.page_mut(parent_id).unwrap();
+                    if let Some(max) = max_opt {
+                        if max < parent.key(idx).to_vec() {
+                            parent.remove(idx);
+                            parent.put_ref(&max, page_id);
+                        }
                     } else {
-                        self.flush(id)?;
+                        parent.remove(idx);
                     }
-                } else {
-                    self.flush(id)?;
+                    drop(parent);
+                    self.flush(parent_id)?;
+                    page_id = parent_id;
                 }
 
                 return Ok(());
             } else {
+                path.push((id, idx));
                 seen.insert(id);
                 if seen.contains(&slot.page) {
                     return Err(Error::Tree(id, "Cyclic reference detected".to_string()));
                 }
-
                 drop(page);
+
                 let page_opt = self.page_mut(slot.page);
                 if page_opt.is_none() {
                     return Err(Error::Tree(id, format!("Page not found: {}", slot.page)));
@@ -412,7 +432,11 @@ impl<P: Page> Tree<P> for File<P> {
 
     fn next_id(&self, parent_id: u32) -> u32 {
         if !self.empty.borrow().is_empty() {
-            return self.empty.borrow_mut().pop().unwrap().0;
+            let id = self.empty.borrow_mut().pop().unwrap().0;
+            let temp = P::create(id, parent_id, self.head.page_bytes);
+            let mut page = self.page_mut(id).unwrap();
+            page.as_mut().copy_from_slice(temp.as_ref());
+            return id;
         }
 
         let len = self.file.borrow_mut().metadata().unwrap().len();
@@ -428,10 +452,6 @@ impl<P: Page> Tree<P> for File<P> {
     }
 
     fn free_id(&self, id: u32) {
-        {
-            let mut page = self.page_mut(id).unwrap();
-            page.clear();
-        }
         self.empty.borrow_mut().push(Reverse(id))
     }
 
@@ -485,9 +505,9 @@ impl<P: Page> Tree<P> for File<P> {
             self.flush(hi_id)?;
             Ok(())
         } else {
-            let (copy, parent_id) = {
+            let (copy, max, parent_id) = {
                 let page = self.page(id).unwrap();
-                (page.copy(), page.parent())
+                (page.copy(), page.max().to_vec(), page.parent())
             };
             let half = copy.len() / 2;
             let peer_id = self.next_id(parent_id);
@@ -515,13 +535,9 @@ impl<P: Page> Tree<P> for File<P> {
 
             {
                 let mut parent = self.page_mut(parent_id).unwrap();
-                if let Some(idx) = parent.find(&page_max) {
-                    parent.remove(idx);
-                }
+                let idx= parent.find(&max).unwrap();
+                parent.remove(idx);
                 parent.put_ref(&page_max, id);
-                if let Some(idx) = parent.find(&peer_max) {
-                    parent.remove(idx);
-                }
                 parent.put_ref(&peer_max, peer_id);
             }
 
@@ -533,27 +549,35 @@ impl<P: Page> Tree<P> for File<P> {
         }
     }
 
-    fn merge(&self, this_id: u32, that_id: u32) -> Result<()> {
-        let that_copy = {
-            let that = self.page(that_id).unwrap();
-            that.copy()
+    fn merge(&self, src_id: u32, dst_id: u32) -> Result<()> {
+        let (src_copy, parent_id) = {
+            let page = self.page(src_id).unwrap();
+            (page.copy(), page.parent())
         };
 
         {
-            let mut page = self.page_mut(this_id).unwrap();
-            for (key, val, p) in that_copy {
+            let mut page = self.page_mut(dst_id).unwrap();
+            for (key, val, p) in src_copy {
+                println!("merge: move k={} v={} p={} from {} to {}", hex(&key), hex(&val), p, src_id, dst_id);
                 if p == 0 {
                     page.put_val(&key, &val);
                 } else {
                     page.put_ref(&key, p);
                 }
             }
+            page.max().to_vec()
         };
 
-        self.flush(this_id)?;
+        {
+            let mut page = self.page_mut(src_id).unwrap();
+            page.clear();
+        }
 
-        self.free_id(that_id);
-        self.flush(that_id)?;
+        self.flush(parent_id)?;
+        self.flush(dst_id)?;
+        self.flush(src_id)?;
+
+        self.free_id(src_id);
         Ok(())
     }
 }
@@ -563,8 +587,10 @@ mod tests {
     use super::*;
     use crate::disk::block::Block;
     use rand::prelude::StdRng;
-    use rand::{RngCore, SeedableRng};
+    use rand::{RngCore, SeedableRng, thread_rng};
     use std::ops::Deref;
+    use std::borrow::Borrow;
+    use crate::util::hex::hex;
 
     fn get<P: Page>(page: &P, key: &[u8]) -> Option<(Vec<u8>, u32)> {
         page.find(key)
@@ -726,7 +752,8 @@ mod tests {
 
     #[test]
     fn test_1k() {
-        let mut rng = StdRng::seed_from_u64(3);
+        // let mut rng = StdRng::seed_from_u64(3);
+        let mut rng = thread_rng();
 
         let path = Path::new("target/test_1k.tmp");
         if path.exists() {
@@ -747,7 +774,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        for (k, v) in data.iter() {
+        for (i, (k, v)) in data.iter().enumerate() {
+            println!("({:05}) insert: key={} val={}", i, hex(k), hex(v));
             file.insert(k, v).unwrap();
         }
 
@@ -755,9 +783,17 @@ mod tests {
             assert_eq!(file.lookup(k).unwrap().unwrap().deref(), v);
         }
 
-        for (key, _) in data.iter() {
+        for (i, (key, _)) in data.iter().enumerate() {
+            println!("({:05}) remove: key={}", i, hex(key));
             file.remove(key).unwrap();
-            assert!(file.lookup(key).unwrap().is_none());
+        }
+
+        for (i, (key, _)) in data.iter().enumerate() {
+            println!("({:05}) lookup: key={}", i, hex(key));
+            let found = file.lookup(key).unwrap()
+                .map(|v| v.borrow().to_vec())
+                .map(|v| hex(&v));
+            //assert_eq!(found, None);
         }
 
         {
@@ -793,14 +829,6 @@ mod tests {
 
             assert!(copy.is_empty());
         }
-    }
-
-    fn hex(src: &[u8]) -> String {
-        src.into_iter()
-            .cloned()
-            .map(|x| format!("{:02x}", x))
-            .collect::<Vec<_>>()
-            .concat()
     }
 
     // TODO Test with key bigger than page size (won't fit any page)

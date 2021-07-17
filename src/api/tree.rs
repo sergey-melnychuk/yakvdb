@@ -13,6 +13,7 @@ pub(crate) trait Tree<P: Page> {
     fn root_mut(&self) -> RefMut<P>;
     fn page_mut(&self, id: u32) -> Option<RefMut<P>>;
 
+    // TODO Add mark(id) to mark page id as dirty and flush() to flush all changes at once
     fn flush(&self, id: u32) -> Result<()>;
 
     /// Reserve the provided page id - such id will never be returned by `next_id` until freed.
@@ -24,6 +25,6 @@ pub(crate) trait Tree<P: Page> {
     /// Split given page into two subpages containing ~equal number of entries.
     fn split(&self, id: u32) -> Result<()>;
 
-    /// Merge page `that_id` into page `this_id`, effectively removing page `that_id`.
-    fn merge(&self, this_id: u32, that_id: u32) -> Result<()>;
+    /// Merge page `src_id` into page `dst_id`, effectively removing page `src_id`.
+    fn merge(&self, src_id: u32, dst_id: u32) -> Result<()>;
 }
