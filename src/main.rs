@@ -1,4 +1,3 @@
-use crate::api::page::Page;
 use crate::api::tree::Tree;
 use crate::disk::block::Block;
 use crate::disk::file::File;
@@ -54,47 +53,98 @@ fn main() {
             )
         })
         .collect::<Vec<_>>();
+    info!("file={:?} count={} page={}", path, count, size);
 
     let mut now = SystemTime::now();
-
     for (k, v) in data.iter() {
         debug!("insert: key='{}' val='{}'", hex(k), hex(v));
         file.insert(k, v).unwrap();
     }
-
     let mut millis = now.elapsed().unwrap_or_default().as_millis();
     info!("insert: {} ms (rate={} op/s)", millis, count as u128 * 1000 / millis);
 
-    let full = {
-        let root = file.root();
-        root.full()
-    };
-    debug!("root.full={}", full);
-
     now = SystemTime::now();
-
-    for (k, v) in data.iter() {
-        let opt = file.lookup(k).unwrap();
-        if let Some(r) = opt {
+    let mut found = Vec::with_capacity(data.len());
+    for (k, _) in data.iter() {
+        if let Some(r) = file.lookup(k).unwrap() {
             let val = r.to_vec();
-            if val != v.to_vec() {
-                error!(
-                    "key='{}' expected val='{}' but got '{}'",
-                    hex(k),
-                    hex(v),
-                    hex(&val)
-                );
-            }
+            found.push(val);
         } else {
             error!("key='{}' not found", hex(k));
         }
     }
-
     millis = now.elapsed().unwrap_or_default().as_millis();
     info!("lookup: {} ms (rate={} op/s)", millis, count as u128 * 1000 / millis);
 
-    now = SystemTime::now();
+    for ((k, v), r) in data.iter().zip(found.iter()) {
+        if v != r {
+            error!(
+                    "key='{}': expected '{}' but got '{}'",
+                    hex(k),
+                    hex(v),
+                    hex(r)
+                );
+        }
+    }
 
+    now = SystemTime::now();
+    let min = file.min().unwrap().unwrap().to_vec();
+    let max = file.max().unwrap().unwrap().to_vec();
+    info!("iter: min={} max={}", hex(&min), hex(&max));
+    let mut this = min.clone();
+    let mut n = 1usize;
+    loop {
+        if let Some(r) = file.above(&this).unwrap() {
+            n += 1;
+            let next = r.to_vec();
+            if next <= this {
+                error!("iter:  asc order violated: {} comes before {}", hex(&this), hex(&next));
+                break;
+            }
+            this = next;
+        } else {
+            if this < max || n < data.len() {
+                error!("iter: failed to call above={} (n={})", hex(&this), n);
+                break;
+            } else {
+                break;
+            }
+        }
+    }
+    if let Some(x) = file.below(&min).unwrap() {
+        error!("below min returned {}", hex(x.as_ref()));
+    }
+    millis = now.elapsed().unwrap_or_default().as_millis();
+    info!("iter:  asc {} ms (rate={} op/s) n={}", millis, count as u128 * 1000 / millis, n);
+
+    now = SystemTime::now();
+    let mut this = max.clone();
+    let mut n = 1usize;
+    loop {
+        if let Some(r) = file.below(&this).unwrap() {
+            n += 1;
+            let next = r.to_vec();
+            if next >= this {
+                error!("iter: desc order violated: {} comes before {}", hex(&this), hex(&next));
+                break;
+            }
+            this = next;
+        } else {
+            if this > min || n < data.len() {
+                error!("iter: failed to call below={} (n={})", hex(&this), n);
+                break;
+            } else {
+                break;
+            }
+        }
+    }
+    if let Some(x) = file.above(&max).unwrap() {
+        error!("above max returned {}", hex(x.as_ref()));
+    }
+    millis = now.elapsed().unwrap_or_default().as_millis();
+    info!("iter: desc {} ms (rate={} op/s) n={}", millis, count as u128 * 1000 / millis, n);
+
+    now = SystemTime::now();
     for (key, _) in data.iter() {
         file.remove(key).unwrap();
         let opt = file.lookup(key).unwrap();
@@ -102,9 +152,6 @@ fn main() {
             error!("key='{}' not removed", hex(r.as_ref()));
         }
     }
-
     millis = now.elapsed().unwrap_or_default().as_millis();
     info!("remove: {} ms (rate={} op/s)", millis, count as u128 * 1000 / millis);
-
-    info!("file={:?} count={} page={}", path, count, size);
 }

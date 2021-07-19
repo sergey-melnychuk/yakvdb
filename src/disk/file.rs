@@ -436,6 +436,133 @@ impl<P: Page> Tree<P> for File<P> {
         }
     }
 
+    fn min(&self) -> Result<Option<Ref<[u8]>>> {
+        let mut page = self.root();
+        if page.size() == 0 {
+            return Ok(None);
+        }
+        loop {
+            let slot = page.slot(0).unwrap();
+            if slot.page == 0 {
+                return Ok(Some(Ref::map(page, |p| p.min())))
+            } else {
+                let id = slot.page;
+                if let Some(next) = self.page(id) {
+                    page = next;
+                } else {
+                    return Err(Error::Tree(id, "Page not found".to_string()))
+                }
+            }
+        }
+    }
+
+    fn max(&self) -> Result<Option<Ref<[u8]>>> {
+        let mut page = self.root();
+        if page.size() == 0 {
+            return Ok(None);
+        }
+        loop {
+            let last = page.size() - 1;
+            let slot = page.slot(last).unwrap();
+            if slot.page == 0 {
+                return Ok(Some(Ref::map(page, |p| p.max())))
+            } else {
+                let id = slot.page;
+                if let Some(next) = self.page(id) {
+                    page = next;
+                } else {
+                    return Err(Error::Tree(id, "Page not found".to_string()))
+                }
+            }
+        }
+    }
+
+    fn above(&self, key: &[u8]) -> Result<Option<Ref<[u8]>>> {
+        let mut path = Vec::with_capacity(8);
+        let mut page = self.root();
+        if page.size() == 0 {
+            return Ok(None);
+        }
+        loop {
+            let idx = page.ceil(key).unwrap();
+            let slot = page.slot(idx).unwrap();
+            if slot.page == 0 {
+                return if key < page.key(idx) {
+                    Ok(Some(Ref::map(page, |p| p.key(idx))))
+                } else if key == page.key(idx) && idx < page.size() - 1  {
+                    Ok(Some(Ref::map(page, |p| p.key(idx + 1))))
+                } else {
+                    // ceil == key, need to take min value from parent's next adjacent subtree
+                    for (parent_id, parent_idx) in path.iter().rev().cloned() {
+                        page = self.page(parent_id).unwrap();
+                        if parent_idx < page.size() - 1 {
+                            let id = page.slot(parent_idx + 1).unwrap().page;
+                            page = self.page(id).unwrap();
+                            loop {
+                                let slot = page.slot(0).unwrap();
+                                if slot.page == 0 {
+                                    return Ok(Some(Ref::map(page, |p| p.min())));
+                                } else {
+                                    page = self.page(slot.page).unwrap();
+                                }
+                            }
+                        }
+                    }
+
+                    // key seems to be the maximum stored value in the tree
+                    Ok(None)
+                }
+            } else {
+                path.push((page.id(), idx));
+                let id = slot.page;
+                if let Some(next) = self.page(id) {
+                    page = next;
+                } else {
+                    return Err(Error::Tree(id, "Page not found".to_string()))
+                }
+            }
+        }
+    }
+
+    fn below(&self, key: &[u8]) -> Result<Option<Ref<[u8]>>> {
+        let mut path = Vec::with_capacity(8);
+        let mut page = self.root();
+        if page.size() == 0 {
+            return Ok(None);
+        }
+        loop {
+            let idx = page.ceil(key).unwrap();
+            let slot = page.slot(idx).unwrap();
+            if slot.page == 0 {
+                return if idx > 0 && key > page.key(idx - 1) {
+                    Ok(Some(Ref::map(page, |p| p.key(idx - 1))))
+                } else {
+                    // ceil == key, need to take max value from parent's previous adjacent page
+                    for (parent_id, parent_idx) in path.iter().rev().cloned() {
+                        page = self.page(parent_id).unwrap();
+                        if parent_idx > 0 {
+                            let idx = parent_idx - 1;
+                            let id = page.slot(idx).unwrap().page;
+                            page = self.page(id).unwrap();
+                            return Ok(Some(Ref::map(page, |p| p.max())))
+                        }
+                    }
+
+                    // key seems to be the maximum stored value in the tree
+                    Ok(None)
+                }
+            } else {
+                path.push((page.id(), idx));
+                let id = slot.page;
+                if let Some(next) = self.page(id) {
+                    page = next;
+                } else {
+                    return Err(Error::Tree(id, "Page not found".to_string()))
+                }
+            }
+        }
+    }
+
     fn root(&self) -> Ref<P> {
         self.page(ROOT).unwrap()
     }
@@ -904,6 +1031,113 @@ mod tests {
     }
 
     #[test]
+    fn test_above() {
+        let path = Path::new("target/test_above.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+
+        let size: u32 = 256;
+        let mut file: File<Block> = File::make(path, size).unwrap();
+
+        let count = 10;
+        let mut data = {
+            let mut rng = StdRng::seed_from_u64(3);
+            let mut result = (0..count)
+                .into_iter()
+                .map(|i| {
+                    let b = i * count as u8;
+                    (vec![b; 8], vec![b; 8])
+                })
+                .collect::<Vec<_>>();
+            result.shuffle(&mut rng);
+            result
+        };
+
+        for (k, v) in data.iter() {
+            debug!("insert: key={} val={}", hex(k), hex(v));
+            file.insert(k, v).unwrap();
+        }
+
+        data.sort();
+        let min = file.min().unwrap().unwrap().to_vec();
+        let max = file.max().unwrap().unwrap().to_vec();
+        assert_eq!(min, data[0].0.to_vec());
+        assert_eq!(max, data.last().unwrap().0.to_vec());
+        assert!(file.above(&max).unwrap().is_none());
+
+        let asc = {
+            let mut result = Vec::with_capacity(data.len());
+            let mut val = file.min().unwrap().unwrap().to_vec();
+            result.push(val.clone());
+            loop {
+                if let Some(next) = file.above(&val).unwrap() {
+                    result.push(next.to_vec());
+                    val = next.to_vec();
+                } else {
+                    break;
+                }
+            }
+            result
+        };
+        assert_eq!(asc, data.clone().into_iter().map(|(k, _)| k).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_below() {
+        let path = Path::new("target/test_below.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+
+        let size: u32 = 256;
+        let mut file: File<Block> = File::make(path, size).unwrap();
+
+        let count = 10;
+        let mut data = {
+            let mut rng = StdRng::seed_from_u64(3);
+            let mut result = (0..count)
+                .into_iter()
+                .map(|i| {
+                    let b = i * count as u8;
+                    (vec![b; 8], vec![b; 8])
+                })
+                .collect::<Vec<_>>();
+            result.shuffle(&mut rng);
+            result
+        };
+
+        for (k, v) in data.iter() {
+            debug!("insert: key={} val={}", hex(k), hex(v));
+            file.insert(k, v).unwrap();
+        }
+
+        data.sort();
+        let min = file.min().unwrap().unwrap().to_vec();
+        let max = file.max().unwrap().unwrap().to_vec();
+        assert_eq!(min, data[0].0.to_vec());
+        assert_eq!(max, data.last().unwrap().0.to_vec());
+        assert_eq!(file.below(&min).unwrap().map(|v| v.to_vec()), None);
+
+        data.reverse();
+        let desc = {
+            let mut result = Vec::with_capacity(data.len());
+            let mut val = file.max().unwrap().unwrap().to_vec();
+            result.push(val.clone());
+            loop {
+                if let Some(next) = file.below(&val).unwrap() {
+                    result.push(next.to_vec());
+                    val = next.to_vec();
+                } else {
+                    break;
+                }
+            }
+            result
+        };
+        assert_eq!(desc, data.clone().into_iter().map(|(k, _)| k).collect::<Vec<_>>());
+    }
+
+    #[test]
     fn test_1k() {
         let mut rng = thread_rng();
 
@@ -934,6 +1168,57 @@ mod tests {
         for (k, v) in data.iter() {
             assert_eq!(file.lookup(k).unwrap().unwrap().deref(), v);
         }
+
+        let mut sorted = data.iter()
+            .map(|(k, _)| k)
+            .cloned()
+            .collect::<Vec<_>>();
+        sorted.sort();
+        let min = file.min().unwrap().unwrap().to_vec();
+        let max = file.max().unwrap().unwrap().to_vec();
+        assert_eq!(min, sorted[0]);
+        assert_eq!(max, sorted.last().cloned().unwrap());
+        assert_eq!(file.below(&min).unwrap().map(|v| v.to_vec()), None);
+        assert_eq!(file.above(&max).unwrap().map(|v| v.to_vec()), None);
+        let asc = {
+            let mut result = Vec::with_capacity(data.len());
+            let mut this = file.min().unwrap().unwrap().to_vec();
+            result.push(this.clone());
+            loop {
+                if let Some(next) = file.above(&this).unwrap() {
+                    result.push(next.to_vec());
+                    this = next.to_vec();
+                } else {
+                    break;
+                }
+            }
+            result
+        };
+        let desc = {
+            let mut result = Vec::with_capacity(data.len());
+            let mut this = file.max().unwrap().unwrap().to_vec();
+            result.push(this.clone());
+            loop {
+                if let Some(next) = file.below(&this).unwrap() {
+                    result.push(next.to_vec());
+                    this = next.to_vec();
+                } else {
+                    break;
+                }
+            }
+            result
+        };
+
+        for (i, (put, got)) in sorted.iter().zip(asc.iter()).enumerate() {
+            assert_eq!(put, got, "ASC: index={}: expected '{}' but got '{}'", i, hex(put), hex(got));
+        }
+        assert_eq!(asc, sorted);
+
+        sorted.reverse();
+        for (i, (put, got)) in sorted.iter().zip(desc.iter()).enumerate() {
+            assert_eq!(put, got, "DESC: index={}: expected '{}' but got '{}'", i, hex(put), hex(got));
+        }
+        assert_eq!(desc, sorted);
 
         for (i, (key, _)) in data.iter().enumerate() {
             debug!("({:05}) remove: key={}", i, hex(key));

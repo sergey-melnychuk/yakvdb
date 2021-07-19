@@ -7,6 +7,11 @@ pub(crate) trait Tree<P: Page> {
     fn insert(&mut self, key: &[u8], val: &[u8]) -> Result<()>;
     fn remove(&mut self, key: &[u8]) -> Result<()>;
 
+    fn min(&self) -> Result<Option<Ref<[u8]>>>;
+    fn max(&self) -> Result<Option<Ref<[u8]>>>;
+    fn above(&self, key: &[u8]) -> Result<Option<Ref<[u8]>>>;
+    fn below(&self, key: &[u8]) -> Result<Option<Ref<[u8]>>>;
+
     fn root(&self) -> Ref<P>;
     fn page(&self, id: u32) -> Option<Ref<P>>;
 
