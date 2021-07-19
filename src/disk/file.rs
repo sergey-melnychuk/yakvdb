@@ -19,7 +19,7 @@ pub(crate) struct File<P: Page> {
     head: Head,
 
     /// In-memory page cache. All page access happens only through cached page representation.
-    cache: RefCell<HashMap<u32, P>>,
+    cache: RefCell<HashMap<u32, P>>, // TODO limit memory usage (LRU-cache?)
     dirty: RefCell<HashSet<u32>>,
 
     /// Min-heap of available page identifiers (this helps avoid "gaps": empty pages inside file).
@@ -137,6 +137,10 @@ impl<P: Page> File<P> {
         };
 
         this.cache.borrow_mut().insert(ROOT, root);
+
+        // TODO perform cleanup/compaction:
+        // get total number of pages based on file length and page size
+        // traverse the BTree, discover empty pages into self.empty
 
         Ok(this)
     }
