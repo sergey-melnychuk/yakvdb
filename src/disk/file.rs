@@ -190,18 +190,20 @@ impl<P: Page> Tree<P> for File<P> {
                     Ok(None)
                 };
             } else {
+                let id = page.id();
+                drop(page);
                 if seen.contains(&slot.page) {
                     return Err(Error::Tree(
-                        page.id(),
+                        id,
                         "Cyclic reference detected".to_string(),
                     ));
                 }
-                seen.insert(page.id());
+                seen.insert(id);
 
                 let page_opt = self.page(slot.page);
                 if page_opt.is_none() {
                     return Err(Error::Tree(
-                        page.id(),
+                        id,
                         format!("Page not found: {}", slot.page),
                     ));
                 }
@@ -221,7 +223,6 @@ impl<P: Page> Tree<P> for File<P> {
             if page.size() == 0 {
                 page.put_val(key, val);
                 drop(page);
-                self.mark(id);
                 return Ok(());
             }
 
@@ -235,7 +236,6 @@ impl<P: Page> Tree<P> for File<P> {
                     parent_page.remove(parent_idx);
                     parent_page.put_ref(key, id);
                     drop(parent_page);
-                    self.mark(parent_id);
                 }
             }
             page = self.page_mut(id).unwrap();
@@ -264,8 +264,6 @@ impl<P: Page> Tree<P> for File<P> {
 
                 if full > SPLIT_THRESHOLD {
                     self.split(id, parent_id)?;
-                } else {
-                    self.mark(id);
                 }
 
                 while !path.is_empty() {
@@ -413,7 +411,6 @@ impl<P: Page> Tree<P> for File<P> {
                         parent.remove(idx);
                     }
                     drop(parent);
-                    self.mark(parent_id);
                     page_id = parent_id;
                 }
 
@@ -577,6 +574,7 @@ impl<P: Page> Tree<P> for File<P> {
     }
 
     fn root_mut(&self) -> RefMut<P> {
+        self.mark(ROOT);
         self.page_mut(ROOT).unwrap()
     }
 
@@ -586,6 +584,7 @@ impl<P: Page> Tree<P> for File<P> {
             self.cache.borrow_mut().insert(id, page);
         }
         let page = RefMut::map(self.cache.borrow_mut(), |cache| cache.get_mut(&id).unwrap());
+        self.mark(id);
         Some(page)
     }
 
@@ -700,9 +699,6 @@ impl<P: Page> Tree<P> for File<P> {
                 page.put_ref(&hi_max, hi_id);
             }
 
-            self.mark(id);
-            self.mark(lo_id);
-            self.mark(hi_id);
             Ok(())
         } else {
             let (copy, max) = {
@@ -753,9 +749,6 @@ impl<P: Page> Tree<P> for File<P> {
                 parent.put_ref(&peer_max, peer_id);
             }
 
-            self.mark(parent_id);
-            self.mark(peer_id);
-            self.mark(id);
             Ok(())
         }
     }
@@ -791,9 +784,6 @@ impl<P: Page> Tree<P> for File<P> {
             let mut page = self.page_mut(src_id).unwrap();
             page.clear();
         }
-
-        self.mark(dst_id);
-        self.mark(src_id);
 
         self.free_id(src_id);
         Ok(())
@@ -1164,6 +1154,8 @@ mod tests {
             debug!("({:05}) insert: key={} val={}", i, hex(k), hex(v));
             file.insert(k, v).unwrap();
         }
+
+        let mut file: File<Block> = File::open(path).unwrap();
 
         for (k, v) in data.iter() {
             assert_eq!(file.lookup(k).unwrap().unwrap().deref(), v);
