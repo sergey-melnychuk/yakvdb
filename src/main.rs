@@ -61,7 +61,11 @@ fn main() {
         file.insert(k, v).unwrap();
     }
     let mut millis = now.elapsed().unwrap_or_default().as_millis();
-    info!("insert: {} ms (rate={} op/s)", millis, count as u128 * 1000 / millis);
+    info!(
+        "insert: {} ms (rate={} op/s)",
+        millis,
+        count as u128 * 1000 / millis
+    );
 
     now = SystemTime::now();
     let mut found = Vec::with_capacity(data.len());
@@ -74,16 +78,20 @@ fn main() {
         }
     }
     millis = now.elapsed().unwrap_or_default().as_millis();
-    info!("lookup: {} ms (rate={} op/s)", millis, count as u128 * 1000 / millis);
+    info!(
+        "lookup: {} ms (rate={} op/s)",
+        millis,
+        count as u128 * 1000 / millis
+    );
 
     for ((k, v), r) in data.iter().zip(found.iter()) {
         if v != r {
             error!(
-                    "key='{}': expected '{}' but got '{}'",
-                    hex(k),
-                    hex(v),
-                    hex(r)
-                );
+                "key='{}': expected '{}' but got '{}'",
+                hex(k),
+                hex(v),
+                hex(r)
+            );
         }
     }
 
@@ -98,7 +106,11 @@ fn main() {
             n += 1;
             let next = r.to_vec();
             if next <= this {
-                error!("iter:  asc order violated: {} comes before {}", hex(&this), hex(&next));
+                error!(
+                    "iter:  asc order violated: {} comes before {}",
+                    hex(&this),
+                    hex(&next)
+                );
                 break;
             }
             this = next;
@@ -115,7 +127,12 @@ fn main() {
         error!("below min returned {}", hex(x.as_ref()));
     }
     millis = now.elapsed().unwrap_or_default().as_millis();
-    info!("iter:  asc {} ms (rate={} op/s) n={}", millis, count as u128 * 1000 / millis, n);
+    info!(
+        "iter:  asc {} ms (rate={} op/s) n={}",
+        millis,
+        count as u128 * 1000 / millis,
+        n
+    );
 
     now = SystemTime::now();
     let mut this = max.clone();
@@ -125,7 +142,11 @@ fn main() {
             n += 1;
             let next = r.to_vec();
             if next >= this {
-                error!("iter: desc order violated: {} comes before {}", hex(&this), hex(&next));
+                error!(
+                    "iter: desc order violated: {} comes before {}",
+                    hex(&this),
+                    hex(&next)
+                );
                 break;
             }
             this = next;
@@ -142,7 +163,12 @@ fn main() {
         error!("above max returned {}", hex(x.as_ref()));
     }
     millis = now.elapsed().unwrap_or_default().as_millis();
-    info!("iter: desc {} ms (rate={} op/s) n={}", millis, count as u128 * 1000 / millis, n);
+    info!(
+        "iter: desc {} ms (rate={} op/s) n={}",
+        millis,
+        count as u128 * 1000 / millis,
+        n
+    );
 
     now = SystemTime::now();
     for (key, _) in data.iter() {
@@ -153,5 +179,9 @@ fn main() {
         }
     }
     millis = now.elapsed().unwrap_or_default().as_millis();
-    info!("remove: {} ms (rate={} op/s)", millis, count as u128 * 1000 / millis);
+    info!(
+        "remove: {} ms (rate={} op/s)",
+        millis,
+        count as u128 * 1000 / millis
+    );
 }

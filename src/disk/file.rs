@@ -193,19 +193,13 @@ impl<P: Page> Tree<P> for File<P> {
                 let id = page.id();
                 drop(page);
                 if seen.contains(&slot.page) {
-                    return Err(Error::Tree(
-                        id,
-                        "Cyclic reference detected".to_string(),
-                    ));
+                    return Err(Error::Tree(id, "Cyclic reference detected".to_string()));
                 }
                 seen.insert(id);
 
                 let page_opt = self.page(slot.page);
                 if page_opt.is_none() {
-                    return Err(Error::Tree(
-                        id,
-                        format!("Page not found: {}", slot.page),
-                    ));
+                    return Err(Error::Tree(id, format!("Page not found: {}", slot.page)));
                 }
                 page = page_opt.unwrap();
             }
@@ -441,13 +435,13 @@ impl<P: Page> Tree<P> for File<P> {
         loop {
             let slot = page.slot(0).unwrap();
             if slot.page == 0 {
-                return Ok(Some(Ref::map(page, |p| p.min())))
+                return Ok(Some(Ref::map(page, |p| p.min())));
             } else {
                 let id = slot.page;
                 if let Some(next) = self.page(id) {
                     page = next;
                 } else {
-                    return Err(Error::Tree(id, "Page not found".to_string()))
+                    return Err(Error::Tree(id, "Page not found".to_string()));
                 }
             }
         }
@@ -462,13 +456,13 @@ impl<P: Page> Tree<P> for File<P> {
             let last = page.size() - 1;
             let slot = page.slot(last).unwrap();
             if slot.page == 0 {
-                return Ok(Some(Ref::map(page, |p| p.max())))
+                return Ok(Some(Ref::map(page, |p| p.max())));
             } else {
                 let id = slot.page;
                 if let Some(next) = self.page(id) {
                     page = next;
                 } else {
-                    return Err(Error::Tree(id, "Page not found".to_string()))
+                    return Err(Error::Tree(id, "Page not found".to_string()));
                 }
             }
         }
@@ -486,7 +480,7 @@ impl<P: Page> Tree<P> for File<P> {
             if slot.page == 0 {
                 return if key < page.key(idx) {
                     Ok(Some(Ref::map(page, |p| p.key(idx))))
-                } else if key == page.key(idx) && idx < page.size() - 1  {
+                } else if key == page.key(idx) && idx < page.size() - 1 {
                     Ok(Some(Ref::map(page, |p| p.key(idx + 1))))
                 } else {
                     // ceil == key, need to take min value from parent's next adjacent subtree
@@ -508,14 +502,14 @@ impl<P: Page> Tree<P> for File<P> {
 
                     // key seems to be the maximum stored value in the tree
                     Ok(None)
-                }
+                };
             } else {
                 path.push((page.id(), idx));
                 let id = slot.page;
                 if let Some(next) = self.page(id) {
                     page = next;
                 } else {
-                    return Err(Error::Tree(id, "Page not found".to_string()))
+                    return Err(Error::Tree(id, "Page not found".to_string()));
                 }
             }
         }
@@ -541,20 +535,20 @@ impl<P: Page> Tree<P> for File<P> {
                             let idx = parent_idx - 1;
                             let id = page.slot(idx).unwrap().page;
                             page = self.page(id).unwrap();
-                            return Ok(Some(Ref::map(page, |p| p.max())))
+                            return Ok(Some(Ref::map(page, |p| p.max())));
                         }
                     }
 
                     // key seems to be the maximum stored value in the tree
                     Ok(None)
-                }
+                };
             } else {
                 path.push((page.id(), idx));
                 let id = slot.page;
                 if let Some(next) = self.page(id) {
                     page = next;
                 } else {
-                    return Err(Error::Tree(id, "Page not found".to_string()))
+                    return Err(Error::Tree(id, "Page not found".to_string()));
                 }
             }
         }
@@ -1070,7 +1064,10 @@ mod tests {
             }
             result
         };
-        assert_eq!(asc, data.clone().into_iter().map(|(k, _)| k).collect::<Vec<_>>());
+        assert_eq!(
+            asc,
+            data.clone().into_iter().map(|(k, _)| k).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1124,7 +1121,10 @@ mod tests {
             }
             result
         };
-        assert_eq!(desc, data.clone().into_iter().map(|(k, _)| k).collect::<Vec<_>>());
+        assert_eq!(
+            desc,
+            data.clone().into_iter().map(|(k, _)| k).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1161,10 +1161,7 @@ mod tests {
             assert_eq!(file.lookup(k).unwrap().unwrap().deref(), v);
         }
 
-        let mut sorted = data.iter()
-            .map(|(k, _)| k)
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut sorted = data.iter().map(|(k, _)| k).cloned().collect::<Vec<_>>();
         sorted.sort();
         let min = file.min().unwrap().unwrap().to_vec();
         let max = file.max().unwrap().unwrap().to_vec();
@@ -1202,13 +1199,27 @@ mod tests {
         };
 
         for (i, (put, got)) in sorted.iter().zip(asc.iter()).enumerate() {
-            assert_eq!(put, got, "ASC: index={}: expected '{}' but got '{}'", i, hex(put), hex(got));
+            assert_eq!(
+                put,
+                got,
+                "ASC: index={}: expected '{}' but got '{}'",
+                i,
+                hex(put),
+                hex(got)
+            );
         }
         assert_eq!(asc, sorted);
 
         sorted.reverse();
         for (i, (put, got)) in sorted.iter().zip(desc.iter()).enumerate() {
-            assert_eq!(put, got, "DESC: index={}: expected '{}' but got '{}'", i, hex(put), hex(got));
+            assert_eq!(
+                put,
+                got,
+                "DESC: index={}: expected '{}' but got '{}'",
+                i,
+                hex(put),
+                hex(got)
+            );
         }
         assert_eq!(desc, sorted);
 
