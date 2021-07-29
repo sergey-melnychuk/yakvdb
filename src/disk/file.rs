@@ -427,6 +427,10 @@ impl<P: Page> Tree<P> for File<P> {
         }
     }
 
+    fn is_empty(&self) -> bool {
+        self.root().size() == 0
+    }
+
     fn min(&self) -> Result<Option<Ref<[u8]>>> {
         let mut page = self.root();
         if page.size() == 0 {

@@ -184,4 +184,8 @@ fn main() {
         millis,
         count as u128 * 1000 / millis
     );
+
+    if !file.is_empty() {
+        error!("non-empty file");
+    }
 }

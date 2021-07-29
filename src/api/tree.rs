@@ -7,6 +7,8 @@ pub(crate) trait Tree<P: Page> {
     fn insert(&mut self, key: &[u8], val: &[u8]) -> Result<()>;
     fn remove(&mut self, key: &[u8]) -> Result<()>;
 
+    fn is_empty(&self) -> bool;
+
     /// Get lowest/smallest key stored in the tree, or none if tree is empty.
     fn min(&self) -> Result<Option<Ref<[u8]>>>;
 
