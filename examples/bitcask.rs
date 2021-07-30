@@ -170,14 +170,7 @@ impl OnDisk {
     }
 
     fn id(path: &Path) -> FileId {
-        let name = path
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .split('.')
-            .next()
-            .unwrap();
+        let name = path.file_stem().unwrap().to_str().unwrap();
         let id: u32 = u32::from_str_radix(name, 16).unwrap();
         FileId(id)
     }
