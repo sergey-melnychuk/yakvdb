@@ -214,13 +214,13 @@ impl<P: Page> Tree<P> for File<P> {
             let id = page.id();
             let parent_id = path.last().cloned().map(|(id, _)| id).unwrap_or_default();
 
-            if page.size() == 0 {
+            if page.len() == 0 {
                 page.put_val(key, val);
                 drop(page);
                 return Ok(());
             }
 
-            let idx = page.ceil(key).unwrap_or_else(|| page.size() - 1);
+            let idx = page.ceil(key).unwrap_or_else(|| page.len() - 1);
 
             drop(page);
             if let Some((parent_id, parent_idx)) = path.last().cloned() {
@@ -329,7 +329,7 @@ impl<P: Page> Tree<P> for File<P> {
                                 let peer = parent.slot(idx - 1).unwrap().page;
                                 peers.push(peer);
                             }
-                            if idx < parent.size() - 1 {
+                            if idx < parent.len() - 1 {
                                 let peer = parent.slot(idx + 1).unwrap().page;
                                 peers.push(peer);
                             }
@@ -340,7 +340,7 @@ impl<P: Page> Tree<P> for File<P> {
                                 .filter_map(|peer_id| {
                                     let peer = self.page(peer_id).unwrap();
                                     let full = peer.full();
-                                    if peer.size() > 0 && full < MERGE_THRESHOLD {
+                                    if peer.len() > 0 && full < MERGE_THRESHOLD {
                                         Some((peer_id, full))
                                     } else {
                                         None
@@ -388,7 +388,7 @@ impl<P: Page> Tree<P> for File<P> {
 
                     let max_opt = {
                         let page = self.page(page_id).unwrap();
-                        if page.size() > 0 {
+                        if page.len() > 0 {
                             Some(page.max().to_vec())
                         } else {
                             None
@@ -428,12 +428,12 @@ impl<P: Page> Tree<P> for File<P> {
     }
 
     fn is_empty(&self) -> bool {
-        self.root().size() == 0
+        self.root().len() == 0
     }
 
     fn min(&self) -> Result<Option<Ref<[u8]>>> {
         let mut page = self.root();
-        if page.size() == 0 {
+        if page.len() == 0 {
             return Ok(None);
         }
         loop {
@@ -453,11 +453,11 @@ impl<P: Page> Tree<P> for File<P> {
 
     fn max(&self) -> Result<Option<Ref<[u8]>>> {
         let mut page = self.root();
-        if page.size() == 0 {
+        if page.len() == 0 {
             return Ok(None);
         }
         loop {
-            let last = page.size() - 1;
+            let last = page.len() - 1;
             let slot = page.slot(last).unwrap();
             if slot.page == 0 {
                 return Ok(Some(Ref::map(page, |p| p.max())));
@@ -475,7 +475,7 @@ impl<P: Page> Tree<P> for File<P> {
     fn above(&self, key: &[u8]) -> Result<Option<Ref<[u8]>>> {
         let mut path = Vec::with_capacity(8);
         let mut page = self.root();
-        if page.size() == 0 {
+        if page.len() == 0 {
             return Ok(None);
         }
         loop {
@@ -484,13 +484,13 @@ impl<P: Page> Tree<P> for File<P> {
             if slot.page == 0 {
                 return if key < page.key(idx) {
                     Ok(Some(Ref::map(page, |p| p.key(idx))))
-                } else if key == page.key(idx) && idx < page.size() - 1 {
+                } else if key == page.key(idx) && idx < page.len() - 1 {
                     Ok(Some(Ref::map(page, |p| p.key(idx + 1))))
                 } else {
                     // ceil == key, need to take min value from parent's next adjacent subtree
                     for (parent_id, parent_idx) in path.iter().rev().cloned() {
                         page = self.page(parent_id).unwrap();
-                        if parent_idx < page.size() - 1 {
+                        if parent_idx < page.len() - 1 {
                             let id = page.slot(parent_idx + 1).unwrap().page;
                             page = self.page(id).unwrap();
                             loop {
@@ -522,7 +522,7 @@ impl<P: Page> Tree<P> for File<P> {
     fn below(&self, key: &[u8]) -> Result<Option<Ref<[u8]>>> {
         let mut path = Vec::with_capacity(8);
         let mut page = self.root();
-        if page.size() == 0 {
+        if page.len() == 0 {
             return Ok(None);
         }
         loop {
@@ -645,7 +645,7 @@ impl<P: Page> Tree<P> for File<P> {
             let (copy, lo_max, hi_max) = {
                 let page = self.page(id).unwrap();
                 let copy = page.copy();
-                let half = page.size() as usize / 2;
+                let half = page.len() as usize / 2;
                 let lo_max = copy.get(half - 1).map(|(k, _, _)| k).cloned().unwrap();
                 let hi_max = copy.last().map(|(k, _, _)| k).cloned().unwrap();
                 (copy, lo_max, hi_max)

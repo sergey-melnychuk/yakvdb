@@ -33,13 +33,13 @@ impl Block {
         let ceil_opt = self.ceil(key);
         if let Some(idx) = &ceil_opt {
             if self.key(*idx) == key {
-                let n = self.size() - 1;
+                let n = self.len() - 1;
                 put_size(&mut self.buf, n);
                 self.remove(*idx);
             }
         }
 
-        let size = self.size();
+        let size = self.len();
         let idx = self.ceil(key).unwrap_or_else(|| size);
 
         let mut slots = (0..size)
@@ -63,7 +63,7 @@ impl Block {
             .enumerate()
             .for_each(|(idx, slot)| put_slot(&mut self.buf, idx as u32, &slot));
 
-        let n = self.size() + 1;
+        let n = self.len() + 1;
         put_size(&mut self.buf, n);
 
         put_slice(&mut self.buf, offset as usize, key);
@@ -101,12 +101,12 @@ impl Page for Block {
         get_u32(&self.buf, CAP_OFFSET)
     }
 
-    fn size(&self) -> u32 {
+    fn len(&self) -> u32 {
         get_u32(&self.buf, SIZE_OFFSET)
     }
 
     fn slot(&self, idx: u32) -> Option<Slot> {
-        if idx >= self.size() {
+        if idx >= self.len() {
             return None;
         }
         let pos = HEAD + U32 * 4 * idx as usize;
@@ -122,7 +122,7 @@ impl Page for Block {
     }
 
     fn max(&self) -> &[u8] {
-        self.key(self.size() - 1)
+        self.key(self.len() - 1)
     }
 
     fn key(&self, idx: u32) -> &[u8] {
@@ -146,7 +146,7 @@ impl Page for Block {
     }
 
     fn free(&self) -> u32 {
-        let size = self.size();
+        let size = self.len();
         if size == 0 {
             return self.cap() - HEAD as u32;
         }
@@ -172,7 +172,7 @@ impl Page for Block {
     }
 
     fn find(&self, key: &[u8]) -> Option<u32> {
-        let n = self.size();
+        let n = self.len();
         if n == 0 {
             return None;
         }
@@ -186,7 +186,7 @@ impl Page for Block {
     }
 
     fn ceil(&self, key: &[u8]) -> Option<u32> {
-        let n = self.size();
+        let n = self.len();
         if n == 0 {
             return None;
         }
@@ -208,7 +208,7 @@ impl Page for Block {
     }
 
     fn remove(&mut self, idx: u32) {
-        let size = self.size();
+        let size = self.len();
         if idx >= size {
             return;
         }
@@ -255,7 +255,7 @@ impl Page for Block {
     }
 
     fn copy(&self) -> Vec<(Vec<u8>, Vec<u8>, u32)> {
-        (0..self.size())
+        (0..self.len())
             .into_iter()
             .filter_map(|idx| self.slot(idx))
             .map(|slot| {
@@ -500,7 +500,7 @@ mod tests {
         assert_eq!(page.put_val(k2, v2), Some(0));
         assert_eq!(page.put_ref(k3, p3), Some(2));
 
-        let slots = (0..page.size())
+        let slots = (0..page.len())
             .into_iter()
             .filter_map(|idx| page.slot(idx))
             .collect::<Vec<_>>();

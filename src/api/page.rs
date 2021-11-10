@@ -30,8 +30,8 @@ pub(crate) trait Page: AsRef<[u8]> + AsMut<[u8]> {
     /// Current page's capacity in bytes.
     fn cap(&self) -> u32;
 
-    /// Number of entries (and slots) stored in the page.
-    fn size(&self) -> u32;
+    /// Number of slots stored in the page.
+    fn len(&self) -> u32;
 
     fn slot(&self, idx: u32) -> Option<Slot>;
 
