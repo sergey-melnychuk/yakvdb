@@ -3,7 +3,7 @@ Yet Another Kev-Value DataBase
 
 Extremely simple (simplest possible?) single-file BTree-based key-value database. 
 
-Build for fun and learning: goal is to "demystify" the "database".
+Built for fun and learning: goal is to "demystify" the "database".
 
 Operations amortized runtime complexity:
 * insert/remove: O(log(N) * log(K) + K)
@@ -17,7 +17,7 @@ Binary search is run for each page (log(K)) and touches at most log(N) pages.
 
 On insert/remove each page performs O(K) cleanup to keep keys ordered, as well as extra housekeeping is performed if necessary (split or merge of pages).
 
-Each insert/remove gets flushed to the disk for durability.
+Each insert/remove gets flushed to disk for durability.
 
 ### API
 * [Page](src/api/page.rs) defines BTree node (impl: [Block](src/disk/block.rs))
@@ -25,7 +25,7 @@ Each insert/remove gets flushed to the disk for durability.
 
 ### Demo
 
-Just `cargo run --release` to run example in from [main.rs](src/main.rs):
+Just `cargo run --release` to run example from [main.rs](src/main.rs):
 * create/open database (file)
 * generate random key-value pairs
 * insert all key-value pairs
@@ -34,15 +34,18 @@ Just `cargo run --release` to run example in from [main.rs](src/main.rs):
 * iterate all keys in descending order
 * remove all keys and check database is empty
 
+The typical result looks like one below.
+
 ```shell
 $ cargo run --release
-[...][INFO] file="target/main_1M.tmp" count=1000000 page=4096
-[...][INFO] insert: 27520 ms (rate=36337 op/s)
-[...][INFO] lookup: 921 ms (rate=1085776 op/s)
-[...][INFO] iter: min=000003cf1bb4e04d max=ffffe6e240320123
-[...][INFO] iter:  asc 489 ms (rate=2044989 op/s) n=1000000
-[...][INFO] iter: desc 465 ms (rate=2150537 op/s) n=1000000
-[...][INFO] remove: 25819 ms (rate=38731 op/s)
+[snip]
+[...] file="target/main_1M.tmp" count=1000000 page=4096
+[...] insert: 23073 ms (rate=43340 op/s)
+[...] lookup: 1061 ms (rate=942507 op/s)
+[...] iter: min=000003cf1bb4e04d max=ffffe6e240320123
+[...] iter:  asc 461 ms (rate=2169197 op/s) n=1000000
+[...] iter: desc 493 ms (rate=2028397 op/s) n=1000000
+[...] remove: 22239 ms (rate=44966 op/s)
 ```
 
 ### Code
