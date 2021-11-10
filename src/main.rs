@@ -102,7 +102,7 @@ fn main() {
     let mut this = min.clone();
     let mut n = 1usize;
     loop {
-        if let Some(r) = file.above(&this).unwrap() {
+        if let Ok(Some(r)) = file.above(&this) {
             n += 1;
             let next = r.to_vec();
             if next <= this {
@@ -138,7 +138,7 @@ fn main() {
     let mut this = max.clone();
     let mut n = 1usize;
     loop {
-        if let Some(r) = file.below(&this).unwrap() {
+        if let Ok(Some(r)) = file.below(&this) {
             n += 1;
             let next = r.to_vec();
             if next >= this {
