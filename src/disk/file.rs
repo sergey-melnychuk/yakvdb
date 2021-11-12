@@ -3,7 +3,7 @@ use crate::api::page::Page;
 use crate::api::tree::Tree;
 use crate::util::hex::hex;
 use bytes::{Buf, BufMut, BytesMut};
-use log::{debug, trace};
+use log::{debug, error, trace};
 use std::cell::{Ref, RefCell, RefMut};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -138,10 +138,20 @@ impl<P: Page> File<P> {
 
         this.cache.borrow_mut().insert(ROOT, root);
 
-        // TODO perform cleanup/compaction:
-        // get total number of pages based on file length and page size
-        // traverse the BTree, discover empty pages into self.empty
-
+        let total_pages = (len - HEAD) as u32 / this.head.page_bytes;
+        debug!("Processing pages for compaction: {}", total_pages);
+        if this.head.page_count < total_pages {
+            for id in 2..=total_pages { // skipping the root page (id=1)
+                if let Ok(page) = this.load(this.offset(id), this.head.page_bytes) {
+                    if page.len() == 0 {
+                        debug!("Page id={} is empty", id);
+                        this.empty.borrow_mut().push(Reverse(id));
+                    }
+                } else {
+                    error!("Page failed to load: id={}", id);
+                }
+            }
+        }
         Ok(this)
     }
 
@@ -591,21 +601,32 @@ impl<P: Page> Tree<P> for File<P> {
     }
 
     fn flush(&self) -> crate::api::error::Result<()> {
-        let pages = {
-            let result = self.dirty.borrow().iter().cloned().collect::<Vec<_>>();
-            self.dirty.borrow_mut().clear();
-            result
-        };
+        let pages = self.dirty.borrow()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        self.dirty.borrow_mut().clear();
+
+        let mut failed = vec![];
         for id in pages {
             if let Some(page) = self.page(id) {
                 self.save(page.deref())?;
                 debug!("flush: page={}", id);
             } else {
-                return Err(Error::Tree(id, "Page not found".to_string()));
+                failed.push(id);
+                error!("flush: no such page={}", id);
             }
         }
 
-        Ok(())
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            let pages = failed.into_iter()
+                .map(|id| format!("{}", id))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(Error::Other(format!("Missing pages: {}", pages)))
+        }
     }
 
     fn next_id(&self) -> Result<u32> {
