@@ -25,7 +25,7 @@ fn setup_logger() -> Result<(), fern::InitError> {
         })
         .level(log::LevelFilter::Info)
         .chain(std::io::stdout())
-        //.chain(fern::log_file("yakvdb.log")?) // TODO set up log rotation
+        .chain(fern::DateBased::new("target/yakvdb", "-%Y-%m-%d:%H00.log"))
         .apply()?;
     Ok(())
 }
