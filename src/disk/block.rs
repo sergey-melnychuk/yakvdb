@@ -40,7 +40,7 @@ impl Block {
         }
 
         let size = self.len();
-        let idx = self.ceil(key).unwrap_or_else(|| size);
+        let idx = self.ceil(key).unwrap_or(size);
 
         let mut slots = (0..size)
             .into_iter()

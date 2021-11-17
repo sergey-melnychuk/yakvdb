@@ -62,7 +62,7 @@ impl<P: Page> File<P> {
         };
 
         let mut buf = BytesMut::with_capacity(HEAD + page_bytes as usize);
-        buf.put_slice(&MAGIC);
+        buf.put_slice(MAGIC);
         buf.put_u32(head.page_bytes);
         buf.put_u32(head.page_count);
 
@@ -141,7 +141,8 @@ impl<P: Page> File<P> {
         let total_pages = (len - HEAD) as u32 / this.head.page_bytes;
         debug!("Processing pages for compaction: {}", total_pages);
         if this.head.page_count < total_pages {
-            for id in 2..=total_pages { // skipping the root page (id=1)
+            for id in 2..=total_pages {
+                // skipping the root page (id=1)
                 if let Ok(page) = this.load(this.offset(id), this.head.page_bytes) {
                     if page.len() == 0 {
                         debug!("Page id={} is empty", id);
@@ -514,7 +515,7 @@ impl<P: Page> Tree<P> for File<P> {
                         }
                     }
 
-                    // key seems to be the maximum stored value in the tree
+                    // the key appears to be the maximum value stored in the tree
                     Ok(None)
                 };
             } else {
@@ -553,7 +554,7 @@ impl<P: Page> Tree<P> for File<P> {
                         }
                     }
 
-                    // key seems to be the maximum stored value in the tree
+                    // the key seems to be the minimum value stored in the tree
                     Ok(None)
                 };
             } else {
@@ -601,10 +602,7 @@ impl<P: Page> Tree<P> for File<P> {
     }
 
     fn flush(&self) -> crate::api::error::Result<()> {
-        let pages = self.dirty.borrow()
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
+        let pages = self.dirty.borrow().iter().cloned().collect::<Vec<_>>();
         self.dirty.borrow_mut().clear();
 
         let mut failed = vec![];
@@ -621,7 +619,8 @@ impl<P: Page> Tree<P> for File<P> {
         if failed.is_empty() {
             Ok(())
         } else {
-            let pages = failed.into_iter()
+            let pages = failed
+                .into_iter()
                 .map(|id| format!("{}", id))
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -819,38 +818,37 @@ impl<P: Page> Tree<P> for File<P> {
         ) {
             if page_id == 0 {
                 return;
-            } else {
-                let page = file.page(page_id).unwrap();
-                let copy = page.copy();
-                let full = page.full();
-
-                acc.push_str(&if copy.is_empty() {
-                    format!("{}page={}: empty", prefix, page_id)
-                } else {
-                    let entries = copy
-                        .iter()
-                        .map(|(k, v, p)| format!("{}{}, {}, {}", prefix, hex(&k), hex(&v), p))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    format!(
-                        "{}page={}: (parent={}) {}% full\n{}",
-                        prefix, page_id, parent_id, full, entries
-                    )
-                });
-
-                acc.push('\n');
-                let links = copy.iter().map(|(_, _, p)| p).cloned().collect::<Vec<_>>();
-
-                links.into_iter().for_each(|id| {
-                    let mut p = prefix.clone();
-                    p.push_str(&tab);
-                    dump_page(file, id, page_id, acc, p, tab.clone());
-                });
             }
+
+            let page = file.page(page_id).unwrap();
+            let copy = page.copy();
+            let full = page.full();
+
+            acc.push_str(&if copy.is_empty() {
+                format!("{}page={}: empty", prefix, page_id)
+            } else {
+                let entries = copy
+                    .iter()
+                    .map(|(k, v, p)| format!("{}{}, {}, {}", prefix, hex(k), hex(v), p))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!(
+                    "{}page={}: (parent={}) {}% full\n{}",
+                    prefix, page_id, parent_id, full, entries
+                )
+            });
+
+            acc.push('\n');
+            let links = copy.iter().map(|(_, _, p)| p).cloned();
+            links.for_each(|id| {
+                let mut p = prefix.clone();
+                p.push_str(&tab);
+                dump_page(file, id, page_id, acc, p, tab.clone());
+            });
         }
 
         let mut acc = String::with_capacity(1024);
-        dump_page(&self, ROOT, 0, &mut acc, "".to_string(), "\t".to_string());
+        dump_page(self, ROOT, 0, &mut acc, "".to_string(), "\t".to_string());
         acc
     }
 }

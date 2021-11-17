@@ -66,7 +66,7 @@ pub(crate) trait Page: AsRef<[u8]> + AsMut<[u8]> {
     /// Returns slot index if operation was successful.
     fn put_ref(&mut self, key: &[u8], page: u32) -> Option<u32>;
 
-    /// Remove the slot of a given index and return key-value stored there.
+    /// Remove the slot of a given index.
     /// Automatic defragmentation is performed to maximize available capacity.
     fn remove(&mut self, idx: u32);
 

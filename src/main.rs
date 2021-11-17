@@ -107,20 +107,19 @@ fn main() {
             let next = r.to_vec();
             if next <= this {
                 error!(
-                    "iter:  asc order violated: {} comes before {}",
+                    "iter:  asc order violated: {} comes before {} (n={})",
                     hex(&this),
-                    hex(&next)
+                    hex(&next),
+                    n
                 );
                 break;
             }
             this = next;
+        } else if this < max || n < data.len() {
+            error!("iter: failed to call above={} (n={})", hex(&this), n);
+            break;
         } else {
-            if this < max || n < data.len() {
-                error!("iter: failed to call above={} (n={})", hex(&this), n);
-                break;
-            } else {
-                break;
-            }
+            break;
         }
     }
     if let Some(x) = file.below(&min).unwrap() {
@@ -143,20 +142,19 @@ fn main() {
             let next = r.to_vec();
             if next >= this {
                 error!(
-                    "iter: desc order violated: {} comes before {}",
+                    "iter: desc order violated: {} comes before {} (n={})",
                     hex(&this),
-                    hex(&next)
+                    hex(&next),
+                    n
                 );
                 break;
             }
             this = next;
+        } else if this > min || n < data.len() {
+            error!("iter: failed to call below={} (n={})", hex(&this), n);
+            break;
         } else {
-            if this > min || n < data.len() {
-                error!("iter: failed to call below={} (n={})", hex(&this), n);
-                break;
-            } else {
-                break;
-            }
+            break;
         }
     }
     if let Some(x) = file.above(&max).unwrap() {
