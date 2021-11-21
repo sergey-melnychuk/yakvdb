@@ -40,12 +40,12 @@ The typical result looks like one below.
 $ cargo run --release
 [snip]
 [...] file="target/main_1M.tmp" count=1000000 page=4096
-[...] insert: 23073 ms (rate=43340 op/s)
-[...] lookup: 1061 ms (rate=942507 op/s)
+[...] insert: 28899 ms (rate=34603 op/s)
+[...] lookup: 7096 ms (rate=140924 op/s)
 [...] iter: min=000003cf1bb4e04d max=ffffe6e240320123
-[...] iter:  asc 461 ms (rate=2169197 op/s) n=1000000
-[...] iter: desc 493 ms (rate=2028397 op/s) n=1000000
-[...] remove: 22239 ms (rate=44966 op/s)
+[...] iter:  asc 589 ms (rate=1697792 op/s) n=1000000
+[...] iter: desc 570 ms (rate=1754385 op/s) n=1000000
+[...] remove: 30850 ms (rate=32414 op/s)```
 ```
 
 ### Code
