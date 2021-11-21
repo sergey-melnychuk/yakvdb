@@ -1,8 +1,8 @@
+use log::debug;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::hash::Hash;
-use log::info;
 
 pub(crate) trait Cache<K: Clone + Eq + PartialEq + Hash, V> {
     fn has(&self, key: &K) -> bool;
@@ -16,7 +16,7 @@ pub(crate) trait Cache<K: Clone + Eq + PartialEq + Hash, V> {
     fn free(&self, key: &K);
 }
 
-pub(crate) struct LRU<K, V> {
+pub(crate) struct LruCache<K, V> {
     map: HashMap<K, V>,
     lru: RefCell<HashMap<K, u64>>,
     locks: RefCell<HashSet<K>>,
@@ -24,7 +24,7 @@ pub(crate) struct LRU<K, V> {
     op: RefCell<u64>,
 }
 
-impl<K: Clone + Eq + Hash + Display, V> LRU<K, V> {
+impl<K: Clone + Eq + Hash + Display, V> LruCache<K, V> {
     pub(crate) fn new(size: usize) -> Self {
         Self {
             map: HashMap::with_capacity(size),
@@ -45,7 +45,8 @@ impl<K: Clone + Eq + Hash + Display, V> LRU<K, V> {
             None
         } else {
             let locked = self.locks.borrow();
-            self.lru.borrow()
+            self.lru
+                .borrow()
                 .iter()
                 .filter(|(key, _)| !locked.contains(*key))
                 .min_by_key(|(_, lru)| *lru)
@@ -56,14 +57,14 @@ impl<K: Clone + Eq + Hash + Display, V> LRU<K, V> {
 
     fn evict(&mut self) {
         if let Some(key) = self.lru() {
-            info!("Evict page {}", key);
+            debug!("Evict page {}", key);
             self.map.remove(&key);
             self.lru.borrow_mut().remove(&key);
         }
     }
 }
 
-impl<K: Clone + Hash + Eq + Display, V> Cache<K, V> for LRU<K, V> {
+impl<K: Clone + Hash + Eq + Display, V> Cache<K, V> for LruCache<K, V> {
     fn has(&self, key: &K) -> bool {
         self.map.contains_key(key)
     }
@@ -105,10 +106,7 @@ impl<K: Clone + Hash + Eq + Display, V> Cache<K, V> for LRU<K, V> {
     }
 
     fn keys(&self) -> Vec<K> {
-        self.map.keys()
-            .into_iter()
-            .cloned()
-            .collect()
+        self.map.keys().into_iter().cloned().collect()
     }
 
     fn lock(&self, key: &K) {
@@ -126,7 +124,7 @@ mod tests {
 
     #[test]
     fn test_eviction() {
-        let mut cache = LRU::new(3);
+        let mut cache = LruCache::new(3);
         cache.put(1, 0);
         cache.put(2, 0);
         cache.put(3, 0);

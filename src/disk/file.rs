@@ -1,9 +1,10 @@
 use crate::api::error::{Error, Result};
 use crate::api::page::Page;
 use crate::api::tree::Tree;
+use crate::util::cache::{Cache, LruCache};
 use crate::util::hex::hex;
 use bytes::{Buf, BufMut, BytesMut};
-use log::{debug, error, info, trace};
+use log::{debug, error, trace};
 use std::cell::{Ref, RefCell, RefMut};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
@@ -12,7 +13,6 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::ops::Deref;
 use std::path::Path;
-use crate::util::cache::{Cache, LRU};
 
 pub(crate) struct File<P: Page> {
     /// Underlying file reference where all data is physically stored.
@@ -20,7 +20,7 @@ pub(crate) struct File<P: Page> {
     head: Head,
 
     /// In-memory page cache. All page access happens only through cached page representation.
-    cache: RefCell<LRU<u32, P>>,
+    cache: RefCell<LruCache<u32, P>>,
     dirty: RefCell<HashSet<u32>>,
 
     /// Min-heap of available page identifiers (this helps avoid "gaps": empty pages inside file).
@@ -76,7 +76,7 @@ impl<P: Page> File<P> {
         Ok(Self {
             file: RefCell::new(file),
             head,
-            cache: RefCell::new(LRU::new(64)),
+            cache: RefCell::new(LruCache::new(64)),
             dirty: RefCell::new(HashSet::with_capacity(32)),
             empty: RefCell::new(BinaryHeap::with_capacity(32)),
         })
@@ -132,7 +132,7 @@ impl<P: Page> File<P> {
         let this = Self {
             file: RefCell::new(file),
             head,
-            cache: RefCell::new(LRU::new(64)),
+            cache: RefCell::new(LruCache::new(64)),
             dirty: RefCell::new(HashSet::with_capacity(32)),
             empty: RefCell::new(BinaryHeap::with_capacity(16)),
         };
@@ -163,12 +163,12 @@ impl<P: Page> File<P> {
             .borrow_mut()
             .seek(SeekFrom::Start(offset as u64))?;
         self.file.borrow_mut().read_exact(page.as_mut())?;
-        info!("Loading page {}", page.id());
+        debug!("Loading page {}", page.id());
         Ok(page)
     }
 
     fn save(&self, page: &P) -> io::Result<()> {
-        info!("Saving page {}", page.id());
+        debug!("Saving page {}", page.id());
         let offset = self.offset(page.id()) as u64;
         self.file.borrow_mut().seek(SeekFrom::Start(offset))?;
         self.file.borrow_mut().write_all(page.as_ref())
@@ -181,7 +181,7 @@ impl<P: Page> File<P> {
 
 impl<P: Page> Tree<P> for File<P> {
     fn lookup(&self, key: &[u8]) -> Result<Option<Ref<[u8]>>> {
-        info!("lookup: {}", hex(key));
+        debug!("lookup: {}", hex(key));
         let mut seen = HashSet::with_capacity(8);
         let mut page = self.root();
         loop {
@@ -222,7 +222,7 @@ impl<P: Page> Tree<P> for File<P> {
     }
 
     fn insert(&mut self, key: &[u8], val: &[u8]) -> Result<()> {
-        info!("insert: {} -> {}", hex(key), hex(val));
+        debug!("insert: {} -> {}", hex(key), hex(val));
         let mut page = self.root_mut();
         let mut seen = HashSet::with_capacity(8);
         let mut path = Vec::with_capacity(8);
@@ -311,7 +311,7 @@ impl<P: Page> Tree<P> for File<P> {
     }
 
     fn remove(&mut self, key: &[u8]) -> Result<()> {
-        info!("remove: {}", hex(key));
+        debug!("remove: {}", hex(key));
         let mut page = self.root_mut();
         let mut seen = HashSet::with_capacity(8);
         let mut path = Vec::with_capacity(8);
@@ -492,7 +492,7 @@ impl<P: Page> Tree<P> for File<P> {
     }
 
     fn above(&self, key: &[u8]) -> Result<Option<Ref<[u8]>>> {
-        info!("above: {}", hex(key));
+        debug!("above: {}", hex(key));
 
         let mut path = Vec::with_capacity(8);
         let mut page = self.root();
@@ -544,7 +544,7 @@ impl<P: Page> Tree<P> for File<P> {
     }
 
     fn below(&self, key: &[u8]) -> Result<Option<Ref<[u8]>>> {
-        info!("below: {}", hex(key));
+        debug!("below: {}", hex(key));
 
         let mut path = Vec::with_capacity(8);
         let mut page = self.root();
