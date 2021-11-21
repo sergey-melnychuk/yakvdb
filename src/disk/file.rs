@@ -3,15 +3,16 @@ use crate::api::page::Page;
 use crate::api::tree::Tree;
 use crate::util::hex::hex;
 use bytes::{Buf, BufMut, BytesMut};
-use log::{debug, error, trace};
+use log::{debug, error, info, trace};
 use std::cell::{Ref, RefCell, RefMut};
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::ops::Deref;
 use std::path::Path;
+use crate::util::cache::{Cache, LRU};
 
 pub(crate) struct File<P: Page> {
     /// Underlying file reference where all data is physically stored.
@@ -19,7 +20,7 @@ pub(crate) struct File<P: Page> {
     head: Head,
 
     /// In-memory page cache. All page access happens only through cached page representation.
-    cache: RefCell<HashMap<u32, P>>, // TODO limit memory usage (LRU-cache?)
+    cache: RefCell<LRU<u32, P>>,
     dirty: RefCell<HashSet<u32>>,
 
     /// Min-heap of available page identifiers (this helps avoid "gaps": empty pages inside file).
@@ -75,7 +76,7 @@ impl<P: Page> File<P> {
         Ok(Self {
             file: RefCell::new(file),
             head,
-            cache: RefCell::new(HashMap::with_capacity(32)),
+            cache: RefCell::new(LRU::new(64)),
             dirty: RefCell::new(HashSet::with_capacity(32)),
             empty: RefCell::new(BinaryHeap::with_capacity(32)),
         })
@@ -131,12 +132,12 @@ impl<P: Page> File<P> {
         let this = Self {
             file: RefCell::new(file),
             head,
-            cache: RefCell::new(HashMap::with_capacity(32)),
+            cache: RefCell::new(LRU::new(64)),
             dirty: RefCell::new(HashSet::with_capacity(32)),
             empty: RefCell::new(BinaryHeap::with_capacity(16)),
         };
 
-        this.cache.borrow_mut().insert(ROOT, root);
+        this.cache.borrow_mut().put(ROOT, root);
 
         let total_pages = (len - HEAD) as u32 / this.head.page_bytes;
         debug!("Processing pages for compaction: {}", total_pages);
@@ -162,10 +163,12 @@ impl<P: Page> File<P> {
             .borrow_mut()
             .seek(SeekFrom::Start(offset as u64))?;
         self.file.borrow_mut().read_exact(page.as_mut())?;
+        info!("Loading page {}", page.id());
         Ok(page)
     }
 
     fn save(&self, page: &P) -> io::Result<()> {
+        info!("Saving page {}", page.id());
         let offset = self.offset(page.id()) as u64;
         self.file.borrow_mut().seek(SeekFrom::Start(offset))?;
         self.file.borrow_mut().write_all(page.as_ref())
@@ -178,6 +181,7 @@ impl<P: Page> File<P> {
 
 impl<P: Page> Tree<P> for File<P> {
     fn lookup(&self, key: &[u8]) -> Result<Option<Ref<[u8]>>> {
+        info!("lookup: {}", hex(key));
         let mut seen = HashSet::with_capacity(8);
         let mut page = self.root();
         loop {
@@ -218,6 +222,7 @@ impl<P: Page> Tree<P> for File<P> {
     }
 
     fn insert(&mut self, key: &[u8], val: &[u8]) -> Result<()> {
+        info!("insert: {} -> {}", hex(key), hex(val));
         let mut page = self.root_mut();
         let mut seen = HashSet::with_capacity(8);
         let mut path = Vec::with_capacity(8);
@@ -306,6 +311,7 @@ impl<P: Page> Tree<P> for File<P> {
     }
 
     fn remove(&mut self, key: &[u8]) -> Result<()> {
+        info!("remove: {}", hex(key));
         let mut page = self.root_mut();
         let mut seen = HashSet::with_capacity(8);
         let mut path = Vec::with_capacity(8);
@@ -453,6 +459,7 @@ impl<P: Page> Tree<P> for File<P> {
                 return Ok(Some(Ref::map(page, |p| p.min())));
             } else {
                 let id = slot.page;
+                drop(page);
                 if let Some(next) = self.page(id) {
                     page = next;
                 } else {
@@ -474,6 +481,7 @@ impl<P: Page> Tree<P> for File<P> {
                 return Ok(Some(Ref::map(page, |p| p.max())));
             } else {
                 let id = slot.page;
+                drop(page);
                 if let Some(next) = self.page(id) {
                     page = next;
                 } else {
@@ -484,6 +492,8 @@ impl<P: Page> Tree<P> for File<P> {
     }
 
     fn above(&self, key: &[u8]) -> Result<Option<Ref<[u8]>>> {
+        info!("above: {}", hex(key));
+
         let mut path = Vec::with_capacity(8);
         let mut page = self.root();
         if page.len() == 0 {
@@ -503,12 +513,14 @@ impl<P: Page> Tree<P> for File<P> {
                         page = self.page(parent_id).unwrap();
                         if parent_idx < page.len() - 1 {
                             let id = page.slot(parent_idx + 1).unwrap().page;
+                            drop(page);
                             page = self.page(id).unwrap();
                             loop {
                                 let slot = page.slot(0).unwrap();
                                 if slot.page == 0 {
                                     return Ok(Some(Ref::map(page, |p| p.min())));
                                 } else {
+                                    drop(page);
                                     page = self.page(slot.page).unwrap();
                                 }
                             }
@@ -521,6 +533,7 @@ impl<P: Page> Tree<P> for File<P> {
             } else {
                 path.push((page.id(), idx));
                 let id = slot.page;
+                drop(page);
                 if let Some(next) = self.page(id) {
                     page = next;
                 } else {
@@ -531,6 +544,8 @@ impl<P: Page> Tree<P> for File<P> {
     }
 
     fn below(&self, key: &[u8]) -> Result<Option<Ref<[u8]>>> {
+        info!("below: {}", hex(key));
+
         let mut path = Vec::with_capacity(8);
         let mut page = self.root();
         if page.len() == 0 {
@@ -545,10 +560,12 @@ impl<P: Page> Tree<P> for File<P> {
                 } else {
                     // ceil == key, need to take max value from parent's previous adjacent page
                     for (parent_id, parent_idx) in path.iter().rev().cloned() {
+                        drop(page);
                         page = self.page(parent_id).unwrap();
                         if parent_idx > 0 {
                             let idx = parent_idx - 1;
                             let id = page.slot(idx).unwrap().page;
+                            drop(page);
                             page = self.page(id).unwrap();
                             return Ok(Some(Ref::map(page, |p| p.max())));
                         }
@@ -560,6 +577,7 @@ impl<P: Page> Tree<P> for File<P> {
             } else {
                 path.push((page.id(), idx));
                 let id = slot.page;
+                drop(page);
                 if let Some(next) = self.page(id) {
                     page = next;
                 } else {
@@ -574,9 +592,9 @@ impl<P: Page> Tree<P> for File<P> {
     }
 
     fn page(&self, id: u32) -> Option<Ref<P>> {
-        if !self.cache.borrow().contains_key(&id) {
+        if !self.cache.borrow().has(&id) {
             let page = self.load(self.offset(id), self.head.page_bytes).ok()?;
-            self.cache.borrow_mut().insert(id, page);
+            self.cache.borrow_mut().put(id, page);
         }
         let page = Ref::map(self.cache.borrow(), |cache| cache.get(&id).unwrap());
         Some(page)
@@ -588,10 +606,11 @@ impl<P: Page> Tree<P> for File<P> {
     }
 
     fn page_mut(&self, id: u32) -> Option<RefMut<P>> {
-        if !self.cache.borrow().contains_key(&id) {
+        if !self.cache.borrow().has(&id) {
             let page = self.load(self.offset(id), self.head.page_bytes).ok()?;
-            self.cache.borrow_mut().insert(id, page);
+            self.cache.borrow_mut().put(id, page);
         }
+        self.cache.borrow().lock(&id);
         let page = RefMut::map(self.cache.borrow_mut(), |cache| cache.get_mut(&id).unwrap());
         self.mark(id);
         Some(page)
@@ -609,6 +628,7 @@ impl<P: Page> Tree<P> for File<P> {
         for id in pages {
             if let Some(page) = self.page(id) {
                 self.save(page.deref())?;
+                self.cache.borrow().free(&page.id());
                 debug!("flush: page={}", id);
             } else {
                 failed.push(id);
