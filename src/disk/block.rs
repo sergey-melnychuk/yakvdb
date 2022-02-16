@@ -603,4 +603,12 @@ mod tests {
         assert_eq!(page.find(&data[1].0), Some(0));
         assert_eq!(page.find(&data[2].0), Some(1));
     }
+
+    #[test]
+    fn test_large_key() {
+        let mut page = Block::create(1, 64);
+        let buf = vec![42u8; 256];
+        let opt = page.put_entry(&buf, &buf, 0);
+        assert!(opt.is_none());
+    }
 }
