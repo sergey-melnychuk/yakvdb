@@ -90,7 +90,9 @@ impl<K: Clone + Hash + Eq + Display, V> Cache<K, V> for LruCache<K, V> {
     }
 
     fn put(&mut self, key: K, value: V) {
-        self.evict();
+        if !self.map.contains_key(&key) {
+            self.evict();
+        }
         let op = self.op();
         self.lru.borrow_mut().insert(key.clone(), op);
         self.map.insert(key, value);
