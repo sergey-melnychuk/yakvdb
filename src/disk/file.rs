@@ -33,7 +33,7 @@ const HEAD: usize = MAGIC.len() + size_of::<Head>();
 const ROOT: u32 = 1;
 
 const SPLIT_THRESHOLD: u8 = 80;
-const MERGE_THRESHOLD: u8 = 30;
+const MERGE_THRESHOLD: u8 = 20;
 
 #[derive(Debug)]
 #[repr(C)]
@@ -76,7 +76,7 @@ impl<P: Page> File<P> {
         Ok(Self {
             file: RefCell::new(file),
             head,
-            cache: RefCell::new(LruCache::new(64)),
+            cache: RefCell::new(LruCache::new(8)),
             dirty: RefCell::new(HashSet::with_capacity(32)),
             empty: RefCell::new(BinaryHeap::with_capacity(32)),
         })
@@ -132,7 +132,7 @@ impl<P: Page> File<P> {
         let this = Self {
             file: RefCell::new(file),
             head,
-            cache: RefCell::new(LruCache::new(64)),
+            cache: RefCell::new(LruCache::new(8)),
             dirty: RefCell::new(HashSet::with_capacity(32)),
             empty: RefCell::new(BinaryHeap::with_capacity(16)),
         };
@@ -230,7 +230,18 @@ impl<P: Page> Tree<P> for File<P> {
             let id = page.id();
             let parent_id = path.last().cloned().map(|(id, _)| id).unwrap_or_default();
 
-            if page.len() == 0 {
+            if page.len() == 0 { // TODO handle keys/values larger than (half-) page size
+                let len = (key.len() + val.len()) as u32;
+                if !page.fits(len) {
+                    return Err(Error::Tree(
+                        page.id(),
+                        format!(
+                            "Entry does not fit into the page: size={} free={}",
+                            len,
+                            page.free()
+                        ),
+                    ));
+                }
                 page.put_val(key, val);
                 drop(page);
                 return Ok(());
@@ -258,7 +269,7 @@ impl<P: Page> Tree<P> for File<P> {
 
             if slot.page == 0 {
                 let len = (key.len() + val.len()) as u32;
-                if !page.fits(len) {
+                if !page.fits(len) { // TODO handle keys/values larger than (half-) page size
                     return Err(Error::Tree(
                         page.id(),
                         format!(
@@ -294,7 +305,7 @@ impl<P: Page> Tree<P> for File<P> {
                 path.push((id, idx));
                 seen.insert(id);
                 if seen.contains(&slot.page) {
-                    return Err(Error::Tree(id, "Cyclic reference detected".to_string()));
+                    return Err(Error::Tree(id, format!("Cyclic reference detected: {:?}", path)));
                 }
 
                 drop(page);
@@ -1284,5 +1295,20 @@ mod tests {
         let copy = file.root().copy();
         debug!("{}", file.dump());
         assert!(copy.is_empty());
+    }
+
+    #[test]
+    fn test_large() {
+        let path = Path::new("target/test_large.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+
+        let page_bytes: u32 = 256;
+        let mut file: File<Block> = File::make(path, page_bytes).unwrap();
+
+        let big = vec![42u8; 1024];
+        let res = file.insert(&big, &big);
+        assert!(res.is_err());
     }
 }

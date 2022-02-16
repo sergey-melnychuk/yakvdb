@@ -34,7 +34,7 @@ fn main() {
     setup_logger().expect("logger");
 
     let path = Path::new("target/main_1M.tmp");
-    let size: u32 = 4096; // TODO handle keys/values larger than (half-) page size
+    let size: u32 = 4096;
 
     let mut file: File<Block> = if path.exists() {
         File::open(path).unwrap()
