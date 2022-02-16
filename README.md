@@ -39,13 +39,33 @@ The typical result looks like one below.
 ```shell
 $ cargo run --release
 [snip]
+
+# 1M
 [...] file="target/main_1M.tmp" count=1000000 page=4096
-[...] insert: 28899 ms (rate=34603 op/s)
-[...] lookup: 7096 ms (rate=140924 op/s)
+[...] insert: 28742 ms (rate=34792 op/s)
+[...] lookup: 5316 ms (rate=188111 op/s)
 [...] iter: min=000003cf1bb4e04d max=ffffe6e240320123
-[...] iter:  asc 589 ms (rate=1697792 op/s) n=1000000
-[...] iter: desc 570 ms (rate=1754385 op/s) n=1000000
-[...] remove: 30850 ms (rate=32414 op/s)```
+[...] iter:  asc 553 ms (rate=1808318 op/s) n=1000000
+[...] iter: desc 538 ms (rate=1858736 op/s) n=1000000
+[...] remove: 27101 ms (rate=36899 op/s)
+
+# 10M
+[...] file="target/10M.db" count=10000000 page=4096
+[...] insert: 371971 ms (rate=26883 op/s)
+[...] lookup: 95038 ms (rate=105221 op/s)
+[...] iter: min=00000244ad95c9eb max=ffffffbd837a505b
+[...] iter:  asc 6793 ms (rate=1472103 op/s) n=10000000
+[...] iter: desc 7008 ms (rate=1426940 op/s) n=10000000
+[...] remove: 368056 ms (rate=27169 op/s)
+
+# 100M
+[...] file="target/100M.db" count=100000000 page=4096
+[...] insert: 4387618 ms (rate=22791 op/s)
+[...] lookup: 1003484 ms (rate=99652 op/s)
+[...] iter: min=000000542c79d673 max=ffffffbd837a505b
+[...] iter:  asc 74953 ms (rate=1334169 op/s) n=100000000
+[...] iter: desc 73857 ms (rate=1353967 op/s) n=100000000
+[...] remove: 4145790 ms (rate=24120 op/s)
 ```
 
 ### Code
