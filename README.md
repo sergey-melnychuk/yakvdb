@@ -37,7 +37,7 @@ Just `cargo run --release` to run example from [main.rs](src/main.rs):
 The typical result looks like one below.
 
 ```shell
-$ cargo run --release
+$ RUST_LOG=info cargo run --release
 [snip]
 
 # 1M
@@ -88,4 +88,6 @@ let _: Result<()> = db.remove(&b"key");
 // To iterate: db.min(), db.max(), db.above(&[u8]), db.below(&[u8])
 ```
 
-[bitcask]: https://riak.com/assets/bitcask-intro.pdf
+### Other
+
+- [Bitcask](https://riak.com/assets/bitcask-intro.pdf)
