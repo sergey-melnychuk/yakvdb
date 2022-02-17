@@ -76,7 +76,7 @@ impl<P: Page> File<P> {
         Ok(Self {
             file: RefCell::new(file),
             head,
-            cache: RefCell::new(LruCache::new(8)),
+            cache: RefCell::new(LruCache::new(32)),
             dirty: RefCell::new(HashSet::with_capacity(32)),
             empty: RefCell::new(BinaryHeap::with_capacity(32)),
         })
@@ -132,7 +132,7 @@ impl<P: Page> File<P> {
         let this = Self {
             file: RefCell::new(file),
             head,
-            cache: RefCell::new(LruCache::new(8)),
+            cache: RefCell::new(LruCache::new(32)),
             dirty: RefCell::new(HashSet::with_capacity(32)),
             empty: RefCell::new(BinaryHeap::with_capacity(16)),
         };
@@ -603,10 +603,7 @@ impl<P: Page> Tree<P> for File<P> {
     }
 
     fn page(&self, id: u32) -> Option<Ref<P>> {
-        if !self.cache.borrow().has(&id) {
-            let page = self.load(self.offset(id), self.head.page_bytes).ok()?;
-            self.cache.borrow_mut().put(id, page);
-        }
+        self.cache(id).ok()?;
         let page = Ref::map(self.cache.borrow(), |cache| cache.get(&id).unwrap());
         Some(page)
     }
@@ -617,14 +614,18 @@ impl<P: Page> Tree<P> for File<P> {
     }
 
     fn page_mut(&self, id: u32) -> Option<RefMut<P>> {
-        if !self.cache.borrow().has(&id) {
-            let page = self.load(self.offset(id), self.head.page_bytes).ok()?;
-            self.cache.borrow_mut().put(id, page);
-        }
-        self.cache.borrow().lock(&id);
+        self.cache(id).ok()?;
         let page = RefMut::map(self.cache.borrow_mut(), |cache| cache.get_mut(&id).unwrap());
         self.mark(id);
         Some(page)
+    }
+
+    fn cache(&self, id: u32) -> io::Result<()> {
+        if !self.cache.borrow().has(&id) {
+            let page = self.load(self.offset(id), self.head.page_bytes)?;
+            self.cache.borrow_mut().put(id, page);
+        }
+        Ok(())
     }
 
     fn mark(&self, id: u32) {
@@ -639,7 +640,6 @@ impl<P: Page> Tree<P> for File<P> {
         for id in pages {
             if let Some(page) = self.page(id) {
                 self.save(page.deref())?;
-                self.cache.borrow().free(&page.id());
                 debug!("flush: page={}", id);
             } else {
                 failed.push(id);
@@ -894,6 +894,7 @@ mod tests {
     use rand::{thread_rng, RngCore, SeedableRng};
     use std::borrow::Borrow;
     use std::ops::Deref;
+    use crate::util;
 
     fn get<P: Page>(page: &P, key: &[u8]) -> Option<(Vec<u8>, u32)> {
         page.find(key)
@@ -1194,15 +1195,7 @@ mod tests {
         let mut file: File<Block> = File::make(path, size).unwrap();
 
         let count = 1000;
-        let data = (0..count)
-            .into_iter()
-            .map(|_| {
-                (
-                    rng.next_u64().to_be_bytes().to_vec(),
-                    rng.next_u64().to_be_bytes().to_vec(),
-                )
-            })
-            .collect::<Vec<_>>();
+        let data = util::data(count, 42);
 
         for (i, (k, v)) in data.iter().enumerate() {
             debug!("({:05}) insert: key={} val={}", i, hex(k), hex(v));

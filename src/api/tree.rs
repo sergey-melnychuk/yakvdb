@@ -33,6 +33,9 @@ pub(crate) trait Tree<P: Page> {
     /// Get a mutable reference to a page having given id, if such page exists.
     fn page_mut(&self, id: u32) -> Option<RefMut<P>>;
 
+    /// Check that the page of given id is cached (if not then load it from disk)
+    fn cache(&self, id: u32) -> std::io::Result<()>;
+
     /// Mark page with given id as dirty and thus eligible for flushing to the disk.
     fn mark(&self, id: u32);
 

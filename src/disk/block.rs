@@ -327,6 +327,7 @@ mod tests {
     use super::*;
     use rand::prelude::*;
     use std::collections::HashSet;
+    use crate::util;
 
     #[test]
     fn test_sizes() {
@@ -442,15 +443,7 @@ mod tests {
         let mut rng = thread_rng();
         let count = 32;
 
-        let pairs = (0..count)
-            .into_iter()
-            .map(|_| {
-                (
-                    rng.next_u64().to_be_bytes().to_vec(),
-                    rng.next_u64().to_be_bytes().to_vec(),
-                )
-            })
-            .collect::<Vec<_>>();
+        let pairs = util::data(count, 42);
 
         let len =
             pairs.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>() + HEAD + pairs.len() * SLOT;

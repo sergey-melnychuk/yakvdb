@@ -3,8 +3,6 @@ use crate::disk::block::Block;
 use crate::disk::file::File;
 use crate::util::hex::hex;
 use log::{debug, error, info};
-use rand::prelude::StdRng;
-use rand::{RngCore, SeedableRng};
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -12,27 +10,7 @@ pub(crate) mod api;
 pub(crate) mod disk;
 pub(crate) mod util;
 
-fn setup_logger() -> Result<(), fern::InitError> {
-    fern::Dispatch::new()
-        .format(|out, message, record| {
-            out.finish(format_args!(
-                "{}[{}][{}] {}",
-                chrono::Local::now().format("[%Y-%m-%d][%H:%M:%S]"),
-                record.target(),
-                record.level(),
-                message
-            ))
-        })
-        .level(log::LevelFilter::Info)
-        .chain(std::io::stdout())
-        .chain(fern::DateBased::new("target/yakvdb", "-%Y-%m-%d:%H00.log"))
-        .apply()?;
-    Ok(())
-}
-
 fn main() {
-    setup_logger().expect("logger");
-
     let path = Path::new("target/main_1M.tmp");
     let size: u32 = 4096;
 
@@ -42,17 +20,8 @@ fn main() {
         File::make(path, size).unwrap()
     };
 
-    let mut rng = StdRng::seed_from_u64(42);
     let count = 1000 * 1000;
-    let data = (0..count)
-        .into_iter()
-        .map(|_| {
-            (
-                rng.next_u64().to_be_bytes().to_vec(),
-                rng.next_u64().to_be_bytes().to_vec(),
-            )
-        })
-        .collect::<Vec<_>>();
+    let data = util::data(count, 42);
     info!("file={:?} count={} page={}", path, count, size);
 
     let mut now = SystemTime::now();
