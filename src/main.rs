@@ -11,6 +11,8 @@ pub(crate) mod disk;
 pub(crate) mod util;
 
 fn main() {
+    env_logger::init();
+
     let path = Path::new("target/main_1M.tmp");
     let size: u32 = 4096;
 
