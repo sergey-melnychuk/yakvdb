@@ -32,7 +32,8 @@ impl<K: Clone + Eq + Hash + Display, V> LruCache<K, V> {
         let existing = if !self.map.contains_key(key) {
             None
         } else {
-            self.lru.borrow()
+            self.lru
+                .borrow()
                 .iter()
                 .enumerate()
                 .find(|(_, x)| x == &key)

@@ -230,7 +230,8 @@ impl<P: Page> Tree<P> for File<P> {
             let id = page.id();
             let parent_id = path.last().cloned().map(|(id, _)| id).unwrap_or_default();
 
-            if page.len() == 0 { // TODO handle keys/values larger than (half-) page size
+            if page.len() == 0 {
+                // TODO handle keys/values larger than (half-) page size
                 let len = (key.len() + val.len()) as u32;
                 if !page.fits(len) {
                     return Err(Error::Tree(
@@ -269,7 +270,8 @@ impl<P: Page> Tree<P> for File<P> {
 
             if slot.page == 0 {
                 let len = (key.len() + val.len()) as u32;
-                if !page.fits(len) { // TODO handle keys/values larger than (half-) page size
+                if !page.fits(len) {
+                    // TODO handle keys/values larger than (half-) page size
                     return Err(Error::Tree(
                         page.id(),
                         format!(
@@ -305,7 +307,10 @@ impl<P: Page> Tree<P> for File<P> {
                 path.push((id, idx));
                 seen.insert(id);
                 if seen.contains(&slot.page) {
-                    return Err(Error::Tree(id, format!("Cyclic reference detected: {:?}", path)));
+                    return Err(Error::Tree(
+                        id,
+                        format!("Cyclic reference detected: {:?}", path),
+                    ));
                 }
 
                 drop(page);
@@ -888,13 +893,13 @@ impl<P: Page> Tree<P> for File<P> {
 mod tests {
     use super::*;
     use crate::disk::block::Block;
+    use crate::util;
     use crate::util::hex::hex;
     use rand::prelude::StdRng;
     use rand::seq::SliceRandom;
-    use rand::{thread_rng, RngCore, SeedableRng};
+    use rand::SeedableRng;
     use std::borrow::Borrow;
     use std::ops::Deref;
-    use crate::util;
 
     fn get<P: Page>(page: &P, key: &[u8]) -> Option<(Vec<u8>, u32)> {
         page.find(key)
@@ -1184,8 +1189,6 @@ mod tests {
 
     #[test]
     fn test_1k() {
-        let mut rng = thread_rng();
-
         let path = Path::new("target/test_1k.tmp");
         if path.exists() {
             fs::remove_file(path).unwrap();

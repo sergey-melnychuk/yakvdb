@@ -325,9 +325,9 @@ fn put_slot(buf: &mut BytesMut, idx: u32, slot: &Slot) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util;
     use rand::prelude::*;
     use std::collections::HashSet;
-    use crate::util;
 
     #[test]
     fn test_sizes() {
@@ -440,9 +440,7 @@ mod tests {
 
     #[test]
     fn test_size() {
-        let mut rng = thread_rng();
         let count = 32;
-
         let pairs = util::data(count, 42);
 
         let len =
