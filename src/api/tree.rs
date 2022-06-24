@@ -2,7 +2,7 @@ use crate::api::error::Result;
 use crate::api::page::Page;
 use std::cell::{Ref, RefMut};
 
-pub(crate) trait Tree<P: Page> {
+pub trait Tree<P: Page> {
     fn lookup(&self, key: &[u8]) -> Result<Option<Ref<[u8]>>>;
     fn insert(&mut self, key: &[u8], val: &[u8]) -> Result<()>;
     fn remove(&mut self, key: &[u8]) -> Result<()>;

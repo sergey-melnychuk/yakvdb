@@ -1,3 +1,3 @@
-pub(crate) mod error;
-pub(crate) mod page;
-pub(crate) mod tree;
+pub mod error;
+pub mod page;
+pub mod tree;

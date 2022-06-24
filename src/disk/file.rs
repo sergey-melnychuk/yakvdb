@@ -14,7 +14,7 @@ use std::mem::size_of;
 use std::ops::Deref;
 use std::path::Path;
 
-pub(crate) struct File<P: Page> {
+pub struct File<P: Page> {
     /// Underlying file reference where all data is physically stored.
     file: RefCell<fs::File>,
     head: Head,
@@ -43,7 +43,7 @@ struct Head {
 }
 
 impl<P: Page> File<P> {
-    pub(crate) fn make(path: &Path, page_bytes: u32) -> io::Result<Self> {
+    pub fn make(path: &Path, page_bytes: u32) -> io::Result<Self> {
         if path.exists() {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
@@ -82,7 +82,7 @@ impl<P: Page> File<P> {
         })
     }
 
-    pub(crate) fn open(path: &Path) -> io::Result<Self> {
+    pub fn open(path: &Path) -> io::Result<Self> {
         let mut file = OpenOptions::new()
             .create(true)
             .read(true)

@@ -1,5 +1,5 @@
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub(crate) struct Slot {
+pub struct Slot {
     pub(crate) offset: u32,
     pub(crate) klen: u32,
     pub(crate) vlen: u32, // if >0 value is stored in the same page as a key (leaf page)
@@ -21,7 +21,7 @@ impl Slot {
     }
 }
 
-pub(crate) trait Page: AsRef<[u8]> + AsMut<[u8]> {
+pub trait Page: AsRef<[u8]> + AsMut<[u8]> {
     fn reserve(capacity: u32) -> Self;
     fn create(id: u32, cap: u32) -> Self;
 
@@ -32,6 +32,7 @@ pub(crate) trait Page: AsRef<[u8]> + AsMut<[u8]> {
 
     /// Number of slots stored in the page.
     fn len(&self) -> u32;
+    fn is_empty(&self) -> bool;
 
     fn slot(&self, idx: u32) -> Option<Slot>;
 

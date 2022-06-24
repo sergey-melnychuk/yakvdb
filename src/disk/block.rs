@@ -3,7 +3,7 @@ use crate::util::bsearch::bsearch;
 use bytes::{BufMut, BytesMut};
 use std::mem::size_of;
 
-pub(crate) struct Block {
+pub struct Block {
     buf: BytesMut,
 }
 
@@ -278,6 +278,10 @@ impl Page for Block {
         self.buf[..HEAD].copy_from_slice(tmp.as_ref());
         let blank = vec![0xFFu8; len - HEAD];
         self.buf[HEAD..].copy_from_slice(&blank);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 

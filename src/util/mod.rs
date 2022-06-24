@@ -1,10 +1,10 @@
-use rand::prelude::StdRng;
 use rand::prelude::SliceRandom;
+use rand::prelude::StdRng;
 use rand::{RngCore, SeedableRng};
 
-pub(crate) mod bsearch;
-pub(crate) mod cache;
-pub(crate) mod hex;
+pub mod bsearch;
+pub mod cache;
+pub mod hex;
 
 pub fn data(count: usize, seed: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut rng = StdRng::seed_from_u64(seed);
@@ -24,4 +24,3 @@ pub fn shuffle<T>(mut data: Vec<T>, seed: u64) -> Vec<T> {
     data.shuffle(&mut rng);
     data
 }
-

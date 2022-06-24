@@ -1,2 +1,2 @@
-pub(crate) mod block;
-pub(crate) mod file;
+pub mod block;
+pub mod file;
