@@ -140,7 +140,7 @@ fn main() {
     );
 
     now = SystemTime::now();
-    for (key, _) in data.iter() {
+    for (key, _) in util::shuffle(data, 42).iter() {
         file.remove(key).unwrap();
         let opt = file.lookup(key).unwrap();
         if let Some(r) = opt {
