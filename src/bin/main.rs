@@ -1,6 +1,6 @@
 use log::{debug, error, info};
+use rusqlite::Connection;
 use sled::Db;
-use sqlite::Connection;
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -23,20 +23,23 @@ struct LiteStorage(Connection);
 
 impl Storage for LiteStorage {
     fn insert(&mut self, key: &[u8], val: &[u8]) {
-        let mut stmt = self.0.prepare("INSERT INTO db (key, val) VALUES (:key, :val);").unwrap();
-        stmt.bind(&[(":key", key), (":val", val)][..]).unwrap();
+        self.0
+            .execute("INSERT INTO db (key, val) VALUES (?1, ?2)", [key, val])
+            .unwrap();
     }
 
     fn remove(&mut self, key: &[u8]) {
-        let mut stmt = self.0.prepare("DELETE FROM db WHERE key = :key;").unwrap();
-        stmt.bind(&[(":key", key)][..]).unwrap();
+        self.0
+            .execute("DELETE FROM db WHERE key = ?1", [key])
+            .unwrap();
     }
 
     fn lookup(&self, key: &[u8]) -> Option<Vec<u8>> {
-        let mut stmt = self.0.prepare("SELECT val FROM db WHERE key = :key;").unwrap();
-        stmt.bind(&[(":key", key)][..]).unwrap();
-        stmt.next().unwrap();
-        stmt.read("val").unwrap()
+        let mut stmt = self.0.prepare("SELECT val FROM db WHERE key = ?1").unwrap();
+        let mut rows = stmt.query([key]).unwrap();
+        rows.next()
+            .unwrap()
+            .map(|row| row.get_ref_unwrap(0).as_blob().unwrap().to_vec())
     }
 }
 
@@ -45,12 +48,12 @@ struct SledStorage(sled::Db);
 impl Storage for SledStorage {
     fn insert(&mut self, key: &[u8], val: &[u8]) {
         self.0.insert(key, val).unwrap();
-        self.0.flush().unwrap();
+        //self.0.flush().unwrap();
     }
 
     fn remove(&mut self, key: &[u8]) {
         self.0.remove(key).unwrap();
-        self.0.flush().unwrap();
+        //self.0.flush().unwrap();
     }
 
     fn lookup(&self, key: &[u8]) -> Option<Vec<u8>> {
@@ -86,7 +89,7 @@ fn benchmark<S: Storage>(mut storage: S, count: usize) {
     info!(
         "insert: {} ms (rate={} op/s)",
         millis,
-        count as u128 * 1000 / millis
+        count as u128 * 1000 / millis.max(1)
     );
 
     now = SystemTime::now();
@@ -103,7 +106,7 @@ fn benchmark<S: Storage>(mut storage: S, count: usize) {
     info!(
         "lookup: {} ms (rate={} op/s)",
         millis,
-        count as u128 * 1000 / millis
+        count as u128 * 1000 / millis.max(1)
     );
 
     for ((k, v), r) in data.iter().zip(found.iter()) {
@@ -205,20 +208,22 @@ fn benchmark<S: Storage>(mut storage: S, count: usize) {
     info!(
         "remove: {} ms (rate={} op/s)",
         millis,
-        count as u128 * 1000 / millis
+        count as u128 * 1000 / millis.max(1)
     );
 
     // if !storage.len() > 0 {
     //     error!("non-empty file");
     // }
-
 }
 
 fn main() {
     env_logger::init();
-    let target = std::env::args().skip(1).next().unwrap();
-
-    let count = 1000 * 1000;
+    let mut it = std::env::args().skip(1);
+    let target = it.next().unwrap();
+    let count = it
+        .next()
+        .and_then(|x| x.parse::<usize>().ok())
+        .unwrap_or(1000);
 
     if target == "self" {
         let path = Path::new("target/main_1M.tmp");
@@ -228,8 +233,11 @@ fn main() {
         } else {
             File::make(path, size).unwrap()
         };
-        info!("target={} file={:?} count={} page={}", target, path, count, size);
-    
+        info!(
+            "target={} file={:?} count={} page={}",
+            target, path, count, size
+        );
+
         benchmark(SelfStorage(file), count);
     }
 
@@ -238,16 +246,20 @@ fn main() {
         let db: Db = sled::open(path).unwrap();
         info!("target={} file={} count={}", target, path, count);
 
-        benchmark(SledStorage(db), count);    
+        benchmark(SledStorage(db), count);
     }
 
     if target == "lite" {
         let path = "target/lite_1M";
-        let db = sqlite::open(path).unwrap();
-        db.execute("CREATE TABLE db (key BLOB PRIMARY KEY, val BLOB);").unwrap();
+        let db = Connection::open(path).unwrap();
         info!("target={} file={} count={}", target, path, count);
 
+        db.execute("DROP TABLE IF EXISTS db", ()).unwrap();
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS db (key BLOB PRIMARY KEY, val BLOB)",
+            (),
+        )
+        .unwrap();
         benchmark(LiteStorage(db), count);
     }
-
 }
