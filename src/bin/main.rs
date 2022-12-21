@@ -1,5 +1,6 @@
 use log::{debug, error, info};
 use sled::Db;
+use sqlite::Connection;
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -16,6 +17,27 @@ trait Storage {
     // fn min(&self) -> Vec<u8>;
     // fn max(&self) -> Vec<u8>;
     // fn len(&self) -> usize;
+}
+
+struct LiteStorage(Connection);
+
+impl Storage for LiteStorage {
+    fn insert(&mut self, key: &[u8], val: &[u8]) {
+        let mut stmt = self.0.prepare("INSERT INTO db (key, val) VALUES (:key, :val);").unwrap();
+        stmt.bind(&[(":key", key), (":val", val)][..]).unwrap();
+    }
+
+    fn remove(&mut self, key: &[u8]) {
+        let mut stmt = self.0.prepare("DELETE FROM db WHERE key = :key;").unwrap();
+        stmt.bind(&[(":key", key)][..]).unwrap();
+    }
+
+    fn lookup(&self, key: &[u8]) -> Option<Vec<u8>> {
+        let mut stmt = self.0.prepare("SELECT val FROM db WHERE key = :key;").unwrap();
+        stmt.bind(&[(":key", key)][..]).unwrap();
+        stmt.next().unwrap();
+        stmt.read("val").unwrap()
+    }
 }
 
 struct SledStorage(sled::Db);
@@ -218,4 +240,14 @@ fn main() {
 
         benchmark(SledStorage(db), count);    
     }
+
+    if target == "lite" {
+        let path = "target/lite_1M";
+        let db = sqlite::open(path).unwrap();
+        db.execute("CREATE TABLE db (key BLOB PRIMARY KEY, val BLOB);").unwrap();
+        info!("target={} file={} count={}", target, path, count);
+
+        benchmark(LiteStorage(db), count);
+    }
+
 }
