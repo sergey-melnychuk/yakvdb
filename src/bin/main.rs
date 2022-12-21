@@ -1,4 +1,5 @@
 use log::{debug, error, info};
+use sled::Db;
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -7,26 +8,57 @@ use yakvdb::disk::block::Block;
 use yakvdb::disk::file::File;
 use yakvdb::util::{self, hex::hex};
 
-fn main() {
-    env_logger::init();
+trait Storage {
+    fn insert(&mut self, key: &[u8], val: &[u8]);
+    fn remove(&mut self, key: &[u8]);
+    fn lookup(&self, key: &[u8]) -> Option<Vec<u8>>;
+    // fn range(&self, lo: &[u8], hi: &[u8]) -> Vec<Vec<u8>>;
+    // fn min(&self) -> Vec<u8>;
+    // fn max(&self) -> Vec<u8>;
+    // fn len(&self) -> usize;
+}
 
-    let path = Path::new("target/main_1M.tmp");
-    let size: u32 = 4096;
+struct SledStorage(sled::Db);
 
-    let mut file: File<Block> = if path.exists() {
-        File::open(path).unwrap()
-    } else {
-        File::make(path, size).unwrap()
-    };
+impl Storage for SledStorage {
+    fn insert(&mut self, key: &[u8], val: &[u8]) {
+        self.0.insert(key, val).unwrap();
+        self.0.flush().unwrap();
+    }
 
-    let count = 1000 * 1000;
+    fn remove(&mut self, key: &[u8]) {
+        self.0.remove(key).unwrap();
+        self.0.flush().unwrap();
+    }
+
+    fn lookup(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.0.get(key).unwrap().map(|x| x.as_ref().to_vec())
+    }
+}
+
+struct SelfStorage(File<Block>);
+
+impl Storage for SelfStorage {
+    fn insert(&mut self, key: &[u8], val: &[u8]) {
+        self.0.insert(key, val).unwrap();
+    }
+
+    fn remove(&mut self, key: &[u8]) {
+        self.0.remove(key).unwrap();
+    }
+
+    fn lookup(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.0.lookup(key).unwrap().map(|x| x.to_vec())
+    }
+}
+
+fn benchmark<S: Storage>(mut storage: S, count: usize) {
     let data = util::data(count, 42);
-    info!("file={:?} count={} page={}", path, count, size);
 
     let mut now = SystemTime::now();
     for (k, v) in data.iter() {
         debug!("insert: key='{}' val='{}'", hex(k), hex(v));
-        file.insert(k, v).unwrap();
+        storage.insert(k, v);
     }
     let mut millis = now.elapsed().unwrap_or_default().as_millis();
     info!(
@@ -38,7 +70,7 @@ fn main() {
     now = SystemTime::now();
     let mut found = Vec::with_capacity(data.len());
     for (k, _) in data.iter() {
-        if let Some(r) = file.lookup(k).unwrap() {
+        if let Some(r) = storage.lookup(k) {
             let val = r.to_vec();
             found.push(val);
         } else {
@@ -63,9 +95,11 @@ fn main() {
         }
     }
 
+    /*
+    let min = storage.min();
+    let max = storage.max();
+
     now = SystemTime::now();
-    let min = file.min().unwrap().unwrap().to_vec();
-    let max = file.max().unwrap().unwrap().to_vec();
     info!("iter: min={} max={}", hex(&min), hex(&max));
     let mut this = min.clone();
     let mut n = 1usize;
@@ -105,7 +139,7 @@ fn main() {
     let mut this = max.clone();
     let mut n = 1usize;
     loop {
-        if let Ok(Some(r)) = file.below(&this) {
+        if let Ok(Some(r)) = storage.below(&this) {
             n += 1;
             let next = r.to_vec();
             if next >= this {
@@ -135,11 +169,12 @@ fn main() {
         count as u128 * 1000 / millis,
         n
     );
+    */
 
     now = SystemTime::now();
     for (key, _) in util::shuffle(data, 42).iter() {
-        file.remove(key).unwrap();
-        let opt = file.lookup(key).unwrap();
+        storage.remove(key);
+        let opt = storage.lookup(key);
         if let Some(r) = opt {
             error!("key='{}' not removed", hex(r.as_ref()));
         }
@@ -151,7 +186,36 @@ fn main() {
         count as u128 * 1000 / millis
     );
 
-    if !file.is_empty() {
-        error!("non-empty file");
+    // if !storage.len() > 0 {
+    //     error!("non-empty file");
+    // }
+
+}
+
+fn main() {
+    env_logger::init();
+    let target = std::env::args().skip(1).next().unwrap();
+
+    let count = 1000 * 1000;
+
+    if target == "self" {
+        let path = Path::new("target/main_1M.tmp");
+        let size: u32 = 4096;
+        let file: File<Block> = if path.exists() {
+            File::open(path).unwrap()
+        } else {
+            File::make(path, size).unwrap()
+        };
+        info!("target={} file={:?} count={} page={}", target, path, count, size);
+    
+        benchmark(SelfStorage(file), count);
+    }
+
+    if target == "sled" {
+        let path = "target/sled_1M";
+        let db: Db = sled::open(path).unwrap();
+        info!("target={} file={} count={}", target, path, count);
+
+        benchmark(SledStorage(db), count);    
     }
 }

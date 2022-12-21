@@ -1,0 +1,25 @@
+work@[~/Learn/yakvdb :main] $ RUST_LOG=info ./target/release/main sled
+[2022-12-21T16:09:29Z INFO  main] target=sled file=target/sled_1M count=1000000
+[2022-12-21T16:09:36Z INFO  main] insert: 7182 ms (rate=139236 op/s)
+[2022-12-21T16:09:38Z INFO  main] lookup: 2153 ms (rate=464468 op/s)
+[2022-12-21T16:09:48Z INFO  main] remove: 10108 ms (rate=98931 op/s)
+
+work@[~/Learn/yakvdb :main] $ RUST_LOG=info ./target/release/main self
+[2022-12-21T16:09:52Z INFO  main] target=self file="target/main_1M.tmp" count=1000000 page=4096
+[2022-12-21T16:10:22Z INFO  main] insert: 29551 ms (rate=33839 op/s)
+[2022-12-21T16:10:27Z INFO  main] lookup: 5042 ms (rate=198333 op/s)
+[2022-12-21T16:10:56Z INFO  main] remove: 29197 ms (rate=34250 op/s)
+
+# sled: with flush on every insert/remove
+work@[~/Learn/yakvdb :main] $ RUST_LOG=info ./target/release/main sled
+[2022-12-21T16:11:28Z INFO  main] target=sled file=target/sled_1M count=1000000
+[2022-12-21T16:13:28Z INFO  main] insert: 120003 ms (rate=8333 op/s)
+[2022-12-21T16:13:30Z INFO  main] lookup: 2074 ms (rate=482160 op/s)
+[2022-12-21T16:15:36Z INFO  main] remove: 125573 ms (rate=7963 op/s)
+
+work@[~/Learn/yakvdb :main] $ RUST_LOG=info ./target/release/main self
+[2022-12-21T16:24:27Z INFO  main] target=self file="target/main_1M.tmp" count=1000000 page=4096
+[2022-12-21T16:24:57Z INFO  main] insert: 30340 ms (rate=32959 op/s)
+[2022-12-21T16:25:02Z INFO  main] lookup: 4892 ms (rate=204415 op/s)
+[2022-12-21T16:25:30Z INFO  main] remove: 28364 ms (rate=35255 op/s)
+
