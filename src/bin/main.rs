@@ -1,6 +1,9 @@
-use log::{debug, error, info};
+use log::{debug, error, info, trace};
+use pickledb::{PickleDb, PickleDbDumpPolicy, SerializationMethod};
 use rusqlite::Connection;
+use redb::{Database, ReadableTable, TableDefinition};
 use sled::Db;
+use std::convert::TryInto;
 use std::path::Path;
 use std::time::SystemTime;
 
@@ -77,6 +80,65 @@ impl Storage for SelfStorage {
     }
 }
 
+struct PickleStorage(PickleDb);
+
+// TODO FIXME (too slow!) redo with pickle-db best practices in mind
+impl Storage for PickleStorage {
+    fn insert(&mut self, key: &[u8], val: &[u8]) {
+        self.0
+            .set(&String::from_utf8_lossy(key), &val.to_vec())
+            .unwrap();
+    }
+
+    fn remove(&mut self, key: &[u8]) {
+        self.0.rem(&String::from_utf8_lossy(key)).unwrap();
+    }
+
+    fn lookup(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.0.get::<Vec<u8>>(&String::from_utf8_lossy(key))
+    }
+}
+
+struct RedbStorage<'a> {
+    db: Database, 
+    td: TableDefinition<'a, u64, u64>,
+}
+
+// TODO FIXME (too slow!) redo with redb best practices in mind
+impl Storage for RedbStorage<'_> {
+    fn insert(&mut self, key: &[u8], val: &[u8]) {
+        let key = u64::from_le_bytes(key.try_into().unwrap());
+        let val = u64::from_le_bytes(val.try_into().unwrap());
+
+        let txn = self.db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(self.td).unwrap();
+            table.insert(key, val).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    fn remove(&mut self, key: &[u8]) {
+        let key = u64::from_le_bytes(key.try_into().unwrap());
+
+        let txn = self.db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(self.td).unwrap();
+            table.remove(key).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    fn lookup(&self, key: &[u8]) -> Option<Vec<u8>> {
+        let key = u64::from_le_bytes(key.try_into().unwrap());
+
+        let txn = self.db.begin_read().unwrap();
+        let table = txn.open_table(self.td).unwrap();
+        table.get(&key).unwrap()
+            .map(|g| g.value().to_le_bytes().to_vec())
+    }
+}
+
 fn benchmark<S: Storage>(mut storage: S, count: usize) {
     let data = util::data(count, 42);
 
@@ -109,15 +171,20 @@ fn benchmark<S: Storage>(mut storage: S, count: usize) {
         count as u128 * 1000 / millis.max(1)
     );
 
+    let mut errors = 0;
     for ((k, v), r) in data.iter().zip(found.iter()) {
         if v != r {
-            error!(
-                "key='{}': expected '{}' but got '{}'",
+            trace!(
+                "ERROR: key='{}': expected '{}' but got '{}'",
                 hex(k),
                 hex(v),
                 hex(r)
             );
+            errors += 1;
         }
+    }
+    if errors > 0 {
+        error!("lookup errors: {}", errors);
     }
 
     /*
@@ -260,6 +327,26 @@ fn main() {
             (),
         )
         .unwrap();
+
         benchmark(LiteStorage(db), count);
+    }
+
+    if target == "pickle" {
+        // https://github.com/seladb/pickledb-rs
+        let path = "target/pickle_1M.db";
+        let db = PickleDb::new(path, PickleDbDumpPolicy::AutoDump, SerializationMethod::Bin);
+        info!("target={} file={} count={}", target, path, count);
+
+        benchmark(PickleStorage(db), count);
+    }
+
+    if target == "redb" {
+        // https://github.com/cberner/redb
+        let path = "target/redb_1M.db";
+        let db = Database::create("target/redb_1M.bin").unwrap();
+        let td: TableDefinition<u64, u64> = TableDefinition::new("data");
+
+        info!("target={} file={} count={}", target, path, count);
+        benchmark(RedbStorage { db, td }, count);
     }
 }
