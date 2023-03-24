@@ -1,7 +1,7 @@
 use log::{debug, error, info, trace};
 use pickledb::{PickleDb, PickleDbDumpPolicy, SerializationMethod};
-use rusqlite::Connection;
 use redb::{Database, ReadableTable, TableDefinition};
+use rusqlite::Connection;
 use sled::Db;
 use std::convert::TryInto;
 use std::path::Path;
@@ -100,7 +100,7 @@ impl Storage for PickleStorage {
 }
 
 struct RedbStorage<'a> {
-    db: Database, 
+    db: Database,
     td: TableDefinition<'a, u64, u64>,
 }
 
@@ -134,7 +134,9 @@ impl Storage for RedbStorage<'_> {
 
         let txn = self.db.begin_read().unwrap();
         let table = txn.open_table(self.td).unwrap();
-        table.get(&key).unwrap()
+        table
+            .get(&key)
+            .unwrap()
             .map(|g| g.value().to_le_bytes().to_vec())
     }
 }
