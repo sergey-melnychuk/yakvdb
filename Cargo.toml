@@ -21,3 +21,4 @@ sled = "0.34.7"
 rusqlite = "0.28.0"
 pickledb = "0.5.1"
 redb = "0.13.0"
+tokio = { version = "1.26.0", features = ["rt-multi-thread", "sync", "macros"] }

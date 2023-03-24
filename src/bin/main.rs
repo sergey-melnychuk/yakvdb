@@ -142,14 +142,17 @@ impl Storage for RedbStorage<'_> {
 }
 
 fn benchmark<S: Storage>(mut storage: S, count: usize) {
-    let data = util::data(count, 42);
-
     let mut now = SystemTime::now();
+    let data = util::data(count, 42);
+    let mut millis = now.elapsed().unwrap_or_default().as_millis();
+    info!("values: {millis} ms");
+
+    now = SystemTime::now();
     for (k, v) in data.iter() {
         debug!("insert: key='{}' val='{}'", hex(k), hex(v));
         storage.insert(k, v);
     }
-    let mut millis = now.elapsed().unwrap_or_default().as_millis();
+    millis = now.elapsed().unwrap_or_default().as_millis();
     info!(
         "insert: {} ms (rate={} op/s)",
         millis,
@@ -285,6 +288,199 @@ fn benchmark<S: Storage>(mut storage: S, count: usize) {
     // }
 }
 
+mod sharded {
+    use std::{
+        cell::Ref,
+        io,
+        sync::mpsc::{channel, Receiver, Sender},
+        thread::{self, JoinHandle},
+    };
+
+    use yakvdb::api::{error::Error, tree::Tree};
+
+    use super::Block;
+    use super::File;
+
+    #[derive(Debug)]
+    enum Request {
+        Lookup { key: Vec<u8> },
+        Remove { key: Vec<u8> },
+        Insert { key: Vec<u8>, val: Vec<u8> },
+    }
+
+    #[derive(Debug)]
+    enum Response {
+        Empty,
+        Value(Vec<u8>),
+    }
+
+    impl Response {
+        fn value(self) -> Option<Vec<u8>> {
+            match self {
+                Response::Value(value) => Some(value),
+                _ => None,
+            }
+        }
+    }
+
+    struct Shard {
+        file: File<Block>,
+    }
+
+    impl Shard {
+        fn new(path: &str) -> io::Result<Self> {
+            let path = std::path::Path::new(path);
+            let file = if path.exists() {
+                File::open(path)?
+            } else {
+                File::make(path, 4096)?
+            };
+            Ok(Self { file })
+        }
+
+        fn lookup(&self, key: &[u8]) -> Result<Option<Ref<[u8]>>, Error> {
+            self.file.lookup(key)
+        }
+
+        fn insert(&mut self, key: &[u8], val: &[u8]) -> Result<(), Error> {
+            self.file.insert(key, val)
+        }
+
+        fn remove(&mut self, key: &[u8]) -> Result<(), Error> {
+            self.file.remove(key)
+        }
+    }
+
+    pub struct ShardedStore {
+        num_shards: u8,
+        signals: Vec<Sender<u8>>,
+        workers: Vec<Option<JoinHandle<()>>>,
+        txs: Vec<Sender<(Request, Sender<Response>)>>,
+    }
+
+    impl ShardedStore {
+        pub fn new(num_shards: u8, base_path: &str) -> Self {
+            let mut signals = Vec::with_capacity(num_shards as usize);
+            let mut workers = Vec::with_capacity(num_shards as usize);
+            let mut txs = Vec::with_capacity(num_shards as usize);
+
+            for id in 0..num_shards {
+                let (signal_tx, signal_rx) = channel();
+                let (tx, rx): (
+                    Sender<(Request, Sender<Response>)>,
+                    Receiver<(Request, Sender<Response>)>,
+                ) = channel();
+                let path = format!("{base_path}/{id:#04x}.db");
+                let mut shard = Shard::new(&path).expect("shard");
+                let handle = thread::spawn(move || loop {
+                    if let Ok((req, res_tx)) = rx.try_recv() {
+                        match req {
+                            Request::Lookup { key } => {
+                                let res = if let Some(val) = shard.lookup(&key).unwrap() {
+                                    Response::Value(val.to_vec())
+                                } else {
+                                    Response::Empty
+                                };
+                                res_tx.send(res).unwrap();
+                            }
+                            Request::Insert { key, val } => {
+                                shard.insert(&key, &val).unwrap();
+                                res_tx.send(Response::Empty).ok();
+                            }
+                            Request::Remove { key } => {
+                                shard.remove(&key).unwrap();
+                                res_tx.send(Response::Empty).ok();
+                            }
+                        }
+                    }
+                    if let Ok(_) = signal_rx.try_recv() {
+                        break;
+                    }
+                });
+                workers.push(Some(handle));
+                signals.push(signal_tx);
+                txs.push(tx);
+            }
+
+            Self {
+                num_shards,
+                signals,
+                workers,
+                txs,
+            }
+        }
+
+        pub fn lookup(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+            let id = key.last().cloned().unwrap_or_default() % self.num_shards;
+            let (tx, rx) = channel();
+            let req = Request::Lookup { key: key.to_vec() };
+            self.txs[id as usize].send((req, tx)).unwrap();
+            loop {
+                let r = rx.try_recv();
+                if let Ok(res) = r {
+                    return Ok(res.value());
+                }
+            }
+        }
+
+        pub fn insert(&self, key: &[u8], val: &[u8]) -> Result<(), Error> {
+            let id = key.last().cloned().unwrap_or_default() % self.num_shards;
+            let (tx, rx) = channel();
+            let req = Request::Insert {
+                key: key.to_vec(),
+                val: val.to_vec(),
+            };
+            self.txs[id as usize].send((req, tx)).unwrap();
+            loop {
+                let r = rx.try_recv();
+                if let Ok(_) = r {
+                    return Ok(());
+                }
+            }
+        }
+
+        pub fn remove(&self, key: &[u8]) -> Result<(), Error> {
+            let id = key.last().cloned().unwrap_or_default() % self.num_shards;
+            let (tx, rx) = channel();
+            let req = Request::Remove { key: key.to_vec() };
+            self.txs[id as usize].send((req, tx)).unwrap();
+            loop {
+                let r = rx.try_recv();
+                if let Ok(_) = r {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    impl Drop for ShardedStore {
+        fn drop(&mut self) {
+            for signal in &self.signals {
+                signal.send(0).ok();
+            }
+            for handle in &mut self.workers {
+                handle.take().unwrap().join().ok();
+            }
+        }
+    }
+}
+
+struct Sharded(sharded::ShardedStore);
+
+impl Storage for Sharded {
+    fn insert(&mut self, key: &[u8], val: &[u8]) {
+        self.0.insert(key, val).ok();
+    }
+
+    fn remove(&mut self, key: &[u8]) {
+        self.0.remove(key).ok();
+    }
+
+    fn lookup(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.0.lookup(key).unwrap_or_default()
+    }
+}
+
 fn main() {
     env_logger::init();
     let mut it = std::env::args().skip(1);
@@ -296,12 +492,9 @@ fn main() {
 
     if target == "self" {
         let path = Path::new("target/main_1M.tmp");
+        std::fs::remove_file(path).ok();
         let size: u32 = 4096;
-        let file: File<Block> = if path.exists() {
-            File::open(path).unwrap()
-        } else {
-            File::make(path, size).unwrap()
-        };
+        let file: File<Block> = File::make(path, size).unwrap();
         info!(
             "target={} file={:?} count={} page={}",
             target, path, count, size
@@ -310,8 +503,20 @@ fn main() {
         benchmark(SelfStorage(file), count);
     }
 
+    if target == "sharded" {
+        let path = "target/shards";
+        std::fs::remove_dir_all(path).ok();
+        std::fs::create_dir(path).ok();
+        let sharded = sharded::ShardedStore::new(1, path);
+        info!("target={} file={:?} count={}", target, path, count);
+
+        benchmark(Sharded(sharded), count);
+    }
+
     if target == "sled" {
         let path = "target/sled_1M";
+        std::fs::remove_dir_all(path).ok();
+        std::fs::create_dir(path).ok();
         let db: Db = sled::open(path).unwrap();
         info!("target={} file={} count={}", target, path, count);
 
@@ -320,6 +525,8 @@ fn main() {
 
     if target == "lite" {
         let path = "target/lite_1M";
+        std::fs::remove_dir_all(path).ok();
+        std::fs::create_dir(path).ok();
         let db = Connection::open(path).unwrap();
         info!("target={} file={} count={}", target, path, count);
 
