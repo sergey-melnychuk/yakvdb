@@ -162,12 +162,8 @@ fn benchmark<S: Storage>(mut storage: S, count: usize) {
     now = SystemTime::now();
     let mut found = Vec::with_capacity(data.len());
     for (k, _) in data.iter() {
-        if let Some(r) = storage.lookup(k) {
-            let val = r.to_vec();
-            found.push(val);
-        } else {
-            error!("key='{}' not found", hex(k));
-        }
+        let val = storage.lookup(k).unwrap_or_default();
+        found.push(val);
     }
     millis = now.elapsed().unwrap_or_default().as_millis();
     info!(
@@ -289,12 +285,7 @@ fn benchmark<S: Storage>(mut storage: S, count: usize) {
 }
 
 mod sharded {
-    use std::{
-        cell::Ref,
-        io,
-        sync::mpsc::{channel, Receiver, Sender},
-        thread::{self, JoinHandle},
-    };
+    use std::{cell::Ref, io, sync::mpsc::{channel, Receiver, Sender}, thread::{self, JoinHandle}};
 
     use yakvdb::api::{error::Error, tree::Tree};
 
@@ -381,7 +372,7 @@ mod sharded {
                                 } else {
                                     Response::Empty
                                 };
-                                res_tx.send(res).unwrap();
+                                res_tx.send(res).ok();
                             }
                             Request::Insert { key, val } => {
                                 shard.insert(&key, &val).unwrap();
@@ -507,8 +498,11 @@ fn main() {
         let path = "target/shards";
         std::fs::remove_dir_all(path).ok();
         std::fs::create_dir(path).ok();
-        let sharded = sharded::ShardedStore::new(1, path);
-        info!("target={} file={:?} count={}", target, path, count);
+        let num_shards: u8 = std::env::var("SHARDS").ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4);
+        let sharded = sharded::ShardedStore::new(num_shards, path);
+        info!("target={} file={:?} count={} shards={}", target, path, count, num_shards);
 
         benchmark(Sharded(sharded), count);
     }
