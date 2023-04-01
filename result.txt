@@ -1,15 +1,43 @@
-work@[~/Learn/yakvdb :benchmark/sled] $ RUST_LOG=info ./target/release/main sled 1000000
-[2022-12-21T21:33:47Z INFO  main] target=sled file=target/sled_1M count=1000000
-[2022-12-21T21:33:54Z INFO  main] insert: 7111 ms (rate=140627 op/s)
-[2022-12-21T21:33:56Z INFO  main] lookup: 2176 ms (rate=459558 op/s)
-[2022-12-21T21:34:06Z INFO  main] remove: 10443 ms (rate=95757 op/s)
+## yakvdb (flush on every insert/remove)
+gitpod /workspace/yakvdb (main) $  RUST_LOG=info ./target/release/main self 1000000
+[2023-04-01T15:36:51Z INFO  main] target=self file="target/main_1M.tmp" count=1000000 page=4096
+[2023-04-01T15:36:51Z INFO  main] values: 68 ms
+[2023-04-01T15:37:13Z INFO  main] insert: 22661 ms (rate=44128 op/s)
+[2023-04-01T15:37:17Z INFO  main] lookup: 3850 ms (rate=259740 op/s)
+[2023-04-01T15:37:37Z INFO  main] remove: 20164 ms (rate=49593 op/s)
 
-work@[~/Learn/yakvdb :benchmark/sled] $ RUST_LOG=info ./target/release/main self 1000000
-[2022-12-21T21:34:14Z INFO  main] target=self file="target/main_1M.tmp" count=1000000 page=4096
-[2022-12-21T21:34:45Z INFO  main] insert: 30928 ms (rate=32333 op/s)
-[2022-12-21T21:34:50Z INFO  main] lookup: 5187 ms (rate=192789 op/s)
-[2022-12-21T21:35:17Z INFO  main] remove: 27224 ms (rate=36732 op/s)
+## yalsdb (https://github.com/sergey-melnychuk/yalskv)
+N=1000000 limit=33554432
+insert: ok (ms=5847 op=171027 kb=25386)
+lookup: ok (ms=1775 op=563380 kb=83626)
+remove: ok (ms=4110 op=243309 kb=36116)
 
-# insert: self = sled / 4.35
-# lookup: self = sled / 2.38
-# remove: self = sled / 2.61
+## sled (flush on every insert/remove)
+gitpod /workspace/yakvdb (main) $ RUST_LOG=info ./target/release/main sled 1000000
+[2023-04-01T15:38:55Z INFO  main] target=sled file=target/sled_1M count=1000000
+[2023-04-01T15:38:55Z INFO  main] values: 80 ms
+[2023-04-01T15:42:35Z INFO  main] insert: 219675 ms (rate=4552 op/s)
+[2023-04-01T15:42:37Z INFO  main] lookup: 1903 ms (rate=525486 op/s)
+[2023-04-01T15:45:49Z INFO  main] remove: 192054 ms (rate=5206 op/s)
+
+## sled (no flush)
+gitpod /workspace/yakvdb (main) $ RUST_LOG=info ./target/release/main sled 1000000
+[2023-04-01T15:46:23Z INFO  main] target=sled file=target/sled_1M count=1000000
+[2023-04-01T15:46:24Z INFO  main] values: 70 ms
+[2023-04-01T15:46:30Z INFO  main] insert: 6328 ms (rate=158027 op/s)
+[2023-04-01T15:46:32Z INFO  main] lookup: 2116 ms (rate=472589 op/s)
+[2023-04-01T15:46:41Z INFO  main] remove: 9224 ms (rate=108412 op/s)
+
+## rocksdb (flush on every insert/remove)
+gitpod /workspace/yakvdb (main) $ RUST_LOG=info ./target/release/main rock 1000000
+[2023-04-01T15:48:34Z INFO  main] target=rock file=target/rocks_1M count=1000000
+[2023-04-01T15:48:34Z INFO  main] values: 67 ms
+<too slow: insert was not complete in 10+ minutes>
+
+## rocksdb (no flush)
+gitpod /workspace/yakvdb (main) $ RUST_LOG=info ./target/release/main rock 1000000
+[2023-04-01T15:47:23Z INFO  main] target=rock file=target/rocks_1M count=1000000
+[2023-04-01T15:47:23Z INFO  main] values: 69 ms
+[2023-04-01T15:47:27Z INFO  main] insert: 3919 ms (rate=255167 op/s)
+[2023-04-01T15:47:29Z INFO  main] lookup: 1990 ms (rate=502512 op/s)
+[2023-04-01T15:47:34Z INFO  main] remove: 5042 ms (rate=198333 op/s)
