@@ -1,5 +1,4 @@
 use log::{debug, error, info, trace};
-use rusqlite::Connection;
 use sled::Db;
 use std::path::Path;
 use std::time::SystemTime;
@@ -17,30 +16,6 @@ trait Storage {
     // fn min(&self) -> Vec<u8>;
     // fn max(&self) -> Vec<u8>;
     // fn len(&self) -> usize;
-}
-
-struct LiteStorage(Connection);
-
-impl Storage for LiteStorage {
-    fn insert(&mut self, key: &[u8], val: &[u8]) {
-        self.0
-            .execute("INSERT INTO db (key, val) VALUES (?1, ?2)", [key, val])
-            .unwrap();
-    }
-
-    fn remove(&mut self, key: &[u8]) {
-        self.0
-            .execute("DELETE FROM db WHERE key = ?1", [key])
-            .unwrap();
-    }
-
-    fn lookup(&self, key: &[u8]) -> Option<Vec<u8>> {
-        let mut stmt = self.0.prepare("SELECT val FROM db WHERE key = ?1 LIMIT 1").unwrap();
-        let mut rows = stmt.query([key]).unwrap();
-        rows.next()
-            .unwrap()
-            .map(|row| row.get_ref_unwrap(0).as_blob().unwrap().to_vec())
-    }
 }
 
 struct SledStorage(sled::Db);
@@ -479,22 +454,5 @@ fn main() {
         info!("target={} file={} count={}", target, path, count);
 
         benchmark(RocksStorage(db), count);
-    }
-
-    if target == "lite" {
-        let path = "target/lite_1M";
-        std::fs::remove_dir_all(path).ok();
-        std::fs::create_dir(path).ok();
-        let db = Connection::open(path).unwrap();
-        info!("target={} file={} count={}", target, path, count);
-
-        db.execute("DROP TABLE IF EXISTS db", ()).unwrap();
-        db.execute(
-            "CREATE TABLE IF NOT EXISTS db (key BLOB PRIMARY KEY, val BLOB)",
-            (),
-        )
-        .unwrap();
-
-        benchmark(LiteStorage(db), count);
     }
 }
