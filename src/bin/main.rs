@@ -1,5 +1,4 @@
 use log::{debug, error, info, trace};
-use pickledb::{PickleDb, PickleDbDumpPolicy, SerializationMethod};
 use rusqlite::Connection;
 use sled::Db;
 use std::path::Path;
@@ -75,25 +74,6 @@ impl Storage for SelfStorage {
 
     fn lookup(&self, key: &[u8]) -> Option<Vec<u8>> {
         self.0.lookup(key).unwrap().map(|x| x.to_vec())
-    }
-}
-
-struct PickleStorage(PickleDb);
-
-// TODO FIXME (too slow!) redo with pickle-db best practices in mind
-impl Storage for PickleStorage {
-    fn insert(&mut self, key: &[u8], val: &[u8]) {
-        self.0
-            .set(&String::from_utf8_lossy(key), &val.to_vec())
-            .unwrap();
-    }
-
-    fn remove(&mut self, key: &[u8]) {
-        self.0.rem(&String::from_utf8_lossy(key)).unwrap();
-    }
-
-    fn lookup(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.0.get::<Vec<u8>>(&String::from_utf8_lossy(key))
     }
 }
 
@@ -516,14 +496,5 @@ fn main() {
         .unwrap();
 
         benchmark(LiteStorage(db), count);
-    }
-
-    if target == "pickle" {
-        // https://github.com/seladb/pickledb-rs
-        let path = "target/pickle_1M.db";
-        let db = PickleDb::new(path, PickleDbDumpPolicy::AutoDump, SerializationMethod::Bin);
-        info!("target={} file={} count={}", target, path, count);
-
-        benchmark(PickleStorage(db), count);
     }
 }
