@@ -38,7 +38,7 @@ impl Storage for LiteStorage {
     }
 
     fn lookup(&self, key: &[u8]) -> Option<Vec<u8>> {
-        let mut stmt = self.0.prepare("SELECT val FROM db WHERE key = ?1").unwrap();
+        let mut stmt = self.0.prepare("SELECT val FROM db WHERE key = ?1 LIMIT 1").unwrap();
         let mut rows = stmt.query([key]).unwrap();
         rows.next()
             .unwrap()
