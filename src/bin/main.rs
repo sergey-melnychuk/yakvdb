@@ -477,10 +477,12 @@ struct RocksStorage(rocksdb::DB);
 impl Storage for RocksStorage {
     fn insert(&mut self, key: &[u8], val: &[u8]) {
         self.0.put(key, val).unwrap();
+        //self.0.flush().unwrap();
     }
 
     fn remove(&mut self, key: &[u8]) {
         self.0.delete(key).unwrap();
+        //self.0.flush().unwrap();
     }
 
     fn lookup(&self, key: &[u8]) -> Option<Vec<u8>> {
