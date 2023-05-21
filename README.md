@@ -1,6 +1,16 @@
 Yet Another Kev-Value DataBase
 ==============================
 
+PLAN:
+- [ ] split `Tree` trait into KV-only and internal page-aware
+- [ ] make yakvdb thread-safe
+  - distinct RW locks on pages in the pool?
+- [ ] add async impl based on `tokio::fs`
+  - you can't go back to sync though
+  - somehow make feature switch to async?
+
+---
+
 Extremely simple (simplest possible?) single-file BTree-based key-value database. 
 
 Built for fun and learning: goal is to "demystify" the "database".
