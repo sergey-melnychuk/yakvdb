@@ -2,9 +2,12 @@ Yet Another Kev-Value DataBase
 ==============================
 
 PLAN:
-- [ ] split `Tree` trait into KV-only and internal page-aware
 - [ ] make yakvdb thread-safe
   - distinct RW locks on pages in the pool?
+  - cannot use it in async context now:
+    - the trait `Sync` is not implemented for `RefCell<...>`
+- [ ] split `Tree` trait into pub KV-only and internal page-aware
+  - to avoid leaking impl details leak into public API
 - [ ] add async impl based on `tokio::fs`
   - you can't go back to sync though
   - somehow make feature switch to async?
