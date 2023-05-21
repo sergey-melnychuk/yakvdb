@@ -8,6 +8,17 @@ PLAN:
     - the trait `Sync` is not implemented for `RefCell<...>`
 - [x] split `Tree` trait into pub KV-only and internal page-aware
   - to avoid leaking impl details leak into public API
+- [ ] CLI
+  - connect to a file and explore it
+  - `lookup X64'00cafebabe'`
+  - `insert X64'00cafebabe' X64'00deadbeef'`
+  - `remove X64'00cafebabe'`
+  - `above X64'00cafebabe'`
+  - `below X64'00cafebabe'`
+  - `min`
+  - `max`
+  - `len` (iterate from `min` to `max`)
+  - basic defragment/restore utilities
 - [ ] add async impl based on `tokio::fs`
   - you can't go back to sync though
   - somehow make feature switch to async?
