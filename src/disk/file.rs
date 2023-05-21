@@ -221,7 +221,7 @@ impl<P: Page> Tree<P> for File<P> {
         }
     }
 
-    fn insert(&mut self, key: &[u8], val: &[u8]) -> Result<()> {
+    fn insert(&self, key: &[u8], val: &[u8]) -> Result<()> {
         debug!("insert: {} -> {}", hex(key), hex(val));
         let mut page = self.root_mut();
         let mut seen = HashSet::with_capacity(8);
@@ -326,7 +326,7 @@ impl<P: Page> Tree<P> for File<P> {
         }
     }
 
-    fn remove(&mut self, key: &[u8]) -> Result<()> {
+    fn remove(&self, key: &[u8]) -> Result<()> {
         debug!("remove: {}", hex(key));
         let mut page = self.root_mut();
         let mut seen = HashSet::with_capacity(8);
@@ -970,7 +970,7 @@ mod tests {
             (b"tre".to_vec(), b"red devils".to_vec()),
         ];
 
-        let mut file: File<Block> = File::make(path, size).unwrap();
+        let file: File<Block> = File::make(path, size).unwrap();
 
         for (k, v) in data.iter() {
             file.insert(k, v).unwrap();
@@ -997,7 +997,7 @@ mod tests {
         }
 
         let size: u32 = 256;
-        let mut file: File<Block> = File::make(path, size).unwrap();
+        let file: File<Block> = File::make(path, size).unwrap();
 
         let count = 25;
         let data = (0..count)
@@ -1025,7 +1025,7 @@ mod tests {
         }
 
         let size: u32 = 256;
-        let mut file: File<Block> = File::make(path, size).unwrap();
+        let file: File<Block> = File::make(path, size).unwrap();
 
         let count = 25;
         let data = {
@@ -1082,7 +1082,7 @@ mod tests {
         }
 
         let size: u32 = 256;
-        let mut file: File<Block> = File::make(path, size).unwrap();
+        let file: File<Block> = File::make(path, size).unwrap();
 
         let count = 10;
         let mut data = {
@@ -1138,7 +1138,7 @@ mod tests {
         }
 
         let size: u32 = 256;
-        let mut file: File<Block> = File::make(path, size).unwrap();
+        let file: File<Block> = File::make(path, size).unwrap();
 
         let count = 10;
         let mut data = {
@@ -1195,7 +1195,7 @@ mod tests {
         }
 
         let size: u32 = 4096;
-        let mut file: File<Block> = File::make(path, size).unwrap();
+        let file: File<Block> = File::make(path, size).unwrap();
 
         let count = 1000;
         let data = util::data(count, 42);
@@ -1205,7 +1205,7 @@ mod tests {
             file.insert(k, v).unwrap();
         }
 
-        let mut file: File<Block> = File::open(path).unwrap();
+        let file: File<Block> = File::open(path).unwrap();
 
         for (k, v) in data.iter() {
             assert_eq!(file.lookup(k).unwrap().unwrap().deref(), v);
@@ -1301,7 +1301,7 @@ mod tests {
         }
 
         let page_bytes: u32 = 256;
-        let mut file: File<Block> = File::make(path, page_bytes).unwrap();
+        let file: File<Block> = File::make(path, page_bytes).unwrap();
 
         let big = vec![42u8; 1024];
         let res = file.insert(&big, &big);

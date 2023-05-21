@@ -4,8 +4,8 @@ use std::cell::{Ref, RefMut};
 
 pub trait Tree<P: Page> {
     fn lookup(&self, key: &[u8]) -> Result<Option<Ref<[u8]>>>;
-    fn insert(&mut self, key: &[u8], val: &[u8]) -> Result<()>;
-    fn remove(&mut self, key: &[u8]) -> Result<()>;
+    fn insert(&self, key: &[u8], val: &[u8]) -> Result<()>;
+    fn remove(&self, key: &[u8]) -> Result<()>;
 
     fn is_empty(&self) -> bool;
 
