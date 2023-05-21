@@ -1,8 +1,8 @@
-use std::path::Path;
+use std::{marker::PhantomData, path::Path};
 
 use crate::api::{self, Store as KVStore};
 
-pub struct Store(api::KV);
+pub struct Store<K, V>(api::KV, PhantomData<(K, V)>);
 
 pub trait DB<K, V>
 where
@@ -22,7 +22,7 @@ where
     fn below(&self, key: &K) -> anyhow::Result<Option<K>>;
 }
 
-impl<K, V> DB<K, V> for Store
+impl<K, V> DB<K, V> for Store<K, V>
 where
     K: AsRef<[u8]> + for<'a> From<&'a [u8]>,
     V: AsRef<[u8]> + for<'a> From<&'a [u8]>,
@@ -33,7 +33,7 @@ where
         } else {
             api::KV::open(path).unwrap()
         };
-        Self(kv)
+        Self(kv, PhantomData)
     }
 
     fn contains(&self, key: &K) -> anyhow::Result<bool> {
