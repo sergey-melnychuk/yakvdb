@@ -1,6 +1,7 @@
 use crate::api::error::{Error, Result};
 use crate::api::page::Page;
 use crate::api::tree::Tree;
+use crate::api::Store;
 use crate::util::cache::{Cache, LruCache};
 use crate::util::hex::hex;
 use bytes::{Buf, BufMut, BytesMut};
@@ -187,7 +188,7 @@ impl<P: Page> File<P> {
     }
 }
 
-impl<P: Page> Tree<P> for File<P> {
+impl<P: Page> Store for File<P> {
     fn lookup(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         debug!("lookup: {}", hex(key));
         let mut seen = HashSet::with_capacity(8);
@@ -610,7 +611,9 @@ impl<P: Page> Tree<P> for File<P> {
             }
         }
     }
+}
 
+impl<P: Page> Tree<P> for File<P> {
     fn root(&self) -> MappedRwLockReadGuard<'_, P> {
         self.page(ROOT).unwrap()
     }

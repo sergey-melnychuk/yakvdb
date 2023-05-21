@@ -6,7 +6,7 @@ PLAN:
   - distinct RW locks on pages in the pool?
   - cannot use it in async context now:
     - the trait `Sync` is not implemented for `RefCell<...>`
-- [ ] split `Tree` trait into pub KV-only and internal page-aware
+- [x] split `Tree` trait into pub KV-only and internal page-aware
   - to avoid leaking impl details leak into public API
 - [ ] add async impl based on `tokio::fs`
   - you can't go back to sync though

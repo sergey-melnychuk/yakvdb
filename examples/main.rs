@@ -2,8 +2,8 @@ use log::{debug, error, info, trace};
 use sled::Db;
 use std::path::Path;
 use std::time::SystemTime;
+use yakvdb::api::Store;
 
-use yakvdb::api::tree::Tree;
 use yakvdb::disk::block::Block;
 use yakvdb::disk::file::File;
 use yakvdb::util::{self, hex::hex};
@@ -202,7 +202,7 @@ mod sharded {
         thread::{self, JoinHandle},
     };
 
-    use yakvdb::api::{error::Error, tree::Tree};
+    use yakvdb::api::{error::Error, Store};
 
     use super::Block;
     use super::File;
