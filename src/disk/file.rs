@@ -5,7 +5,6 @@ use crate::util::cache::{Cache, LruCache};
 use crate::util::hex::hex;
 use bytes::{Buf, BufMut, BytesMut};
 use log::{debug, error, trace};
-use std::cell::{Ref, RefCell, RefMut};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
 use std::fs::{self, OpenOptions};
@@ -13,18 +12,23 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::ops::Deref;
 use std::path::Path;
+use std::sync::Arc;
+
+use parking_lot::{
+    MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
+};
 
 pub struct File<P: Page> {
     /// Underlying file reference where all data is physically stored.
-    file: RefCell<fs::File>,
+    file: Arc<RwLock<fs::File>>,
     head: Head,
 
     /// In-memory page cache. All page access happens only through cached page representation.
-    cache: RefCell<LruCache<u32, P>>,
-    dirty: RefCell<HashSet<u32>>,
+    cache: Arc<RwLock<LruCache<u32, P>>>,
+    dirty: Arc<RwLock<HashSet<u32>>>,
 
     /// Min-heap of available page identifiers (this helps avoid "gaps": empty pages inside file).
-    empty: RefCell<BinaryHeap<Reverse<u32>>>,
+    empty: Arc<RwLock<BinaryHeap<Reverse<u32>>>>,
 }
 
 const MAGIC: &[u8] = b"YAKVDB42";
@@ -74,11 +78,11 @@ impl<P: Page> File<P> {
         file.flush()?;
 
         Ok(Self {
-            file: RefCell::new(file),
+            file: Arc::new(RwLock::new(file)),
             head,
-            cache: RefCell::new(LruCache::new(32)),
-            dirty: RefCell::new(HashSet::with_capacity(32)),
-            empty: RefCell::new(BinaryHeap::with_capacity(32)),
+            cache: Arc::new(RwLock::new(LruCache::new(32))),
+            dirty: Arc::new(RwLock::new(HashSet::with_capacity(32))),
+            empty: Arc::new(RwLock::new(BinaryHeap::with_capacity(32))),
         })
     }
 
@@ -130,14 +134,14 @@ impl<P: Page> File<P> {
         file.read_exact(root.as_mut())?;
 
         let this = Self {
-            file: RefCell::new(file),
+            file: Arc::new(RwLock::new(file)),
             head,
-            cache: RefCell::new(LruCache::new(32)),
-            dirty: RefCell::new(HashSet::with_capacity(32)),
-            empty: RefCell::new(BinaryHeap::with_capacity(16)),
+            cache: Arc::new(RwLock::new(LruCache::new(32))),
+            dirty: Arc::new(RwLock::new(HashSet::with_capacity(32))),
+            empty: Arc::new(RwLock::new(BinaryHeap::with_capacity(16))),
         };
 
-        this.cache.borrow_mut().put(ROOT, root);
+        this.cache.write().put(ROOT, root);
 
         let total_pages = (len - HEAD) as u32 / this.head.page_bytes;
         debug!("Processing pages for compaction: {}", total_pages);
@@ -147,7 +151,7 @@ impl<P: Page> File<P> {
                 if let Ok(page) = this.load(this.offset(id), this.head.page_bytes) {
                     if page.len() == 0 {
                         debug!("Page id={} is empty", id);
-                        this.empty.borrow_mut().push(Reverse(id));
+                        this.empty.write().push(Reverse(id));
                     }
                 } else {
                     error!("Page failed to load: id={}", id);
@@ -158,11 +162,12 @@ impl<P: Page> File<P> {
     }
 
     fn load(&self, offset: usize, length: u32) -> io::Result<P> {
-        let mut page = P::reserve(length as u32);
-        self.file
-            .borrow_mut()
-            .seek(SeekFrom::Start(offset as u64))?;
-        self.file.borrow_mut().read_exact(page.as_mut())?;
+        let mut page = P::reserve(length);
+        {
+            let mut file = self.file.write();
+            file.seek(SeekFrom::Start(offset as u64))?;
+            file.read_exact(page.as_mut())?;
+        }
         debug!("Loading page {}", page.id());
         Ok(page)
     }
@@ -170,8 +175,11 @@ impl<P: Page> File<P> {
     fn save(&self, page: &P) -> io::Result<()> {
         debug!("Saving page {}", page.id());
         let offset = self.offset(page.id()) as u64;
-        self.file.borrow_mut().seek(SeekFrom::Start(offset))?;
-        self.file.borrow_mut().write_all(page.as_ref())
+        {
+            let mut file = self.file.write();
+            file.seek(SeekFrom::Start(offset))?;
+            file.write_all(page.as_ref())
+        }
     }
 
     fn offset(&self, id: u32) -> usize {
@@ -180,7 +188,7 @@ impl<P: Page> File<P> {
 }
 
 impl<P: Page> Tree<P> for File<P> {
-    fn lookup(&self, key: &[u8]) -> Result<Option<Ref<[u8]>>> {
+    fn lookup(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         debug!("lookup: {}", hex(key));
         let mut seen = HashSet::with_capacity(8);
         let mut page = self.root();
@@ -200,7 +208,7 @@ impl<P: Page> Tree<P> for File<P> {
             if slot.page == 0 {
                 // Log how deep the lookup went into the tree depth: seen.len()
                 return if key == page.key(idx) {
-                    Ok(Some(Ref::map(page, |p| p.val(idx))))
+                    Ok(Some(page.val(idx).to_vec()))
                 } else {
                     Ok(None)
                 };
@@ -464,7 +472,7 @@ impl<P: Page> Tree<P> for File<P> {
         self.root().len() == 0
     }
 
-    fn min(&self) -> Result<Option<Ref<[u8]>>> {
+    fn min(&self) -> Result<Option<Vec<u8>>> {
         let mut page = self.root();
         if page.len() == 0 {
             return Ok(None);
@@ -472,7 +480,7 @@ impl<P: Page> Tree<P> for File<P> {
         loop {
             let slot = page.slot(0).unwrap();
             if slot.page == 0 {
-                return Ok(Some(Ref::map(page, |p| p.min())));
+                return Ok(Some(page.min().to_vec()));
             } else {
                 let id = slot.page;
                 drop(page);
@@ -485,7 +493,7 @@ impl<P: Page> Tree<P> for File<P> {
         }
     }
 
-    fn max(&self) -> Result<Option<Ref<[u8]>>> {
+    fn max(&self) -> Result<Option<Vec<u8>>> {
         let mut page = self.root();
         if page.len() == 0 {
             return Ok(None);
@@ -494,7 +502,7 @@ impl<P: Page> Tree<P> for File<P> {
             let last = page.len() - 1;
             let slot = page.slot(last).unwrap();
             if slot.page == 0 {
-                return Ok(Some(Ref::map(page, |p| p.max())));
+                return Ok(Some(page.max().to_vec()));
             } else {
                 let id = slot.page;
                 drop(page);
@@ -507,7 +515,7 @@ impl<P: Page> Tree<P> for File<P> {
         }
     }
 
-    fn above(&self, key: &[u8]) -> Result<Option<Ref<[u8]>>> {
+    fn above(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         debug!("above: {}", hex(key));
 
         let mut path = Vec::with_capacity(8);
@@ -520,9 +528,9 @@ impl<P: Page> Tree<P> for File<P> {
             let slot = page.slot(idx).unwrap();
             if slot.page == 0 {
                 return if key < page.key(idx) {
-                    Ok(Some(Ref::map(page, |p| p.key(idx))))
+                    Ok(Some(page.key(idx).to_vec()))
                 } else if key == page.key(idx) && idx < page.len() - 1 {
-                    Ok(Some(Ref::map(page, |p| p.key(idx + 1))))
+                    Ok(Some(page.key(idx + 1).to_vec()))
                 } else {
                     // ceil == key, need to take min value from parent's next adjacent subtree
                     for (parent_id, parent_idx) in path.iter().rev().cloned() {
@@ -534,7 +542,7 @@ impl<P: Page> Tree<P> for File<P> {
                             loop {
                                 let slot = page.slot(0).unwrap();
                                 if slot.page == 0 {
-                                    return Ok(Some(Ref::map(page, |p| p.min())));
+                                    return Ok(Some(page.min().to_vec()));
                                 } else {
                                     drop(page);
                                     page = self.page(slot.page).unwrap();
@@ -559,7 +567,7 @@ impl<P: Page> Tree<P> for File<P> {
         }
     }
 
-    fn below(&self, key: &[u8]) -> Result<Option<Ref<[u8]>>> {
+    fn below(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         debug!("below: {}", hex(key));
 
         let mut path = Vec::with_capacity(8);
@@ -572,7 +580,7 @@ impl<P: Page> Tree<P> for File<P> {
             let slot = page.slot(idx).unwrap();
             if slot.page == 0 {
                 return if idx > 0 && key > page.key(idx - 1) {
-                    Ok(Some(Ref::map(page, |p| p.key(idx - 1))))
+                    Ok(Some(page.key(idx - 1).to_vec()))
                 } else {
                     // ceil == key, need to take max value from parent's previous adjacent page
                     for (parent_id, parent_idx) in path.iter().rev().cloned() {
@@ -583,7 +591,7 @@ impl<P: Page> Tree<P> for File<P> {
                             let id = page.slot(idx).unwrap().page;
                             drop(page);
                             page = self.page(id).unwrap();
-                            return Ok(Some(Ref::map(page, |p| p.max())));
+                            return Ok(Some(page.max().to_vec()));
                         }
                     }
 
@@ -603,43 +611,44 @@ impl<P: Page> Tree<P> for File<P> {
         }
     }
 
-    fn root(&self) -> Ref<P> {
+    fn root(&self) -> MappedRwLockReadGuard<'_, P> {
         self.page(ROOT).unwrap()
     }
 
-    fn page(&self, id: u32) -> Option<Ref<P>> {
+    fn page(&self, id: u32) -> Option<MappedRwLockReadGuard<'_, P>> {
         self.cache(id).ok()?;
-        let page = Ref::map(self.cache.borrow(), |cache| cache.get(&id).unwrap());
+        let page = RwLockReadGuard::map(self.cache.read(), |cache| cache.get(&id).unwrap());
         Some(page)
     }
 
-    fn root_mut(&self) -> RefMut<P> {
+    fn root_mut(&self) -> MappedRwLockWriteGuard<'_, P> {
         self.mark(ROOT);
         self.page_mut(ROOT).unwrap()
     }
 
-    fn page_mut(&self, id: u32) -> Option<RefMut<P>> {
+    fn page_mut(&self, id: u32) -> Option<MappedRwLockWriteGuard<'_, P>> {
         self.cache(id).ok()?;
-        let page = RefMut::map(self.cache.borrow_mut(), |cache| cache.get_mut(&id).unwrap());
         self.mark(id);
+        let page = RwLockWriteGuard::map(self.cache.write(), |cache| cache.get_mut(&id).unwrap());
         Some(page)
     }
 
     fn cache(&self, id: u32) -> io::Result<()> {
-        if !self.cache.borrow().has(&id) {
+        let has_id = self.cache.read().has(&id);
+        if !has_id {
             let page = self.load(self.offset(id), self.head.page_bytes)?;
-            self.cache.borrow_mut().put(id, page);
+            self.cache.write().put(id, page);
         }
         Ok(())
     }
 
     fn mark(&self, id: u32) {
-        self.dirty.borrow_mut().insert(id);
+        self.dirty.write().insert(id);
     }
 
     fn flush(&self) -> crate::api::error::Result<()> {
-        let pages = self.dirty.borrow().iter().cloned().collect::<Vec<_>>();
-        self.dirty.borrow_mut().clear();
+        let pages = self.dirty.read().iter().cloned().collect::<Vec<_>>();
+        self.dirty.write().clear();
 
         let mut failed = vec![];
         for id in pages {
@@ -665,19 +674,20 @@ impl<P: Page> Tree<P> for File<P> {
     }
 
     fn next_id(&self) -> Result<u32> {
-        if !self.empty.borrow().is_empty() {
-            let id = self.empty.borrow_mut().pop().unwrap().0;
+        let is_empty = self.empty.read().is_empty();
+        if !is_empty {
+            let id = self.empty.write().pop().unwrap().0;
             let temp = P::create(id, self.head.page_bytes);
             let mut page = self.page_mut(id).unwrap();
             page.as_mut().copy_from_slice(temp.as_ref());
             return Ok(id);
         }
 
-        let len = self.file.borrow_mut().metadata().unwrap().len();
+        let len = self.file.write().metadata().unwrap().len();
         let id = 1 + ((len - HEAD as u64) / self.head.page_bytes as u64) as u32;
         let page = P::create(id, self.head.page_bytes);
         {
-            let mut f = self.file.borrow_mut();
+            let mut f = self.file.write();
             f.seek(SeekFrom::End(0))?;
             f.write_all(page.as_ref())?;
         }
@@ -686,7 +696,7 @@ impl<P: Page> Tree<P> for File<P> {
     }
 
     fn free_id(&self, id: u32) {
-        self.empty.borrow_mut().push(Reverse(id))
+        self.empty.write().push(Reverse(id))
     }
 
     fn split(&self, id: u32, parent_id: u32) -> Result<()> {
@@ -898,7 +908,6 @@ mod tests {
     use rand::prelude::StdRng;
     use rand::seq::SliceRandom;
     use rand::SeedableRng;
-    use std::borrow::Borrow;
     use std::ops::Deref;
 
     fn get<P: Page>(page: &P, key: &[u8]) -> Option<(Vec<u8>, u32)> {
@@ -1280,11 +1289,7 @@ mod tests {
 
         for (i, (key, _)) in data.iter().enumerate() {
             debug!("({:05}) lookup: key={}", i, hex(key));
-            let found = file
-                .lookup(key)
-                .unwrap()
-                .map(|v| v.borrow().to_vec())
-                .map(|v| hex(&v));
+            let found = file.lookup(key).unwrap().map(|v| hex(&v));
             assert_eq!(found, None);
         }
 

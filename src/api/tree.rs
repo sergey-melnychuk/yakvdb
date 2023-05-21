@@ -1,37 +1,37 @@
 use crate::api::error::Result;
 use crate::api::page::Page;
-use std::cell::{Ref, RefMut};
+use parking_lot::{MappedRwLockReadGuard, MappedRwLockWriteGuard};
 
 pub trait Tree<P: Page> {
-    fn lookup(&self, key: &[u8]) -> Result<Option<Ref<[u8]>>>;
+    fn lookup(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
     fn insert(&self, key: &[u8], val: &[u8]) -> Result<()>;
     fn remove(&self, key: &[u8]) -> Result<()>;
 
     fn is_empty(&self) -> bool;
 
     /// Get lowest/smallest key stored in the tree, or none if tree is empty.
-    fn min(&self) -> Result<Option<Ref<[u8]>>>;
+    fn min(&self) -> Result<Option<Vec<u8>>>;
 
     /// Get highest/biggest key stored in the tree, or none if tree is empty.
-    fn max(&self) -> Result<Option<Ref<[u8]>>>;
+    fn max(&self) -> Result<Option<Vec<u8>>>;
 
     /// Get smallest key that is strictly greater than given one, if any.
-    fn above(&self, key: &[u8]) -> Result<Option<Ref<[u8]>>>;
+    fn above(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
 
     /// Get biggest key that is strictly lesser than given one, if any.
-    fn below(&self, key: &[u8]) -> Result<Option<Ref<[u8]>>>;
+    fn below(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
 
     /// Get an immutable reference to a root page.
-    fn root(&self) -> Ref<P>;
+    fn root(&self) -> MappedRwLockReadGuard<'_, P>;
 
     /// Get an immutable reference to a page having given id, if such page exists.
-    fn page(&self, id: u32) -> Option<Ref<P>>;
+    fn page(&self, id: u32) -> Option<MappedRwLockReadGuard<'_, P>>;
 
     /// Get a mutable reference to a root page.
-    fn root_mut(&self) -> RefMut<P>;
+    fn root_mut(&self) -> MappedRwLockWriteGuard<'_, P>;
 
     /// Get a mutable reference to a page having given id, if such page exists.
-    fn page_mut(&self, id: u32) -> Option<RefMut<P>>;
+    fn page_mut(&self, id: u32) -> Option<MappedRwLockWriteGuard<'_, P>>;
 
     /// Check that the page of given id is cached (if not then load it from disk)
     fn cache(&self, id: u32) -> std::io::Result<()>;

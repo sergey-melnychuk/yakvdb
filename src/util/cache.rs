@@ -1,8 +1,9 @@
 use log::debug;
-use std::cell::RefCell;
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::hash::Hash;
+use std::sync::Arc;
 
 pub(crate) trait Cache<K: Clone + Eq + PartialEq + Hash, V> {
     fn has(&self, key: &K) -> bool;
@@ -15,7 +16,7 @@ pub(crate) trait Cache<K: Clone + Eq + PartialEq + Hash, V> {
 
 pub(crate) struct LruCache<K, V> {
     map: HashMap<K, V>,
-    lru: RefCell<Vec<K>>,
+    lru: Arc<RwLock<Vec<K>>>,
     cap: usize,
 }
 
@@ -23,7 +24,7 @@ impl<K: Clone + Eq + Hash + Display, V> LruCache<K, V> {
     pub(crate) fn new(size: usize) -> Self {
         Self {
             map: HashMap::with_capacity(size),
-            lru: RefCell::new(Vec::with_capacity(size)),
+            lru: Arc::new(RwLock::new(Vec::with_capacity(size))),
             cap: size,
         }
     }
@@ -33,7 +34,7 @@ impl<K: Clone + Eq + Hash + Display, V> LruCache<K, V> {
             None
         } else {
             self.lru
-                .borrow()
+                .read()
                 .iter()
                 .enumerate()
                 .find(|(_, x)| x == &key)
@@ -41,11 +42,11 @@ impl<K: Clone + Eq + Hash + Display, V> LruCache<K, V> {
         };
 
         if let Some(idx) = existing {
-            let mut lru = self.lru.borrow_mut();
+            let mut lru = self.lru.write();
             lru.remove(idx);
             lru.push(key.clone());
         } else {
-            let mut lru = self.lru.borrow_mut();
+            let mut lru = self.lru.write();
             if lru.len() == self.cap {
                 let evicted = lru.remove(0);
                 return Some(evicted);

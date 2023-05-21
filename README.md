@@ -2,7 +2,7 @@ Yet Another Kev-Value DataBase
 ==============================
 
 PLAN:
-- [ ] make yakvdb thread-safe
+- [x] make yakvdb thread-safe
   - distinct RW locks on pages in the pool?
   - cannot use it in async context now:
     - the trait `Sync` is not implemented for `RefCell<...>`

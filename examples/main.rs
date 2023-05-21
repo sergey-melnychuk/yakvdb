@@ -196,7 +196,11 @@ fn benchmark<S: Storage>(mut storage: S, count: usize) {
 }
 
 mod sharded {
-    use std::{cell::Ref, io, sync::mpsc::{channel, Receiver, Sender}, thread::{self, JoinHandle}};
+    use std::{
+        io,
+        sync::mpsc::{channel, Receiver, Sender},
+        thread::{self, JoinHandle},
+    };
 
     use yakvdb::api::{error::Error, tree::Tree};
 
@@ -240,7 +244,7 @@ mod sharded {
             Ok(Self { file })
         }
 
-        fn lookup(&self, key: &[u8]) -> Result<Option<Ref<[u8]>>, Error> {
+        fn lookup(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
             self.file.lookup(key)
         }
 
@@ -427,11 +431,15 @@ fn main() {
         let path = "target/shards";
         std::fs::remove_dir_all(path).ok();
         std::fs::create_dir(path).ok();
-        let num_shards: u8 = std::env::var("SHARDS").ok()
+        let num_shards: u8 = std::env::var("SHARDS")
+            .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(4);
         let sharded = sharded::ShardedStore::new(num_shards, path);
-        info!("target={} file={:?} count={} shards={}", target, path, count, num_shards);
+        info!(
+            "target={} file={:?} count={} shards={}",
+            target, path, count, num_shards
+        );
 
         benchmark(Sharded(sharded), count);
     }
