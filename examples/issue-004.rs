@@ -1,6 +1,13 @@
-use std::{path::{PathBuf, Path}, fs::{self, File}, io::{self, BufReader, BufRead}};
+use std::{
+    fs::{self, File},
+    io::{self, BufRead, BufReader},
+    path::{Path, PathBuf},
+};
 
-use yakvdb::{disk::{file::File as YakFile, block::Block}, api::Store};
+use yakvdb::{
+    api::Store,
+    disk::{block::Block, file::File as YakFile},
+};
 
 fn path<P: AsRef<Path>>(path: P) -> PathBuf {
     path.as_ref().to_owned()
@@ -11,7 +18,6 @@ fn lines<P: AsRef<Path>>(path: P) -> io::Result<io::Lines<BufReader<File>>> {
     let file = File::open(path.as_ref())?;
     Ok(BufReader::new(file).lines())
 }
-
 
 fn data<P: AsRef<Path>>(path: P) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
     Ok(lines(path)?
