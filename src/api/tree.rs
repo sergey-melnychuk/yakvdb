@@ -33,6 +33,9 @@ pub trait Tree<P: Page> {
     /// Split given page into two subpages containing ~equal number of entries.
     fn split(&self, id: u32, parent_id: u32) -> Result<()>;
 
+    /// Check reference consistency a between parent page and a child page.
+    fn check(&self, parent_id: u32, page_id: u32) -> Result<()>;
+
     /// Merge page `src_id` into page `dst_id`, effectively removing page `src_id`.
     fn merge(&self, src_id: u32, dst_id: u32) -> Result<()>;
 

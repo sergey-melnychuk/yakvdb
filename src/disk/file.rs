@@ -816,8 +816,55 @@ impl<P: Page> Tree<P> for File<P> {
                 parent.put_ref(&peer_max, peer_id);
             }
 
+            self.check(parent_id, id)?;
+            self.check(parent_id, peer_id)?;
+
             Ok(())
         }
+    }
+
+    fn check(&self, parent_id: u32, page_id: u32) -> Result<()> {
+        let page_max = {
+            let page = self.page(page_id).unwrap();
+            page.max().to_vec()
+        };
+
+        let (parent_key, parent_ref) = {
+            let parent = self.page(parent_id).unwrap();
+            let page_idx = parent.find(&page_max).unwrap();
+            let parent_key = parent.key(page_idx).to_vec();
+            let parent_ref = parent
+                .slot(page_idx)
+                .map(|slot| slot.page)
+                .unwrap_or_default();
+            (parent_key, parent_ref)
+        };
+
+        if parent_key != page_max {
+            log::error!(
+                "parent_key != page_max: parent_key={} page_max={}",
+                hex(&parent_key),
+                hex(&page_max)
+            );
+            return Err(Error::Tree(
+                parent_id,
+                "Parent entry key does not match child page".to_string(),
+            ));
+        }
+
+        if parent_ref != page_id {
+            log::error!(
+                "parent_ref != page_id: parent_ref={} page_id={}",
+                parent_ref,
+                page_id,
+            );
+            return Err(Error::Tree(
+                parent_id,
+                "Parent entry ref does not match child page".to_string(),
+            ));
+        }
+
+        Ok(())
     }
 
     fn merge(&self, src_id: u32, dst_id: u32) -> Result<()> {
