@@ -33,8 +33,6 @@ impl Block {
         let ceil_opt = self.ceil(key);
         if let Some(idx) = &ceil_opt {
             if self.key(*idx) == key {
-                let n = self.len() - 1;
-                put_size(&mut self.buf, n);
                 self.remove(*idx);
             }
         }
