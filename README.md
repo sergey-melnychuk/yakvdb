@@ -8,6 +8,8 @@ PLAN:
     - the trait `Sync` is not implemented for `RefCell<...>`
 - [x] split `Tree` trait into pub KV-only and internal page-aware
   - to avoid leaking impl details leak into public API
+- [ ] iterator impl (feature `iter`)
+  - range lookup (returning an iterator)
 - [ ] CLI
   - connect to a file and explore it
   - `lookup X64'00cafebabe'`
