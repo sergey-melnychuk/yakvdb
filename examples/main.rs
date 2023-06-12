@@ -1,5 +1,6 @@
 use log::{debug, error, info, trace};
 use sled::Db;
+use std::cell::RefCell;
 use std::path::Path;
 use std::time::SystemTime;
 use yakvdb::api::Store;
@@ -9,8 +10,8 @@ use yakvdb::disk::file::File;
 use yakvdb::util::{self, hex::hex};
 
 trait Storage {
-    fn insert(&mut self, key: &[u8], val: &[u8]);
-    fn remove(&mut self, key: &[u8]);
+    fn insert(&self, key: &[u8], val: &[u8]);
+    fn remove(&self, key: &[u8]);
     fn lookup(&self, key: &[u8]) -> Option<Vec<u8>>;
     // fn range(&self, lo: &[u8], hi: &[u8]) -> Vec<Vec<u8>>;
     // fn min(&self) -> Vec<u8>;
@@ -21,12 +22,12 @@ trait Storage {
 struct SledStorage(sled::Db);
 
 impl Storage for SledStorage {
-    fn insert(&mut self, key: &[u8], val: &[u8]) {
+    fn insert(&self, key: &[u8], val: &[u8]) {
         self.0.insert(key, val).unwrap();
         //self.0.flush().unwrap();
     }
 
-    fn remove(&mut self, key: &[u8]) {
+    fn remove(&self, key: &[u8]) {
         self.0.remove(key).unwrap();
         //self.0.flush().unwrap();
     }
@@ -39,11 +40,11 @@ impl Storage for SledStorage {
 struct SelfStorage(File<Block>);
 
 impl Storage for SelfStorage {
-    fn insert(&mut self, key: &[u8], val: &[u8]) {
+    fn insert(&self, key: &[u8], val: &[u8]) {
         self.0.insert(key, val).unwrap();
     }
 
-    fn remove(&mut self, key: &[u8]) {
+    fn remove(&self, key: &[u8]) {
         self.0.remove(key).unwrap();
     }
 
@@ -52,7 +53,23 @@ impl Storage for SelfStorage {
     }
 }
 
-fn benchmark<S: Storage>(mut storage: S, count: usize) {
+struct LSKV(RefCell<yalskv::Store>);
+
+impl Storage for LSKV {
+    fn insert(&self, key: &[u8], val: &[u8]) {
+        self.0.borrow_mut().insert(key, val).ok();
+    }
+
+    fn remove(&self, key: &[u8]) {
+        self.0.borrow_mut().remove(key).ok();
+    }
+
+    fn lookup(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.0.borrow_mut().lookup(key).ok().flatten()
+    }
+}
+
+fn benchmark<S: Storage>(storage: S, count: usize) {
     let mut now = SystemTime::now();
     let data = util::data(count, 42);
     let mut millis = now.elapsed().unwrap_or_default().as_millis();
@@ -196,38 +213,9 @@ fn benchmark<S: Storage>(mut storage: S, count: usize) {
 }
 
 mod sharded {
-    use std::{
-        io,
-        sync::mpsc::{channel, Receiver, Sender},
-        thread::{self, JoinHandle},
-    };
+    use std::io;
 
-    use yakvdb::api::{error::Error, Store};
-
-    use super::Block;
-    use super::File;
-
-    #[derive(Debug)]
-    enum Request {
-        Lookup { key: Vec<u8> },
-        Remove { key: Vec<u8> },
-        Insert { key: Vec<u8>, val: Vec<u8> },
-    }
-
-    #[derive(Debug)]
-    enum Response {
-        Empty,
-        Value(Vec<u8>),
-    }
-
-    impl Response {
-        fn value(self) -> Option<Vec<u8>> {
-            match self {
-                Response::Value(value) => Some(value),
-                _ => None,
-            }
-        }
-    }
+    use yakvdb::{disk::{file::File, block::Block}, api::{error::Error, Store}};
 
     struct Shard {
         file: File<Block>,
@@ -248,125 +236,48 @@ mod sharded {
             self.file.lookup(key)
         }
 
-        fn insert(&mut self, key: &[u8], val: &[u8]) -> Result<(), Error> {
+        fn insert(&self, key: &[u8], val: &[u8]) -> Result<(), Error> {
             self.file.insert(key, val)
         }
 
-        fn remove(&mut self, key: &[u8]) -> Result<(), Error> {
+        fn remove(&self, key: &[u8]) -> Result<(), Error> {
             self.file.remove(key)
         }
     }
 
     pub struct ShardedStore {
         num_shards: u8,
-        signals: Vec<Sender<u8>>,
-        workers: Vec<Option<JoinHandle<()>>>,
-        txs: Vec<Sender<(Request, Sender<Response>)>>,
+        shards: Vec<Shard>,
     }
 
     impl ShardedStore {
         pub fn new(num_shards: u8, base_path: &str) -> Self {
-            let mut signals = Vec::with_capacity(num_shards as usize);
-            let mut workers = Vec::with_capacity(num_shards as usize);
-            let mut txs = Vec::with_capacity(num_shards as usize);
-
-            for id in 0..num_shards {
-                let (signal_tx, signal_rx) = channel();
-                let (tx, rx): (
-                    Sender<(Request, Sender<Response>)>,
-                    Receiver<(Request, Sender<Response>)>,
-                ) = channel();
-                let path = format!("{base_path}/{id:#04x}.db");
-                let mut shard = Shard::new(&path).expect("shard");
-                let handle = thread::spawn(move || loop {
-                    if let Ok((req, res_tx)) = rx.try_recv() {
-                        match req {
-                            Request::Lookup { key } => {
-                                let res = if let Some(val) = shard.lookup(&key).unwrap() {
-                                    Response::Value(val.to_vec())
-                                } else {
-                                    Response::Empty
-                                };
-                                res_tx.send(res).ok();
-                            }
-                            Request::Insert { key, val } => {
-                                shard.insert(&key, &val).unwrap();
-                                res_tx.send(Response::Empty).ok();
-                            }
-                            Request::Remove { key } => {
-                                shard.remove(&key).unwrap();
-                                res_tx.send(Response::Empty).ok();
-                            }
-                        }
-                    }
-                    if let Ok(_) = signal_rx.try_recv() {
-                        break;
-                    }
-                });
-                workers.push(Some(handle));
-                signals.push(signal_tx);
-                txs.push(tx);
-            }
+            let shards = (0..num_shards).into_iter()
+                .map(|id| format!("{base_path}/{id:#04x}.db"))
+                .map(|path| Shard::new(&path).unwrap())
+                .collect();
 
             Self {
                 num_shards,
-                signals,
-                workers,
-                txs,
+                shards,
             }
+        }
+
+        fn shard(&self, key: &[u8]) -> &Shard {
+            let id = key.last().cloned().unwrap_or_default() % self.num_shards;
+            self.shards.get(id as usize).unwrap()
         }
 
         pub fn lookup(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
-            let id = key.last().cloned().unwrap_or_default() % self.num_shards;
-            let (tx, rx) = channel();
-            let req = Request::Lookup { key: key.to_vec() };
-            self.txs[id as usize].send((req, tx)).unwrap();
-            loop {
-                let r = rx.try_recv();
-                if let Ok(res) = r {
-                    return Ok(res.value());
-                }
-            }
+            self.shard(key).lookup(key)
         }
 
         pub fn insert(&self, key: &[u8], val: &[u8]) -> Result<(), Error> {
-            let id = key.last().cloned().unwrap_or_default() % self.num_shards;
-            let (tx, rx) = channel();
-            let req = Request::Insert {
-                key: key.to_vec(),
-                val: val.to_vec(),
-            };
-            self.txs[id as usize].send((req, tx)).unwrap();
-            loop {
-                let r = rx.try_recv();
-                if let Ok(_) = r {
-                    return Ok(());
-                }
-            }
+            self.shard(key).insert(key, val)
         }
 
         pub fn remove(&self, key: &[u8]) -> Result<(), Error> {
-            let id = key.last().cloned().unwrap_or_default() % self.num_shards;
-            let (tx, rx) = channel();
-            let req = Request::Remove { key: key.to_vec() };
-            self.txs[id as usize].send((req, tx)).unwrap();
-            loop {
-                let r = rx.try_recv();
-                if let Ok(_) = r {
-                    return Ok(());
-                }
-            }
-        }
-    }
-
-    impl Drop for ShardedStore {
-        fn drop(&mut self) {
-            for signal in &self.signals {
-                signal.send(0).ok();
-            }
-            for handle in &mut self.workers {
-                handle.take().unwrap().join().ok();
-            }
+            self.shard(key).remove(key)
         }
     }
 }
@@ -374,11 +285,11 @@ mod sharded {
 struct Sharded(sharded::ShardedStore);
 
 impl Storage for Sharded {
-    fn insert(&mut self, key: &[u8], val: &[u8]) {
+    fn insert(&self, key: &[u8], val: &[u8]) {
         self.0.insert(key, val).ok();
     }
 
-    fn remove(&mut self, key: &[u8]) {
+    fn remove(&self, key: &[u8]) {
         self.0.remove(key).ok();
     }
 
@@ -390,12 +301,12 @@ impl Storage for Sharded {
 struct RocksStorage(rocksdb::DB);
 
 impl Storage for RocksStorage {
-    fn insert(&mut self, key: &[u8], val: &[u8]) {
+    fn insert(&self, key: &[u8], val: &[u8]) {
         self.0.put(key, val).unwrap();
         //self.0.flush().unwrap();
     }
 
-    fn remove(&mut self, key: &[u8]) {
+    fn remove(&self, key: &[u8]) {
         self.0.delete(key).unwrap();
         //self.0.flush().unwrap();
     }
@@ -427,14 +338,28 @@ fn main() {
         benchmark(SelfStorage(file), count);
     }
 
-    if target == "sharded" {
+    if target == "lskv" {
+        let path = "target/yalskv";
+        std::fs::remove_dir_all(path).ok();
+        std::fs::create_dir(path).ok();
+
+        let db = yalskv::Store::open("target/yalskv").unwrap();
+        info!(
+            "target={} file={:?} count={}",
+            target, path, count
+        );
+
+        benchmark(LSKV(RefCell::new(db)), count);
+    }
+
+    if target == "shrd" {
         let path = "target/shards";
         std::fs::remove_dir_all(path).ok();
         std::fs::create_dir(path).ok();
         let num_shards: u8 = std::env::var("SHARDS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(4);
+            .unwrap_or(16);
         let sharded = sharded::ShardedStore::new(num_shards, path);
         info!(
             "target={} file={:?} count={} shards={}",
