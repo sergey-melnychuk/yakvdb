@@ -524,6 +524,9 @@ impl<P: Page> Store for File<P> {
         if page.len() == 0 {
             return Ok(None);
         }
+        if page.max() < key {
+            return Ok(None);
+        }
         loop {
             let idx = page.ceil(key).unwrap();
             let slot = page.slot(idx).unwrap();
@@ -575,6 +578,9 @@ impl<P: Page> Store for File<P> {
         let mut page = self.root();
         if page.len() == 0 {
             return Ok(None);
+        }
+        if page.max() < key {
+            return Ok(Some(page.max().to_vec()));
         }
         loop {
             let idx = page.ceil(key).unwrap();
@@ -1149,7 +1155,7 @@ mod tests {
             let mut result = (0..count)
                 .into_iter()
                 .map(|i| {
-                    let b = i * count as u8;
+                    let b = (i + 1) * count as u8;
                     (vec![b; 8], vec![b; 8])
                 })
                 .collect::<Vec<_>>();
@@ -1187,6 +1193,11 @@ mod tests {
             asc,
             data.clone().into_iter().map(|(k, _)| k).collect::<Vec<_>>()
         );
+
+        assert_eq!(file.above(&max).unwrap(), None);
+        let mut max = max;
+        *max.last_mut().unwrap() += 1;
+        assert_eq!(file.above(&max).unwrap(), None);
     }
 
     #[test]
@@ -1205,7 +1216,7 @@ mod tests {
             let mut result = (0..count)
                 .into_iter()
                 .map(|i| {
-                    let b = i * count as u8;
+                    let b = (i + 1) * count as u8;
                     (vec![b; 8], vec![b; 8])
                 })
                 .collect::<Vec<_>>();
@@ -1244,6 +1255,11 @@ mod tests {
             desc,
             data.clone().into_iter().map(|(k, _)| k).collect::<Vec<_>>()
         );
+
+        assert_eq!(file.below(&min).unwrap(), None);
+        let mut min = min;
+        *min.last_mut().unwrap() -= 1;
+        assert_eq!(file.below(&min).unwrap(), None);
     }
 
     #[test]
