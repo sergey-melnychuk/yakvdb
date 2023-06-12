@@ -336,6 +336,7 @@ fn main() {
         );
 
         benchmark(SelfStorage(file), count);
+        std::fs::remove_file(path).ok();
     }
 
     if target == "lskv" {
@@ -350,6 +351,7 @@ fn main() {
         );
 
         benchmark(LSKV(RefCell::new(db)), count);
+        std::fs::remove_dir_all(path).ok();
     }
 
     if target == "shrd" {
@@ -367,6 +369,7 @@ fn main() {
         );
 
         benchmark(Sharded(sharded), count);
+        std::fs::remove_dir_all(path).ok();
     }
 
     if target == "sled" {
@@ -377,6 +380,7 @@ fn main() {
         info!("target={} file={} count={}", target, path, count);
 
         benchmark(SledStorage(db), count);
+        std::fs::remove_dir_all(path).ok();
     }
 
     if target == "rock" {
@@ -387,5 +391,6 @@ fn main() {
         info!("target={} file={} count={}", target, path, count);
 
         benchmark(RocksStorage(db), count);
+        std::fs::remove_dir_all(path).ok();
     }
 }
