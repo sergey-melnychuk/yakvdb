@@ -298,24 +298,6 @@ impl Storage for Sharded {
     }
 }
 
-struct RocksStorage(rocksdb::DB);
-
-impl Storage for RocksStorage {
-    fn insert(&self, key: &[u8], val: &[u8]) {
-        self.0.put(key, val).unwrap();
-        //self.0.flush().unwrap();
-    }
-
-    fn remove(&self, key: &[u8]) {
-        self.0.delete(key).unwrap();
-        //self.0.flush().unwrap();
-    }
-
-    fn lookup(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.0.get(key).unwrap()
-    }
-}
-
 fn main() {
     env_logger::init();
     let mut it = std::env::args().skip(1);
@@ -380,17 +362,6 @@ fn main() {
         info!("target={} file={} count={}", target, path, count);
 
         benchmark(SledStorage(db), count);
-        std::fs::remove_dir_all(path).ok();
-    }
-
-    if target == "rock" {
-        let path = "target/rocks_1M";
-        std::fs::remove_dir_all(path).ok();
-        std::fs::create_dir(path).ok();
-        let db = rocksdb::DB::open_default(path).unwrap();
-        info!("target={} file={} count={}", target, path, count);
-
-        benchmark(RocksStorage(db), count);
         std::fs::remove_dir_all(path).ok();
     }
 }

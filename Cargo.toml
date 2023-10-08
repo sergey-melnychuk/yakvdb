@@ -28,5 +28,4 @@ yalskv = "0.1.0"
 [dev-dependencies]
 sled = "0.34.7"
 tokio = { version = "1.26.0", features = ["rt-multi-thread", "sync", "macros"] }
-rocksdb = "0.20.1"
 hex = "0.4.3"
