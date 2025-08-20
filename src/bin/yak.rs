@@ -2,7 +2,6 @@ use std::path::Path;
 use std::io::{self, Write};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
-use atty;
 use crossterm::{
     event::{self, Event, KeyCode},
     terminal::{disable_raw_mode, enable_raw_mode},
@@ -22,7 +21,7 @@ fn paginated_print(lines: &[String], lines_per_page: usize) {
         let mut handle = stdout.lock();
         for line in lines {
             // Handle broken pipe gracefully (when piped to head, less, etc.)
-            if writeln!(handle, "{}", line).is_err() {
+            if writeln!(handle, "{line}").is_err() {
                 return; // Exit silently on broken pipe
             }
         }
@@ -34,7 +33,7 @@ fn paginated_print(lines: &[String], lines_per_page: usize) {
         let stdout = io::stdout();
         let mut handle = stdout.lock();
         for line in lines {
-            if writeln!(handle, "{}", line).is_err() {
+            if writeln!(handle, "{line}").is_err() {
                 return; // Exit silently on broken pipe
             }
         }
@@ -46,7 +45,7 @@ fn paginated_print(lines: &[String], lines_per_page: usize) {
     let mut handle = stdout.lock();
     for chunk in lines.chunks(lines_per_page) {
         for line in chunk {
-            if writeln!(handle, "{}", line).is_err() {
+            if writeln!(handle, "{line}").is_err() {
                 return; // Exit silently on broken pipe
             }
         }
@@ -133,7 +132,7 @@ fn main() {
         if arg.starts_with("0x") || arg.starts_with("0X") {
             hex::decode(&arg[2..]).ok()
         } else if (arg.starts_with('"') && arg.ends_with('"')) || (arg.starts_with('\'') && arg.ends_with('\'')) {
-            Some(arg[1..arg.len()-1].as_bytes().to_vec())
+            Some(arg.as_bytes()[1..arg.len()-1].to_vec())
         } else {
             Some(arg.as_bytes().to_vec())
         }
@@ -155,19 +154,17 @@ fn main() {
                 } else {
                     current.push(c);
                 }
-            } else {
-                if c == '"' || c == '\'' {
-                    in_quotes = true;
-                    quote_char = c;
-                    current.push(c);
-                } else if c.is_whitespace() {
-                    if !current.is_empty() {
-                        args.push(current.clone());
-                        current.clear();
-                    }
-                } else {
-                    current.push(c);
+            } else if c == '"' || c == '\'' {
+                in_quotes = true;
+                quote_char = c;
+                current.push(c);
+            } else if c.is_whitespace() {
+                if !current.is_empty() {
+                    args.push(current.clone());
+                    current.clear();
                 }
+            } else {
+                current.push(c);
             }
         }
         if !current.is_empty() {
@@ -225,7 +222,7 @@ fn main() {
                             println!("Key not found");
                         }
                         Err(e) => {
-                            println!("Error: {:?}", e);
+                            println!("Error: {e:?}");
                         }
                     }
                 } else {
@@ -253,7 +250,7 @@ fn main() {
                 };
                 match file.insert(&key_bytes, &val_bytes) {
                     Ok(()) => println!("OK"),
-                    Err(e) => println!("Error: {:?}", e),
+                    Err(e) => println!("Error: {e:?}"),
                 }
             }
             "remove" => {
@@ -264,7 +261,7 @@ fn main() {
                 if let Some(key_bytes) = parse_arg_bytes(&args[1]) {
                     match file.remove(&key_bytes) {
                         Ok(()) => println!("OK"),
-                        Err(e) => println!("Error: {:?}", e),
+                        Err(e) => println!("Error: {e:?}"),
                     }
                 } else {
                     println!("Invalid key format");
@@ -279,7 +276,7 @@ fn main() {
                         }
                     }
                     Ok(None) => println!("No minimum key (empty database)"),
-                    Err(e) => println!("Error: {:?}", e),
+                    Err(e) => println!("Error: {e:?}"),
                 }
             }
             "max" => {
@@ -291,7 +288,7 @@ fn main() {
                         }
                     }
                     Ok(None) => println!("No maximum key (empty database)"),
-                    Err(e) => println!("Error: {:?}", e),
+                    Err(e) => println!("Error: {e:?}"),
                 }
             }
             "len" | "size" | "count" => {
@@ -308,16 +305,16 @@ fn main() {
                                 }
                                 Ok(None) => break, // No more keys
                                 Err(e) => {
-                                    println!("Error during iteration: {:?}", e);
+                                    println!("Error during iteration: {e:?}");
                                     return;
                                 }
                             }
                         }
                         
-                        println!("Total entries: {}", count);
+                        println!("Total entries: {count}");
                     }
                     Ok(None) => println!("Total entries: 0 (empty database)"),
-                    Err(e) => println!("Error: {:?}", e),
+                    Err(e) => println!("Error: {e:?}"),
                 }
             }
             "from" => {
@@ -358,7 +355,7 @@ fn main() {
                                             }
                                             Ok(None) => break, // No more entries
                                             Err(e) => {
-                                                println!("Error during iteration: {:?}", e);
+                                                println!("Error during iteration: {e:?}");
                                                 break;
                                             }
                                         }
@@ -369,7 +366,7 @@ fn main() {
                                 println!("No entries found after the given key");
                             }
                             Err(e) => {
-                                println!("Error: {:?}", e);
+                                println!("Error: {e:?}");
                             }
                         }
                     } else {
@@ -417,7 +414,7 @@ fn main() {
                                             }
                                             Ok(None) => break,
                                             Err(e) => {
-                                                println!("Error during iteration: {:?}", e);
+                                                println!("Error during iteration: {e:?}");
                                                 return;
                                             }
                                         }
@@ -443,7 +440,7 @@ fn main() {
                                 }
                             }
                             Ok(None) => println!("Database is empty"),
-                            Err(e) => println!("Error: {:?}", e),
+                            Err(e) => println!("Error: {e:?}"),
                         }
                     } else {
                         println!("Invalid number: {}", args[2]);
@@ -466,7 +463,7 @@ fn main() {
                             }
                         }
                         Ok(None) => println!("No key above the given key"),
-                        Err(e) => println!("Error: {:?}", e),
+                        Err(e) => println!("Error: {e:?}"),
                     }
                 } else {
                     println!("Invalid key format");
@@ -486,7 +483,7 @@ fn main() {
                             }
                         }
                         Ok(None) => println!("No key below the given key"),
-                        Err(e) => println!("Error: {:?}", e),
+                        Err(e) => println!("Error: {e:?}"),
                     }
                 } else {
                     println!("Invalid key format");
@@ -498,17 +495,17 @@ fn main() {
                         Mode::Str => "str",
                         Mode::Hex => "hex",
                     };
-                    println!("Current mode: '{}'.", m);
+                    println!("Current mode: '{m}'.");
                     println!("Usage: mode <str|hex>");
                     continue;
                 }
                 let m = args[1].to_lowercase();
                 if m == "str" {
                     mode = Mode::Str;
-                    println!("Mode set to '{}'.", m);
+                    println!("Mode set to '{m}'.");
                 } else if m == "hex" {
                     mode = Mode::Hex;
-                    println!("Mode set to '{}'.", m);
+                    println!("Mode set to '{m}'.");
                 } else {
                     println!("Unknown mode '{}'. Use 'str' or 'hex'.", args[1]);
                 }
@@ -537,7 +534,7 @@ fn main() {
                 let file_len = match std::fs::metadata(path) {
                     Ok(metadata) => metadata.len(),
                     Err(e) => {
-                        println!("Error reading file metadata: {}", e);
+                        println!("Error reading file metadata: {e}");
                         continue;
                     }
                 };
@@ -567,9 +564,9 @@ fn main() {
                                 Mode::Str => format!("\"{}\"", String::from_utf8_lossy(page.max())),
                             };
                             if min_key == max_key {
-                                format!("{}", min_key)
+                                min_key.to_string()
                             } else {
-                                format!("{}..{}", min_key, max_key)
+                                format!("{min_key}..{max_key}")
                             }
                         } else {
                             "empty".to_string()
@@ -581,7 +578,7 @@ fn main() {
                             key_range
                         };
                                                 
-                        output_lines.push(format!("{:<6} {:<8} {:<6} {:<20}", id, page_type, fill_percent, truncated_range));
+                        output_lines.push(format!("{id:<6} {page_type:<8} {fill_percent:<6} {truncated_range:<20}"));
                     }
                 }
                 
@@ -612,8 +609,8 @@ fn main() {
                         
                         println!("Page Details:");
                         println!("=============");
-                        println!("ID: {}", page_id);
-                        println!("Type: {}", page_type);
+                        println!("ID: {page_id}");
+                        println!("Type: {page_type}");
                         println!("Fill: {}%", page.full());
                         println!("Capacity: {} bytes", page.cap());
                         println!("Free: {} bytes", page.free());
@@ -652,18 +649,18 @@ fn main() {
                                 };
 
                                 let val_or_page_ref = if *page_ref > 0 {
-                                    format!("[PAGE: {}]", page_ref)
+                                    format!("[PAGE: {page_ref}]")
                                 } else {
                                     truncated_val
                                 };
                                 
-                                println!("{:<4} {:<20} {:<20}", i, truncated_key, val_or_page_ref);
+                                println!("{i:<4} {truncated_key:<20} {val_or_page_ref:<20}");
                             }
                         } else {
                             println!("\nPage is empty");
                         }
                     } else {
-                        println!("Page {} not found or cannot be loaded", page_id);
+                        println!("Page {page_id} not found or cannot be loaded");
                     }
                 } else {
                     println!("Invalid page ID: {}", args[1]);
@@ -687,7 +684,7 @@ fn main() {
                 
                 println!("Root Page (ID: 1):");
                 println!("==================");
-                println!("Type: {}", page_type);
+                println!("Type: {page_type}");
                 println!("Fill: {}%", root_page.full());
                 println!("Capacity: {} bytes", root_page.cap());
                 println!("Free: {} bytes", root_page.free());
@@ -726,12 +723,12 @@ fn main() {
                         };
 
                         let val_or_page_ref = if *page_ref > 0 {
-                            format!("[PAGE: {}]", page_ref)
+                            format!("[PAGE: {page_ref}]")
                         } else {
                             truncated_val
                         };
                         
-                        println!("{:<4} {:<20} {:<20}", i, truncated_key, val_or_page_ref);
+                        println!("{i:<4} {truncated_key:<20} {val_or_page_ref:<20}");
                     }
                 } else {
                     println!("\nRoot page is empty");
@@ -779,7 +776,7 @@ fn main() {
                 break;
             }
             Err(err) => {
-                println!("Error: {:?}", err);
+                println!("Error: {err:?}");
                 break;
             }
         }

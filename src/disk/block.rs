@@ -41,7 +41,6 @@ impl Block {
         let idx = self.ceil(key).unwrap_or(size);
 
         let mut slots = (0..size)
-            .into_iter()
             .filter_map(|idx| self.slot(idx))
             .collect::<Vec<_>>();
 
@@ -150,7 +149,6 @@ impl Page for Block {
         }
         let lo = HEAD as u32 + size * SLOT as u32;
         let hi = (0..size)
-            .into_iter()
             .filter_map(|idx| self.slot(idx))
             .map(|slot| slot.offset)
             .min()
@@ -212,7 +210,6 @@ impl Page for Block {
         }
 
         let mut slots = (0..size)
-            .into_iter()
             .filter_map(|idx| self.slot(idx))
             .collect::<Vec<_>>();
 
@@ -254,7 +251,6 @@ impl Page for Block {
 
     fn copy(&self) -> Vec<(Vec<u8>, Vec<u8>, u32)> {
         (0..self.len())
-            .into_iter()
             .filter_map(|idx| self.slot(idx))
             .map(|slot| {
                 (
@@ -346,7 +342,6 @@ mod tests {
         let len = size * size_of::<u64>() * 4;
 
         let mut keys = (0..size)
-            .into_iter()
             .map(|_| rng.gen::<u64>().to_be_bytes().to_vec())
             .collect::<Vec<_>>();
 
@@ -363,7 +358,6 @@ mod tests {
         keys.sort();
 
         let read = (0..size)
-            .into_iter()
             .map(|idx| page.key(idx as u32).to_vec())
             .collect::<Vec<_>>();
 
@@ -378,7 +372,6 @@ mod tests {
         let len = size * size_of::<u64>() * 10;
 
         let keys = (0..size)
-            .into_iter()
             .map(|_| rng.gen::<u64>())
             .collect::<HashSet<_>>();
 
@@ -412,7 +405,6 @@ mod tests {
         let len = size * size_of::<u64>() * 10;
 
         let keys = (0..size)
-            .into_iter()
             .map(|_| {
                 let x = rng.gen::<u64>();
                 x - (x % 100)
@@ -494,7 +486,6 @@ mod tests {
         assert_eq!(page.put_ref(k3, p3), Some(2));
 
         let slots = (0..page.len())
-            .into_iter()
             .filter_map(|idx| page.slot(idx))
             .collect::<Vec<_>>();
 

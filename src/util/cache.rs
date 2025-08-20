@@ -10,8 +10,6 @@ pub(crate) trait Cache<K: Clone + Eq + PartialEq + Hash, V> {
     fn get(&self, key: &K) -> Option<&V>;
     fn get_mut(&mut self, key: &K) -> Option<&mut V>;
     fn put(&mut self, key: K, value: V);
-    fn len(&self) -> usize;
-    fn keys(&self) -> Vec<K>;
 }
 
 pub(crate) struct LruCache<K, V> {
@@ -83,17 +81,9 @@ impl<K: Clone + Hash + Eq + Display, V> Cache<K, V> for LruCache<K, V> {
     fn put(&mut self, key: K, value: V) {
         if let Some(evicted) = self.touch(&key) {
             self.map.remove(&evicted);
-            debug!("Evicted page {}", evicted);
+            debug!("Evicted page {evicted}");
         }
         self.map.insert(key, value);
-    }
-
-    fn len(&self) -> usize {
-        self.map.len()
-    }
-
-    fn keys(&self) -> Vec<K> {
-        self.map.keys().into_iter().cloned().collect()
     }
 }
 
@@ -109,7 +99,7 @@ mod tests {
         cache.put(3, 0);
         cache.put(4, 0);
 
-        let mut keys = cache.keys();
+        let mut keys = cache.map.keys().cloned().collect::<Vec<_>>();
         keys.sort();
         assert_eq!(keys, vec![2, 3, 4]);
     }

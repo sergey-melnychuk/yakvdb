@@ -50,14 +50,14 @@ struct Head {
 impl<P: Page> File<P> {
     pub fn make(path: &Path, page_bytes: u32) -> io::Result<Self> {
         if path.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("File exists: {:?}", path),
+            return Err(io::Error::other(
+                format!("File exists: {path:?}"),
             ));
         }
 
         let mut file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .write(true)
             .read(true)
             .open(path)?;
@@ -90,13 +90,14 @@ impl<P: Page> File<P> {
     pub fn open(path: &Path) -> io::Result<Self> {
         let mut file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(path)?;
 
         let len = file.metadata()?.len() as usize;
         if len < HEAD {
-            return Err(io::Error::new(io::ErrorKind::Other, "File too short"));
+            return Err(io::Error::other("File too short"));
         }
 
         let mut buf = BytesMut::with_capacity(HEAD);
@@ -106,9 +107,8 @@ impl<P: Page> File<P> {
         let mut magic = [0u8; 8];
         buf.copy_to_slice(&mut magic);
         if magic != MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("MAGIC mismatch: {:?}", magic),
+            return Err(io::Error::other(
+                format!("MAGIC mismatch: {magic:?}"),
             ));
         }
 
@@ -118,15 +118,13 @@ impl<P: Page> File<P> {
         };
 
         if head.page_bytes > u16::MAX as u32 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 format!("Page size too large: {}", head.page_bytes),
             ));
         }
 
         if len < HEAD + head.page_bytes as usize {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "File does not contain one full page".to_string(),
             ));
         }
@@ -145,17 +143,17 @@ impl<P: Page> File<P> {
         this.cache.write().put(ROOT, root);
 
         let total_pages = (len - HEAD) as u32 / this.head.page_bytes;
-        debug!("Processing pages for compaction: {}", total_pages);
+        debug!("Processing pages for compaction: {total_pages}");
         if this.head.page_count < total_pages {
             for id in 2..=total_pages {
                 // skipping the root page (id=1)
                 if let Ok(page) = this.load(this.offset(id), this.head.page_bytes) {
                     if page.len() == 0 {
-                        debug!("Page id={} is empty", id);
+                        debug!("Page id={id} is empty");
                         this.empty.write().push(Reverse(id));
                     }
                 } else {
-                    error!("Page failed to load: id={}", id);
+                    error!("Page failed to load: id={id}");
                 }
             }
         }
@@ -202,7 +200,7 @@ impl<P: Page> Store for File<P> {
 
             let slot_opt = page.slot(idx);
             if slot_opt.is_none() {
-                return Err(Error::Tree(page.id(), format!("Slot not found: {}", idx)));
+                return Err(Error::Tree(page.id(), format!("Slot not found: {idx}")));
             }
             let slot = slot_opt.unwrap();
 
@@ -273,7 +271,7 @@ impl<P: Page> Store for File<P> {
 
             let slot_opt = page.slot(idx);
             if slot_opt.is_none() {
-                return Err(Error::Tree(page.id(), format!("Slot not found: {}", idx)));
+                return Err(Error::Tree(page.id(), format!("Slot not found: {idx}")));
             }
             let slot = slot_opt.unwrap();
 
@@ -298,8 +296,8 @@ impl<P: Page> Store for File<P> {
                     self.split(id, parent_id)?;
                 }
 
-                while !path.is_empty() {
-                    let (page_id, _) = path.pop().unwrap();
+                while let Some((page_id, _)) = path.pop() {
+                    
                     let (parent_id, _) = path.last().cloned().unwrap_or_default();
                     let full = {
                         let page = self.page(page_id).unwrap();
@@ -318,7 +316,7 @@ impl<P: Page> Store for File<P> {
                 if seen.contains(&slot.page) {
                     return Err(Error::Tree(
                         id,
-                        format!("Cyclic reference detected: {:?}", path),
+                        format!("Cyclic reference detected: {path:?}"),
                     ));
                 }
 
@@ -349,7 +347,7 @@ impl<P: Page> Store for File<P> {
 
             let slot_opt = page.slot(idx);
             if slot_opt.is_none() {
-                return Err(Error::Tree(page.id(), format!("Slot not found: {}", idx)));
+                return Err(Error::Tree(page.id(), format!("Slot not found: {idx}")));
             }
             let slot = slot_opt.unwrap();
 
@@ -393,10 +391,7 @@ impl<P: Page> Store for File<P> {
                         };
                         if let Some(peer_id) = peer_id {
                             trace!(
-                                "merge: found peer_id={} to merge page_id={} (parent_id={})",
-                                peer_id,
-                                page_id,
-                                parent_id
+                                "merge: found peer_id={peer_id} to merge page_id={page_id} (parent_id={parent_id})"
                             );
                             let peer_max = {
                                 let peer = self.page(peer_id).unwrap();
@@ -406,7 +401,7 @@ impl<P: Page> Store for File<P> {
                             let mut parent = self.page_mut(parent_id).unwrap();
                             parent.remove(idx);
                             let peer_idx = parent.ceil(&peer_max).unwrap();
-                            trace!("\t merge: parent remove: peer_idx={} idx={}", peer_idx, idx);
+                            trace!("\t merge: parent remove: peer_idx={peer_idx} idx={idx}");
                             parent.remove(peer_idx);
                             drop(parent);
 
@@ -663,10 +658,10 @@ impl<P: Page> Tree<P> for File<P> {
         for id in pages {
             if let Some(page) = self.page(id) {
                 self.save(page.deref())?;
-                debug!("flush: page={}", id);
+                debug!("flush: page={id}");
             } else {
                 failed.push(id);
-                error!("flush: no such page={}", id);
+                error!("flush: no such page={id}");
             }
         }
 
@@ -675,10 +670,10 @@ impl<P: Page> Tree<P> for File<P> {
         } else {
             let pages = failed
                 .into_iter()
-                .map(|id| format!("{}", id))
+                .map(|id| format!("{id}"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            Err(Error::Other(format!("Missing pages: {}", pages)))
+            Err(Error::Other(format!("Missing pages: {pages}")))
         }
     }
 
@@ -713,8 +708,7 @@ impl<P: Page> Tree<P> for File<P> {
             let lo_id = self.next_id()?;
             let hi_id = self.next_id()?;
             debug!(
-                "split: root={} into lo={} and hi={} (parent={})",
-                id, lo_id, hi_id, parent_id
+                "split: root={id} into lo={lo_id} and hi={hi_id} (parent={parent_id})"
             );
 
             let (copy, lo_max, hi_max) = {
@@ -781,8 +775,7 @@ impl<P: Page> Tree<P> for File<P> {
             let half = copy.len() / 2;
             let peer_id = self.next_id()?;
             debug!(
-                "split: page={} into peer={} (parent={})",
-                id, peer_id, parent_id
+                "split: page={id} into peer={peer_id} (parent={parent_id})"
             );
 
             let page_max = {
@@ -860,9 +853,7 @@ impl<P: Page> Tree<P> for File<P> {
 
         if parent_ref != page_id {
             log::error!(
-                "parent_ref != page_id: parent_ref={} page_id={}",
-                parent_ref,
-                page_id,
+                "parent_ref != page_id: parent_ref={parent_ref} page_id={page_id}",
             );
             return Err(Error::Tree(
                 parent_id,
@@ -874,7 +865,7 @@ impl<P: Page> Tree<P> for File<P> {
     }
 
     fn merge(&self, src_id: u32, dst_id: u32) -> Result<()> {
-        debug!("merge: src={} into dst={}", src_id, dst_id);
+        debug!("merge: src={src_id} into dst={dst_id}");
         let src_copy = {
             let page = self.page(src_id).unwrap();
             page.copy()
@@ -927,7 +918,7 @@ impl<P: Page> Tree<P> for File<P> {
             let full = page.full();
 
             acc.push_str(&if copy.is_empty() {
-                format!("{}page={}: empty", prefix, page_id)
+                format!("{prefix}page={page_id}: empty")
             } else {
                 let entries = copy
                     .iter()
@@ -935,8 +926,7 @@ impl<P: Page> Tree<P> for File<P> {
                     .collect::<Vec<_>>()
                     .join("\n");
                 format!(
-                    "{}page={}: (parent={}) {}% full\n{}",
-                    prefix, page_id, parent_id, full, entries
+                    "{prefix}page={page_id}: (parent={parent_id}) {full}% full\n{entries}"
                 )
             });
 
@@ -1029,11 +1019,9 @@ mod tests {
         }
         let size: u32 = 256;
 
-        let data = vec![
-            (b"uno".to_vec(), b"la squadra azzurra".to_vec()),
+        let data = [(b"uno".to_vec(), b"la squadra azzurra".to_vec()),
             (b"due".to_vec(), b"it's coming home".to_vec()),
-            (b"tre".to_vec(), b"red devils".to_vec()),
-        ];
+            (b"tre".to_vec(), b"red devils".to_vec())];
 
         let file: File<Block> = File::make(path, size).unwrap();
 
@@ -1066,9 +1054,8 @@ mod tests {
 
         let count = 25;
         let data = (0..count)
-            .into_iter()
             .map(|i| {
-                let c = 'a' as u8 + (i % ('z' as u8 - 'a' as u8 + 1) as u8 as u64) as u8;
+                let c = b'a' + (i % ((b'z' - b'a' + 1)) as u64) as u8;
                 (vec![c; 8], vec![c; 8])
             })
             .collect::<Vec<_>>();
@@ -1096,9 +1083,8 @@ mod tests {
         let data = {
             let mut rng = StdRng::seed_from_u64(3);
             let mut result = (0..count)
-                .into_iter()
                 .map(|i| {
-                    let c = 'a' as u8 + (i % ('z' as u8 - 'a' as u8 + 1) as u8 as u64) as u8;
+                    let c = b'a' + (i % ((b'z' - b'a' + 1)) as u64) as u8;
                     (vec![c; 8], vec![c; 8])
                 })
                 .collect::<Vec<_>>();
@@ -1153,9 +1139,8 @@ mod tests {
         let mut data = {
             let mut rng = StdRng::seed_from_u64(3);
             let mut result = (0..count)
-                .into_iter()
                 .map(|i| {
-                    let b = (i + 1) * count as u8;
+                    let b = (i + 1) * count;
                     (vec![b; 8], vec![b; 8])
                 })
                 .collect::<Vec<_>>();
@@ -1214,9 +1199,8 @@ mod tests {
         let mut data = {
             let mut rng = StdRng::seed_from_u64(3);
             let mut result = (0..count)
-                .into_iter()
                 .map(|i| {
-                    let b = (i + 1) * count as u8;
+                    let b = (i + 1) * count;
                     (vec![b; 8], vec![b; 8])
                 })
                 .collect::<Vec<_>>();

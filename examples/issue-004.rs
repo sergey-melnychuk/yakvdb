@@ -21,7 +21,6 @@ fn lines<P: AsRef<Path>>(path: P) -> io::Result<io::Lines<BufReader<File>>> {
 
 fn data<P: AsRef<Path>>(path: P) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
     Ok(lines(path)?
-        .into_iter()
         .flatten()
         .skip_while(|line| line.starts_with('#'))
         .filter_map(|line| {

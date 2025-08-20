@@ -113,7 +113,7 @@ fn benchmark<S: Storage>(storage: S, count: usize) {
         }
     }
     if errors > 0 {
-        error!("lookup errors: {}", errors);
+        error!("lookup errors: {errors}");
     }
 
     /*
@@ -252,7 +252,7 @@ mod sharded {
 
     impl ShardedStore {
         pub fn new(num_shards: u8, base_path: &str) -> Self {
-            let shards = (0..num_shards).into_iter()
+            let shards = (0..num_shards)
                 .map(|id| format!("{base_path}/{id:#04x}.db"))
                 .map(|path| Shard::new(&path).unwrap())
                 .collect();
@@ -313,8 +313,7 @@ fn main() {
         let size: u32 = 4096;
         let file: File<Block> = File::make(path, size).unwrap();
         info!(
-            "target={} file={:?} count={} page={}",
-            target, path, count, size
+            "target={target} file={path:?} count={count} page={size}"
         );
 
         benchmark(SelfStorage(file), count);
@@ -328,8 +327,7 @@ fn main() {
 
         let db = yalskv::Store::open("target/yalskv").unwrap();
         info!(
-            "target={} file={:?} count={}",
-            target, path, count
+            "target={target} file={path:?} count={count}"
         );
 
         benchmark(LSKV(RefCell::new(db)), count);
@@ -346,8 +344,7 @@ fn main() {
             .unwrap_or(16);
         let sharded = sharded::ShardedStore::new(num_shards, path);
         info!(
-            "target={} file={:?} count={} shards={}",
-            target, path, count, num_shards
+            "target={target} file={path:?} count={count} shards={num_shards}"
         );
 
         benchmark(Sharded(sharded), count);
@@ -359,7 +356,7 @@ fn main() {
         std::fs::remove_dir_all(path).ok();
         std::fs::create_dir(path).ok();
         let db: Db = sled::open(path).unwrap();
-        info!("target={} file={} count={}", target, path, count);
+        info!("target={target} file={path} count={count}");
 
         benchmark(SledStorage(db), count);
         std::fs::remove_dir_all(path).ok();
