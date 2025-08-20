@@ -10,7 +10,7 @@ repository = "https://github.com/sergey-melnychuk/yakvdb"
 documentation = "https://github.com/sergey-melnychuk/yakvdb"
 
 [features]
-default = ["typed"]
+default = []
 typed = ["dep:anyhow"]
 
 [profile.release]
@@ -24,8 +24,9 @@ env_logger = "0.9"
 parking_lot = "0.12"
 anyhow = { version = "1", optional = true }
 yalskv = "0.1.0"
+hex = "0.4.3"
+rustyline = "14.0"
 
 [dev-dependencies]
 sled = "0.34.7"
 tokio = { version = "1.26.0", features = ["rt-multi-thread", "sync", "macros"] }
-hex = "0.4.3"
