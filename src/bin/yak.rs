@@ -244,10 +244,7 @@ fn main() {
                                     match file.above(&current_key) {
                                         Ok(Some(next_key)) => {
                                             if let Ok(Some(value)) = file.lookup(&next_key) {
-                                                entries.push((
-                                                    next_key.clone(),
-                                                    value,
-                                                ));
+                                                entries.push((next_key.clone(), value));
                                             }
                                             current_key = next_key;
                                         }
@@ -298,10 +295,7 @@ fn main() {
                                     match file.below(&current_key) {
                                         Ok(Some(next_key)) => {
                                             if let Ok(Some(value)) = file.lookup(&next_key) {
-                                                entries.push((
-                                                    next_key.clone(),
-                                                    value,
-                                                ));
+                                                entries.push((next_key.clone(), value));
                                             }
                                             current_key = next_key;
                                         }
