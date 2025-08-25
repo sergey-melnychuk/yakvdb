@@ -231,71 +231,46 @@ fn main() {
                             println!("Usage: from <key> <number>");
                             continue;
                         }
-                        if let Some(start_key) = parse_arg_bytes(&args[1]) {
+                        if let Some(key) = parse_arg_bytes(&args[1]) {
                             if let Ok(number) = args[2].parse::<usize>() {
                                 if number == 0 {
                                     println!("Number must be greater than 0");
                                     continue;
                                 }
 
-                                // Start from the key above the given key (exclusive)
-                                match file.above(&start_key) {
-                                    Ok(Some(mut current_key)) => {
-                                        // Print the first entry
-                                        if let Ok(Some(value)) = file.lookup(&current_key) {
-                                            match mode {
-                                                Mode::Hex => println!(
-                                                    "0x{} : 0x{}",
-                                                    hex::encode(&current_key),
-                                                    hex::encode(&value)
-                                                ),
-                                                Mode::Str => println!(
-                                                    "\"{}\" : \"{}\"",
-                                                    String::from_utf8_lossy(&current_key),
-                                                    String::from_utf8_lossy(&value)
-                                                ),
+                                let mut entries = Vec::new();
+                                let mut current_key = key;
+                                while entries.len() < number {
+                                    match file.above(&current_key) {
+                                        Ok(Some(next_key)) => {
+                                            if let Ok(Some(value)) = file.lookup(&next_key) {
+                                                entries.push((
+                                                    next_key.clone(),
+                                                    value,
+                                                ));
                                             }
-
-                                            // Print remaining entries
-                                            for _ in 2..=number {
-                                                match file.above(&current_key) {
-                                                    Ok(Some(next_key)) => {
-                                                        if let Ok(Some(value)) =
-                                                            file.lookup(&next_key)
-                                                        {
-                                                            match mode {
-                                                                Mode::Hex => println!(
-                                                                    "0x{} : 0x{}",
-                                                                    hex::encode(&next_key),
-                                                                    hex::encode(&value)
-                                                                ),
-                                                                Mode::Str => println!(
-                                                                    "\"{}\" : \"{}\"",
-                                                                    String::from_utf8_lossy(
-                                                                        &next_key
-                                                                    ),
-                                                                    String::from_utf8_lossy(&value)
-                                                                ),
-                                                            }
-                                                            current_key = next_key;
-                                                        } else {
-                                                            break;
-                                                        }
-                                                    }
-                                                    Ok(None) => break, // No more entries
-                                                    Err(e) => {
-                                                        println!("Error during iteration: {e:?}");
-                                                        break;
-                                                    }
-                                                }
-                                            }
+                                            current_key = next_key;
+                                        }
+                                        Ok(None) => break,
+                                        Err(e) => {
+                                            println!("Error during iteration: {e:?}");
+                                            return;
                                         }
                                     }
-                                    Ok(None) => {
-                                        println!("No entries found after the given key");
-                                    }
-                                    Err(e) => {
-                                        println!("Error: {e:?}");
+                                }
+
+                                for (key, value) in entries.iter() {
+                                    match mode {
+                                        Mode::Hex => println!(
+                                            "0x{} : 0x{}",
+                                            hex::encode(key),
+                                            hex::encode(value)
+                                        ),
+                                        Mode::Str => println!(
+                                            "\"{}\" : \"{}\"",
+                                            String::from_utf8_lossy(key),
+                                            String::from_utf8_lossy(value)
+                                        ),
                                     }
                                 }
                             } else {
@@ -310,79 +285,47 @@ fn main() {
                             println!("Usage: till <key> <number>");
                             continue;
                         }
-                        if let Some(end_key) = parse_arg_bytes(&args[1]) {
+                        if let Some(key) = parse_arg_bytes(&args[1]) {
                             if let Ok(number) = args[2].parse::<usize>() {
                                 if number == 0 {
                                     println!("Number must be greater than 0");
                                     continue;
                                 }
 
-                                // Collect all keys up to but not including the end_key (exclusive)
                                 let mut entries = Vec::new();
-
-                                match file.min() {
-                                    Ok(Some(mut current_key)) => {
-                                        // Check if min key is < end_key (exclusive)
-                                        if current_key < end_key {
-                                            if let Ok(Some(value)) = file.lookup(&current_key) {
-                                                entries.push((current_key.clone(), value));
+                                let mut current_key = key;
+                                while entries.len() < number {
+                                    match file.below(&current_key) {
+                                        Ok(Some(next_key)) => {
+                                            if let Ok(Some(value)) = file.lookup(&next_key) {
+                                                entries.push((
+                                                    next_key.clone(),
+                                                    value,
+                                                ));
                                             }
-
-                                            // Continue until we reach the end_key (but don't include it)
-                                            loop {
-                                                match file.above(&current_key) {
-                                                    Ok(Some(next_key)) => {
-                                                        if next_key < end_key {
-                                                            if let Ok(Some(value)) =
-                                                                file.lookup(&next_key)
-                                                            {
-                                                                entries.push((
-                                                                    next_key.clone(),
-                                                                    value,
-                                                                ));
-                                                            }
-                                                            current_key = next_key;
-                                                        } else {
-                                                            break; // Stop when we reach or pass the end_key
-                                                        }
-                                                    }
-                                                    Ok(None) => break,
-                                                    Err(e) => {
-                                                        println!("Error during iteration: {e:?}");
-                                                        return;
-                                                    }
-                                                }
-                                            }
+                                            current_key = next_key;
                                         }
-
-                                        // Take the last 'number' entries
-                                        let start_idx = if entries.len() > number {
-                                            entries.len() - number
-                                        } else {
-                                            0
-                                        };
-
-                                        for (key, value) in entries.iter().skip(start_idx) {
-                                            match mode {
-                                                Mode::Hex => println!(
-                                                    "0x{} : 0x{}",
-                                                    hex::encode(key),
-                                                    hex::encode(value)
-                                                ),
-                                                Mode::Str => println!(
-                                                    "\"{}\" : \"{}\"",
-                                                    String::from_utf8_lossy(key),
-                                                    String::from_utf8_lossy(value)
-                                                ),
-                                            }
-                                        }
-
-                                        if entries.is_empty() {
-                                            println!("No entries found before the given key");
+                                        Ok(None) => break,
+                                        Err(e) => {
+                                            println!("Error during iteration: {e:?}");
+                                            return;
                                         }
                                     }
-                                    Ok(None) => println!("Database is empty"),
-                                    Err(e) => println!("Error: {e:?}"),
+                                }
+
+                                for (key, value) in entries.iter().rev() {
+                                    match mode {
+                                        Mode::Hex => println!(
+                                            "0x{} : 0x{}",
+                                            hex::encode(key),
+                                            hex::encode(value)
+                                        ),
+                                        Mode::Str => println!(
+                                            "\"{}\" : \"{}\"",
+                                            String::from_utf8_lossy(key),
+                                            String::from_utf8_lossy(value)
+                                        ),
+                                    }
                                 }
                             } else {
                                 println!("Invalid number: {}", args[2]);
