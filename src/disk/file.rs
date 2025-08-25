@@ -37,6 +37,7 @@ const MAGIC: &[u8] = b"YAKVDB42";
 const HEAD: usize = MAGIC.len() + size_of::<Head>();
 const ROOT: u32 = 1;
 
+// Percentage threshold for splitting (on insert) and merging (on delete) pages
 const SPLIT_THRESHOLD: u8 = 80;
 const MERGE_THRESHOLD: u8 = 20;
 
@@ -50,9 +51,7 @@ struct Head {
 impl<P: Page> File<P> {
     pub fn make(path: &Path, page_bytes: u32) -> io::Result<Self> {
         if path.exists() {
-            return Err(io::Error::other(
-                format!("File exists: {path:?}"),
-            ));
+            return Err(io::Error::other(format!("File exists: {path:?}")));
         }
 
         let mut file = OpenOptions::new()
@@ -107,9 +106,7 @@ impl<P: Page> File<P> {
         let mut magic = [0u8; 8];
         buf.copy_to_slice(&mut magic);
         if magic != MAGIC {
-            return Err(io::Error::other(
-                format!("MAGIC mismatch: {magic:?}"),
-            ));
+            return Err(io::Error::other(format!("MAGIC mismatch: {magic:?}")));
         }
 
         let head = Head {
@@ -118,9 +115,10 @@ impl<P: Page> File<P> {
         };
 
         if head.page_bytes > u16::MAX as u32 {
-            return Err(io::Error::other(
-                format!("Page size too large: {}", head.page_bytes),
-            ));
+            return Err(io::Error::other(format!(
+                "Page size too large: {}",
+                head.page_bytes
+            )));
         }
 
         if len < HEAD + head.page_bytes as usize {
@@ -183,6 +181,10 @@ impl<P: Page> File<P> {
 
     fn offset(&self, id: u32) -> usize {
         HEAD + (id - 1) as usize * self.head.page_bytes as usize
+    }
+
+    pub fn page_size(&self) -> u32 {
+        self.head.page_bytes
     }
 }
 
@@ -297,7 +299,6 @@ impl<P: Page> Store for File<P> {
                 }
 
                 while let Some((page_id, _)) = path.pop() {
-                    
                     let (parent_id, _) = path.last().cloned().unwrap_or_default();
                     let full = {
                         let page = self.page(page_id).unwrap();
@@ -707,9 +708,7 @@ impl<P: Page> Tree<P> for File<P> {
         if id == ROOT {
             let lo_id = self.next_id()?;
             let hi_id = self.next_id()?;
-            debug!(
-                "split: root={id} into lo={lo_id} and hi={hi_id} (parent={parent_id})"
-            );
+            debug!("split: root={id} into lo={lo_id} and hi={hi_id} (parent={parent_id})");
 
             let (copy, lo_max, hi_max) = {
                 let page = self.page(id).unwrap();
@@ -774,9 +773,7 @@ impl<P: Page> Tree<P> for File<P> {
             };
             let half = copy.len() / 2;
             let peer_id = self.next_id()?;
-            debug!(
-                "split: page={id} into peer={peer_id} (parent={parent_id})"
-            );
+            debug!("split: page={id} into peer={peer_id} (parent={parent_id})");
 
             let page_max = {
                 let mut page = self.page_mut(id).unwrap();
@@ -852,9 +849,7 @@ impl<P: Page> Tree<P> for File<P> {
         }
 
         if parent_ref != page_id {
-            log::error!(
-                "parent_ref != page_id: parent_ref={parent_ref} page_id={page_id}",
-            );
+            log::error!("parent_ref != page_id: parent_ref={parent_ref} page_id={page_id}",);
             return Err(Error::Tree(
                 parent_id,
                 "Parent entry ref does not match child page".to_string(),
@@ -925,9 +920,7 @@ impl<P: Page> Tree<P> for File<P> {
                     .map(|(k, v, p)| format!("{}{}, {}, {}", prefix, hex(k), hex(v), p))
                     .collect::<Vec<_>>()
                     .join("\n");
-                format!(
-                    "{prefix}page={page_id}: (parent={parent_id}) {full}% full\n{entries}"
-                )
+                format!("{prefix}page={page_id}: (parent={parent_id}) {full}% full\n{entries}")
             });
 
             acc.push('\n');
@@ -1019,9 +1012,11 @@ mod tests {
         }
         let size: u32 = 256;
 
-        let data = [(b"uno".to_vec(), b"la squadra azzurra".to_vec()),
+        let data = [
+            (b"uno".to_vec(), b"la squadra azzurra".to_vec()),
             (b"due".to_vec(), b"it's coming home".to_vec()),
-            (b"tre".to_vec(), b"red devils".to_vec())];
+            (b"tre".to_vec(), b"red devils".to_vec()),
+        ];
 
         let file: File<Block> = File::make(path, size).unwrap();
 
@@ -1055,7 +1050,7 @@ mod tests {
         let count = 25;
         let data = (0..count)
             .map(|i| {
-                let c = b'a' + (i % ((b'z' - b'a' + 1)) as u64) as u8;
+                let c = b'a' + (i % (b'z' - b'a' + 1) as u64) as u8;
                 (vec![c; 8], vec![c; 8])
             })
             .collect::<Vec<_>>();
@@ -1084,7 +1079,7 @@ mod tests {
             let mut rng = StdRng::seed_from_u64(3);
             let mut result = (0..count)
                 .map(|i| {
-                    let c = b'a' + (i % ((b'z' - b'a' + 1)) as u64) as u8;
+                    let c = b'a' + (i % (b'z' - b'a' + 1) as u64) as u8;
                     (vec![c; 8], vec![c; 8])
                 })
                 .collect::<Vec<_>>();

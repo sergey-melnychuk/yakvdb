@@ -215,7 +215,10 @@ fn benchmark<S: Storage>(storage: S, count: usize) {
 mod sharded {
     use std::io;
 
-    use yakvdb::{disk::{file::File, block::Block}, api::{error::Error, Store}};
+    use yakvdb::{
+        api::{error::Error, Store},
+        disk::{block::Block, file::File},
+    };
 
     struct Shard {
         file: File<Block>,
@@ -257,10 +260,7 @@ mod sharded {
                 .map(|path| Shard::new(&path).unwrap())
                 .collect();
 
-            Self {
-                num_shards,
-                shards,
-            }
+            Self { num_shards, shards }
         }
 
         fn shard(&self, key: &[u8]) -> &Shard {
@@ -312,9 +312,7 @@ fn main() {
         std::fs::remove_file(path).ok();
         let size: u32 = 4096;
         let file: File<Block> = File::make(path, size).unwrap();
-        info!(
-            "target={target} file={path:?} count={count} page={size}"
-        );
+        info!("target={target} file={path:?} count={count} page={size}");
 
         benchmark(SelfStorage(file), count);
         std::fs::remove_file(path).ok();
@@ -326,9 +324,7 @@ fn main() {
         std::fs::create_dir(path).ok();
 
         let db = yalskv::Store::open("target/yalskv").unwrap();
-        info!(
-            "target={target} file={path:?} count={count}"
-        );
+        info!("target={target} file={path:?} count={count}");
 
         benchmark(LSKV(RefCell::new(db)), count);
         std::fs::remove_dir_all(path).ok();
@@ -343,9 +339,7 @@ fn main() {
             .and_then(|s| s.parse().ok())
             .unwrap_or(16);
         let sharded = sharded::ShardedStore::new(num_shards, path);
-        info!(
-            "target={target} file={path:?} count={count} shards={num_shards}"
-        );
+        info!("target={target} file={path:?} count={count} shards={num_shards}");
 
         benchmark(Sharded(sharded), count);
         std::fs::remove_dir_all(path).ok();

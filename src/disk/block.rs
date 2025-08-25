@@ -22,7 +22,7 @@ impl AsRef<[u8]> for Block {
 const ID_OFFSET: usize = 0;
 const CAP_OFFSET: usize = 4;
 const SIZE_OFFSET: usize = 8;
-const RESERVED: u32 = 0xC0DE1542;
+const RESERVED: u32 = 0xC0DEFACE;
 
 impl Block {
     fn put_entry(&mut self, key: &[u8], val: &[u8], page: u32) -> Option<u32> {
@@ -371,9 +371,7 @@ mod tests {
         let size = 64;
         let len = size * size_of::<u64>() * 10;
 
-        let keys = (0..size)
-            .map(|_| rng.gen::<u64>())
-            .collect::<HashSet<_>>();
+        let keys = (0..size).map(|_| rng.gen::<u64>()).collect::<HashSet<_>>();
 
         let pairs = keys
             .iter()
