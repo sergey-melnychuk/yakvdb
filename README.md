@@ -8,9 +8,7 @@ PLAN:
     - the trait `Sync` is not implemented for `RefCell<...>`
 - [x] split `Tree` trait into pub KV-only and internal page-aware
   - to avoid leaking impl details leak into public API
-- [ ] iterator impl (feature `iter`)
-  - range lookup (returning an iterator)
-- [ ] CLI
+- [X] CLI
   - connect to a file and explore it
   - `lookup X64'00cafebabe'`
   - `insert X64'00cafebabe' X64'00deadbeef'`
@@ -21,9 +19,6 @@ PLAN:
   - `max`
   - `len` (iterate from `min` to `max`)
   - basic defragment/restore utilities
-- [ ] add async impl based on `tokio::fs`
-  - you can't go back to sync though
-  - somehow make feature switch to async?
 
 ---
 
