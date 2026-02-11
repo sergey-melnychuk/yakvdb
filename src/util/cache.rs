@@ -103,4 +103,21 @@ mod tests {
         keys.sort();
         assert_eq!(keys, vec![2, 3, 4]);
     }
+
+    #[test]
+    fn test_get_miss() {
+        let mut cache: LruCache<u32, u32> = LruCache::new(4);
+        assert!(!cache.has(&1));
+        assert!(cache.get(&1).is_none());
+        assert!(cache.get_mut(&1).is_none());
+
+        cache.put(1, 42);
+        assert!(cache.has(&1));
+        assert_eq!(cache.get(&1), Some(&42));
+        assert_eq!(cache.get_mut(&1), Some(&mut 42));
+
+        // Key that was never inserted
+        assert!(cache.get(&99).is_none());
+        assert!(cache.get_mut(&99).is_none());
+    }
 }

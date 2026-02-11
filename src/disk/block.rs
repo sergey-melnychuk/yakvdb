@@ -135,8 +135,9 @@ impl Page for Block {
     fn val(&self, idx: u32) -> &[u8] {
         self.slot(idx)
             .map(|slot| {
+                let vlen = slot.inline_vlen();
                 let at = slot.offset as usize + slot.klen as usize;
-                let to = at + slot.vlen as usize;
+                let to = at + vlen as usize;
                 &self.buf[at..to]
             })
             .unwrap_or_default()
@@ -148,6 +149,8 @@ impl Page for Block {
             return self.cap() - HEAD as u32;
         }
         let lo = HEAD as u32 + size * SLOT as u32;
+        // For overflow entries klen bytes are stored inline but no value bytes,
+        // so we only look at actual data offsets.
         let hi = (0..size)
             .filter_map(|idx| self.slot(idx))
             .map(|slot| slot.offset)
@@ -203,6 +206,50 @@ impl Page for Block {
         self.put_entry(key, &[], page)
     }
 
+    fn put_overflow(&mut self, key: &[u8], overflow_page: u32, raw_vlen: u32) -> Option<u32> {
+        // Overflow entries store only the key inline (no value bytes).
+        // The vlen field carries OVERFLOW_FLAG | multiplier.
+        if !self.fits(key.len() as u32) {
+            return None;
+        }
+
+        let ceil_opt = self.ceil(key);
+        if let Some(idx) = &ceil_opt {
+            if self.key(*idx) == key {
+                self.remove(*idx);
+            }
+        }
+
+        let size = self.len();
+        let idx = self.ceil(key).unwrap_or(size);
+
+        let mut slots = (0..size)
+            .filter_map(|idx| self.slot(idx))
+            .collect::<Vec<_>>();
+
+        let klen = key.len() as u32;
+        let end = slots
+            .iter()
+            .map(|slot| slot.offset)
+            .min()
+            .unwrap_or_else(|| self.cap());
+        let offset = end - klen;
+        let slot = Slot::new(offset, klen, raw_vlen, overflow_page);
+
+        slots.insert(idx as usize, slot);
+        slots
+            .into_iter()
+            .enumerate()
+            .for_each(|(idx, slot)| put_slot(&mut self.buf, idx as u32, &slot));
+
+        let n = self.len() + 1;
+        put_size(&mut self.buf, n);
+
+        put_slice(&mut self.buf, offset as usize, key);
+
+        Some(idx)
+    }
+
     fn remove(&mut self, idx: u32) {
         let size = self.len();
         if idx >= size {
@@ -214,12 +261,13 @@ impl Page for Block {
             .collect::<Vec<_>>();
 
         let removed = slots.remove(idx as usize);
-        let blank = vec![0u8; (removed.klen + removed.vlen) as usize];
+        let inline_bytes = removed.klen + removed.inline_vlen();
+        let blank = vec![0u8; inline_bytes as usize];
         put_slice(&mut self.buf, removed.offset as usize, &blank);
 
         put_size(&mut self.buf, size - 1);
 
-        let total: u32 = slots.iter().map(|slot| slot.klen + slot.vlen).sum();
+        let total: u32 = slots.iter().map(|slot| slot.klen + slot.inline_vlen()).sum();
         let mut offset = self.cap() - total;
 
         let copy = slots
@@ -249,7 +297,7 @@ impl Page for Block {
             .for_each(|(idx, slot)| put_slot(&mut self.buf, idx as u32, &slot));
     }
 
-    fn copy(&self) -> Vec<(Vec<u8>, Vec<u8>, u32)> {
+    fn copy(&self) -> Vec<(Vec<u8>, Vec<u8>, u32, u32)> {
         (0..self.len())
             .filter_map(|idx| self.slot(idx))
             .map(|slot| {
@@ -257,6 +305,7 @@ impl Page for Block {
                     get_key(&self.buf, &slot).to_vec(),
                     get_val(&self.buf, &slot).to_vec(),
                     slot.page,
+                    slot.vlen,
                 )
             })
             .collect::<Vec<_>>()
@@ -294,8 +343,9 @@ fn get_key<'a>(buf: &'a BytesMut, slot: &'a Slot) -> &'a [u8] {
 }
 
 fn get_val<'a>(buf: &'a BytesMut, slot: &'a Slot) -> &'a [u8] {
+    let vlen = slot.inline_vlen();
     &buf[(slot.offset as usize + slot.klen as usize)
-        ..(slot.offset as usize + slot.klen as usize + slot.vlen as usize)]
+        ..(slot.offset as usize + slot.klen as usize + vlen as usize)]
 }
 
 fn put_u32(buf: &mut BytesMut, pos: usize, val: u32) {
@@ -476,7 +526,7 @@ mod tests {
         assert_eq!(page.buf.len(), len as usize);
         assert_eq!(
             &page.buf[0..HEAD],
-            &[0, 0, 0, id as u8, 0, 0, 0, len as u8, 0, 0, 0, 0, 0xC0, 0xDE, 0x15, 0x42,]
+            &[0, 0, 0, id as u8, 0, 0, 0, len as u8, 0, 0, 0, 0, 0xC0, 0xDE, 0xFA, 0xCE,]
         );
 
         assert_eq!(page.put_val(k1, v1), Some(0));
@@ -576,7 +626,7 @@ mod tests {
         assert_eq!(
             page.copy()
                 .into_iter()
-                .map(|(k, v, _)| (k, v))
+                .map(|(k, v, _, _)| (k, v))
                 .collect::<Vec<_>>(),
             copy
         );
@@ -592,5 +642,72 @@ mod tests {
         let buf = vec![42u8; 256];
         let opt = page.put_entry(&buf, &buf, 0);
         assert!(opt.is_none());
+    }
+
+    #[test]
+    fn test_is_empty() {
+        let page = Block::create(1, 128);
+        assert!(page.is_empty());
+
+        let mut page2 = Block::create(2, 128);
+        page2.put_val(b"key", b"val");
+        assert!(!page2.is_empty());
+    }
+
+    #[test]
+    fn test_slot_out_of_bounds() {
+        let page = Block::create(1, 128);
+        assert_eq!(page.slot(0), None);
+        assert_eq!(page.slot(999), None);
+    }
+
+    #[test]
+    fn test_remove_out_of_bounds() {
+        let mut page = Block::create(1, 128);
+        page.put_val(b"key", b"val");
+        // Remove beyond size should be no-op
+        page.remove(5);
+        assert_eq!(page.len(), 1);
+    }
+
+    #[test]
+    fn test_find_empty_page() {
+        let page = Block::create(1, 128);
+        assert_eq!(page.find(b"anything"), None);
+    }
+
+    #[test]
+    fn test_put_entry_replaces_existing() {
+        let mut page = Block::create(1, 256);
+        page.put_val(b"key1", b"val1");
+        assert_eq!(page.len(), 1);
+        assert_eq!(page.val(0), b"val1");
+
+        // Replace with same key, different value
+        page.put_val(b"key1", b"val2");
+        assert_eq!(page.len(), 1);
+        assert_eq!(page.val(0), b"val2");
+    }
+
+    #[test]
+    fn test_put_overflow_doesnt_fit() {
+        let mut page = Block::create(1, 64);
+        let big_key = vec![42u8; 256];
+        let opt = page.put_overflow(&big_key, 10, 0x80000001);
+        assert!(opt.is_none());
+    }
+
+    #[test]
+    fn test_put_overflow_replaces_existing() {
+        let mut page = Block::create(1, 256);
+        page.put_overflow(b"overkey", 10, 0x80000001);
+        assert_eq!(page.len(), 1);
+
+        // Replace with same key
+        page.put_overflow(b"overkey", 20, 0x80000002);
+        assert_eq!(page.len(), 1);
+        let slot = page.slot(0).unwrap();
+        assert_eq!(slot.page, 20);
+        assert_eq!(slot.vlen, 0x80000002);
     }
 }
