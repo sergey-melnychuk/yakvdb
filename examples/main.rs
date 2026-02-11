@@ -53,9 +53,9 @@ impl Storage for SelfStorage {
     }
 }
 
-struct LSKV(RefCell<yalskv::Store>);
+struct Lskv(RefCell<yalskv::Store>);
 
-impl Storage for LSKV {
+impl Storage for Lskv {
     fn insert(&self, key: &[u8], val: &[u8]) {
         self.0.borrow_mut().insert(key, val).ok();
     }
@@ -326,7 +326,7 @@ fn main() {
         let db = yalskv::Store::open("target/yalskv").unwrap();
         info!("target={target} file={path:?} count={count}");
 
-        benchmark(LSKV(RefCell::new(db)), count);
+        benchmark(Lskv(RefCell::new(db)), count);
         std::fs::remove_dir_all(path).ok();
     }
 

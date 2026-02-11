@@ -1,5 +1,5 @@
 use crate::api::error::{Error, Result};
-use crate::api::page::Page;
+use crate::api::page::{Page, OVERFLOW_FLAG};
 use crate::api::tree::Tree;
 use crate::api::Store;
 use crate::util::cache::{Cache, LruCache};
@@ -13,6 +13,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::ops::Deref;
 use std::path::Path;
+use std::convert::TryInto;
 use std::sync::Arc;
 
 use parking_lot::{
@@ -40,6 +41,17 @@ const ROOT: u32 = 1;
 // Percentage threshold for splitting (on insert) and merging (on delete) pages
 const SPLIT_THRESHOLD: u8 = 80;
 const MERGE_THRESHOLD: u8 = 20;
+
+/// Magic value at offset 4 of an overflow region leader page.
+/// Regular pages have `cap` (= page_bytes <= u16::MAX = 65535) at this offset,
+/// so any value above 65535 is unambiguous.
+const OVERFLOW_MAGIC: u32 = 0xF100DA7A;
+
+/// Size of the overflow region header in bytes: [id, MAGIC, key_len, val_len].
+const OVERFLOW_HEAD: usize = 16;
+
+/// Size of a single slot descriptor in bytes (matches size_of::<Slot>()).
+const SLOT_BYTES: usize = 16;
 
 #[derive(Debug)]
 #[repr(C)]
@@ -143,8 +155,22 @@ impl<P: Page> File<P> {
         let total_pages = (len - HEAD) as u32 / this.head.page_bytes;
         debug!("Processing pages for compaction: {total_pages}");
         if this.head.page_count < total_pages {
-            for id in 2..=total_pages {
-                // skipping the root page (id=1)
+            let mut id = 2u32;
+            while id <= total_pages {
+                // Check if this is an overflow leader by reading the 16-byte header
+                let page_offset = this.offset(id);
+                if let Ok((magic, key_len, val_len)) = this.read_overflow_header(page_offset) {
+                    if magic == OVERFLOW_MAGIC {
+                        // This is an overflow region leader -- skip its continuation pages
+                        let data_len = (key_len + val_len) as usize;
+                        let m = Self::overflow_multiplier(this.head.page_bytes, data_len);
+                        debug!("Page id={id} is overflow leader (multiplier={m})");
+                        id += m;
+                        continue;
+                    }
+                }
+
+                // Regular page -- check if empty
                 if let Ok(page) = this.load(this.offset(id), this.head.page_bytes) {
                     if page.len() == 0 {
                         debug!("Page id={id} is empty");
@@ -153,6 +179,7 @@ impl<P: Page> File<P> {
                 } else {
                     error!("Page failed to load: id={id}");
                 }
+                id += 1;
             }
         }
         Ok(this)
@@ -186,6 +213,186 @@ impl<P: Page> File<P> {
     pub fn page_size(&self) -> u32 {
         self.head.page_bytes
     }
+
+    // ---- Overflow I/O ----
+
+    /// Compute the number of pages needed for an overflow region holding `data_len` bytes.
+    fn overflow_multiplier(page_bytes: u32, data_len: usize) -> u32 {
+        let total = OVERFLOW_HEAD + data_len;
+        (total as u32).div_ceil(page_bytes)
+    }
+
+    /// Allocate `multiplier` contiguous pages at the end of the file.
+    /// Returns the starting page id.
+    fn alloc_overflow(&self, multiplier: u32) -> Result<u32> {
+        let len = self.file.write().metadata().unwrap().len();
+        let id = 1 + ((len - HEAD as u64) / self.head.page_bytes as u64) as u32;
+        let region_bytes = multiplier as usize * self.head.page_bytes as usize;
+        let zeroes = vec![0u8; region_bytes];
+        {
+            let mut f = self.file.write();
+            f.seek(SeekFrom::End(0))?;
+            f.write_all(&zeroes)?;
+        }
+        debug!("alloc_overflow: id={id} multiplier={multiplier}");
+        Ok(id)
+    }
+
+    /// Write overflow header + key + value data into a previously allocated region.
+    fn write_overflow(
+        &self,
+        start_page: u32,
+        key: &[u8],
+        val: &[u8],
+        multiplier: u32,
+    ) -> Result<()> {
+        let region_bytes = multiplier as usize * self.head.page_bytes as usize;
+        let mut buf = BytesMut::with_capacity(region_bytes);
+        // Header: [id: u32] [OVERFLOW_MAGIC: u32] [key_len: u32] [val_len: u32]
+        buf.put_u32(start_page);
+        buf.put_u32(OVERFLOW_MAGIC);
+        buf.put_u32(key.len() as u32);
+        buf.put_u32(val.len() as u32);
+        buf.put_slice(key);
+        buf.put_slice(val);
+        // Pad remainder with zeroes
+        buf.extend_from_slice(&vec![0u8; region_bytes - buf.len()]);
+
+        let offset = self.offset(start_page) as u64;
+        {
+            let mut f = self.file.write();
+            f.seek(SeekFrom::Start(offset))?;
+            f.write_all(&buf)?;
+        }
+        debug!(
+            "write_overflow: page={start_page} multiplier={multiplier} key_len={} val_len={}",
+            key.len(),
+            val.len()
+        );
+        Ok(())
+    }
+
+    /// Read the full key and value from an overflow region in a single I/O.
+    fn read_overflow(&self, start_page: u32, multiplier: u32) -> Result<(Vec<u8>, Vec<u8>)> {
+        let region_bytes = multiplier as usize * self.head.page_bytes as usize;
+        let mut buf = vec![0u8; region_bytes];
+        let offset = self.offset(start_page) as u64;
+        {
+            let mut f = self.file.write();
+            f.seek(SeekFrom::Start(offset))?;
+            f.read_exact(&mut buf)?;
+        }
+
+        let _id = u32::from_be_bytes(buf[0..4].try_into().unwrap());
+        let magic = u32::from_be_bytes(buf[4..8].try_into().unwrap());
+        if magic != OVERFLOW_MAGIC {
+            return Err(Error::Tree(
+                start_page,
+                format!("Overflow magic mismatch: expected {OVERFLOW_MAGIC:#X}, got {magic:#X}"),
+            ));
+        }
+        let key_len = u32::from_be_bytes(buf[8..12].try_into().unwrap()) as usize;
+        let val_len = u32::from_be_bytes(buf[12..16].try_into().unwrap()) as usize;
+
+        let key = buf[OVERFLOW_HEAD..OVERFLOW_HEAD + key_len].to_vec();
+        let val = buf[OVERFLOW_HEAD + key_len..OVERFLOW_HEAD + key_len + val_len].to_vec();
+        Ok((key, val))
+    }
+
+    /// Free all pages in an overflow region and return them to the free list.
+    fn free_overflow(&self, start_page: u32, multiplier: u32) -> Result<()> {
+        debug!("free_overflow: page={start_page} multiplier={multiplier}");
+        for i in 0..multiplier {
+            let page_id = start_page + i;
+            // Write an empty Block header so open() can recognize it as free
+            let empty = P::create(page_id, self.head.page_bytes);
+            let offset = self.offset(page_id) as u64;
+            {
+                let mut f = self.file.write();
+                f.seek(SeekFrom::Start(offset))?;
+                f.write_all(empty.as_ref())?;
+            }
+            self.free_id(page_id);
+        }
+        Ok(())
+    }
+
+    /// Scan all overflow entries on a leaf page for one whose full key matches `key`.
+    /// This handles the case where overflow entries store only a key prefix inline,
+    /// causing `ceil()` to miss them (prefix < full_key).
+    fn scan_overflow_entries(
+        &self,
+        page: &P,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        let n = page.len();
+        for i in 0..n {
+            if let Some(slot) = page.slot(i) {
+                if slot.is_overflow() {
+                    let inline_key = page.key(i);
+                    if key.len() >= inline_key.len() && key.starts_with(inline_key) {
+                        let (full_key, full_val) =
+                            self.read_overflow(slot.page, slot.multiplier())?;
+                        if key == full_key.as_slice() {
+                            return Ok(Some(full_val));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Find an overflow entry on a page whose full key matches `key`.
+    /// Returns (slot_index, overflow_page, multiplier) if found.
+    fn find_overflow_by_prefix(
+        &self,
+        page: &P,
+        key: &[u8],
+    ) -> Result<Option<(u32, u32, u32)>> {
+        let n = page.len();
+        for i in 0..n {
+            if let Some(slot) = page.slot(i) {
+                if slot.is_overflow() {
+                    let inline_key = page.key(i);
+                    if key.len() >= inline_key.len() && key.starts_with(inline_key) {
+                        let (full_key, _) =
+                            self.read_overflow(slot.page, slot.multiplier())?;
+                        if key == full_key.as_slice() {
+                            return Ok(Some((i, slot.page, slot.multiplier())));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// For a copy() entry, return the full key. If the entry is overflow and the inline
+    /// key is a prefix, read the full key from the overflow region.
+    fn resolve_full_key(&self, key: &[u8], page_ref: u32, raw_vlen: u32) -> Result<Vec<u8>> {
+        if raw_vlen & OVERFLOW_FLAG != 0 {
+            let m = raw_vlen & !OVERFLOW_FLAG;
+            let (full_key, _) = self.read_overflow(page_ref, m)?;
+            Ok(full_key)
+        } else {
+            Ok(key.to_vec())
+        }
+    }
+
+    /// Read only the overflow header to extract key_len and val_len.
+    fn read_overflow_header(&self, page_offset: usize) -> io::Result<(u32, u32, u32)> {
+        let mut hdr = [0u8; OVERFLOW_HEAD];
+        {
+            let mut f = self.file.write();
+            f.seek(SeekFrom::Start(page_offset as u64))?;
+            f.read_exact(&mut hdr)?;
+        }
+        let magic = u32::from_be_bytes(hdr[4..8].try_into().unwrap());
+        let key_len = u32::from_be_bytes(hdr[8..12].try_into().unwrap());
+        let val_len = u32::from_be_bytes(hdr[12..16].try_into().unwrap());
+        Ok((magic, key_len, val_len))
+    }
 }
 
 impl<P: Page> Store for File<P> {
@@ -195,8 +402,12 @@ impl<P: Page> Store for File<P> {
         let mut page = self.root();
         loop {
             let idx_opt = page.ceil(key);
+
+            // When ceil returns None, the search key is greater than all inline keys.
+            // But an overflow entry with a prefix key (shorter than full key) might still
+            // match -- scan overflow entries as a fallback.
             if idx_opt.is_none() {
-                return Ok(None);
+                return self.scan_overflow_entries(&page, key);
             }
             let idx = idx_opt.unwrap();
 
@@ -206,13 +417,24 @@ impl<P: Page> Store for File<P> {
             }
             let slot = slot_opt.unwrap();
 
-            if slot.page == 0 {
-                // Log how deep the lookup went into the tree depth: seen.len()
-                return if key == page.key(idx) {
-                    Ok(Some(page.val(idx).to_vec()))
+            if slot.is_leaf() {
+                if slot.is_overflow() {
+                    // Overflow entry: read full key+value from overflow region
+                    let (full_key, full_val) =
+                        self.read_overflow(slot.page, slot.multiplier())?;
+                    if key == full_key.as_slice() {
+                        return Ok(Some(full_val));
+                    }
+                    // The ceil'd entry didn't match -- scan other overflow entries
+                    return self.scan_overflow_entries(&page, key);
                 } else {
-                    Ok(None)
-                };
+                    return if key == page.key(idx) {
+                        Ok(Some(page.val(idx).to_vec()))
+                    } else {
+                        // Also check overflow entries at lower indices
+                        self.scan_overflow_entries(&page, key)
+                    };
+                }
             } else {
                 let id = page.id();
                 drop(page);
@@ -240,20 +462,41 @@ impl<P: Page> Store for File<P> {
             let parent_id = path.last().cloned().map(|(id, _)| id).unwrap_or_default();
 
             if page.len() == 0 {
-                // TODO handle keys/values larger than (half-) page size
-                let len = (key.len() + val.len()) as u32;
-                if !page.fits(len) {
-                    return Err(Error::Tree(
-                        page.id(),
-                        format!(
-                            "Entry does not fit into the page: size={} free={}",
-                            len,
-                            page.free()
-                        ),
-                    ));
+                let inline_len = (key.len() + val.len()) as u32;
+                if page.fits(inline_len) {
+                    // Fast path: key+value fits inline
+                    page.put_val(key, val);
+                    drop(page);
+                } else if page.fits(key.len() as u32) {
+                    // Key fits inline but value doesn't -- use overflow
+                    drop(page);
+                    let m = Self::overflow_multiplier(
+                        self.head.page_bytes,
+                        key.len() + val.len(),
+                    );
+                    let ov_page = self.alloc_overflow(m)?;
+                    self.write_overflow(ov_page, key, val, m)?;
+                    let raw_vlen = OVERFLOW_FLAG | m;
+                    let mut page = self.page_mut(id).unwrap();
+                    page.put_overflow(key, ov_page, raw_vlen);
+                    drop(page);
+                } else {
+                    // Even the key doesn't fit -- store a prefix inline + overflow
+                    let max_prefix = page.free().saturating_sub(SLOT_BYTES as u32) as usize;
+                    let prefix = &key[..max_prefix.min(key.len())];
+                    drop(page);
+                    let m = Self::overflow_multiplier(
+                        self.head.page_bytes,
+                        key.len() + val.len(),
+                    );
+                    let ov_page = self.alloc_overflow(m)?;
+                    self.write_overflow(ov_page, key, val, m)?;
+                    let raw_vlen = OVERFLOW_FLAG | m;
+                    let mut page = self.page_mut(id).unwrap();
+                    page.put_overflow(prefix, ov_page, raw_vlen);
+                    drop(page);
                 }
-                page.put_val(key, val);
-                drop(page);
+                self.flush()?;
                 return Ok(());
             }
 
@@ -277,25 +520,67 @@ impl<P: Page> Store for File<P> {
             }
             let slot = slot_opt.unwrap();
 
-            if slot.page == 0 {
-                let len = (key.len() + val.len()) as u32;
-                if !page.fits(len) {
-                    // TODO handle keys/values larger than (half-) page size
-                    return Err(Error::Tree(
-                        page.id(),
-                        format!(
-                            "Entry does not fit into the page: size={} free={}",
-                            len,
-                            page.free()
-                        ),
-                    ));
+            if slot.is_leaf() {
+                // If replacing an existing overflow entry, free the old overflow region
+                if slot.is_overflow() && page.key(idx) == key {
+                    let old_ov_page = slot.page;
+                    let old_m = slot.multiplier();
+                    page.remove(idx);
+                    drop(page);
+                    self.free_overflow(old_ov_page, old_m)?;
+                    page = self.page_mut(id).unwrap();
                 }
-                page.put_val(key, val);
-                let full = page.full();
-                drop(page);
 
-                if full > SPLIT_THRESHOLD {
-                    self.split(id, parent_id)?;
+                let inline_len = (key.len() + val.len()) as u32;
+                if page.fits(inline_len) {
+                    // Fits inline
+                    page.put_val(key, val);
+                    let full = page.full();
+                    drop(page);
+
+                    if full > SPLIT_THRESHOLD {
+                        self.split(id, parent_id)?;
+                    }
+                } else if page.fits(key.len() as u32) {
+                    // Key fits inline, value overflows
+                    drop(page);
+                    let m = Self::overflow_multiplier(
+                        self.head.page_bytes,
+                        key.len() + val.len(),
+                    );
+                    let ov_page = self.alloc_overflow(m)?;
+                    self.write_overflow(ov_page, key, val, m)?;
+                    let raw_vlen = OVERFLOW_FLAG | m;
+                    let mut page = self.page_mut(id).unwrap();
+                    page.put_overflow(key, ov_page, raw_vlen);
+                    let full = page.full();
+                    drop(page);
+
+                    if full > SPLIT_THRESHOLD {
+                        self.split(id, parent_id)?;
+                    }
+                } else {
+                    // Key prefix + overflow
+                    let free = page.free();
+                    let max_prefix =
+                        free.saturating_sub(SLOT_BYTES as u32) as usize;
+                    let prefix = &key[..max_prefix.min(key.len())];
+                    drop(page);
+                    let m = Self::overflow_multiplier(
+                        self.head.page_bytes,
+                        key.len() + val.len(),
+                    );
+                    let ov_page = self.alloc_overflow(m)?;
+                    self.write_overflow(ov_page, key, val, m)?;
+                    let raw_vlen = OVERFLOW_FLAG | m;
+                    let mut page = self.page_mut(id).unwrap();
+                    page.put_overflow(prefix, ov_page, raw_vlen);
+                    let full = page.full();
+                    drop(page);
+
+                    if full > SPLIT_THRESHOLD {
+                        self.split(id, parent_id)?;
+                    }
                 }
 
                 while let Some((page_id, _)) = path.pop() {
@@ -341,7 +626,42 @@ impl<P: Page> Store for File<P> {
         let mut path = Vec::with_capacity(8);
         loop {
             let idx_opt = page.ceil(key);
+
+            // Handle overflow prefix fallback: scan overflow entries if ceil misses
             if idx_opt.is_none() {
+                let found = self.find_overflow_by_prefix(&page, key)?;
+                if let Some((idx, ov_page, m)) = found {
+                    let id = page.id();
+                    page.remove(idx);
+                    drop(page);
+                    self.free_overflow(ov_page, m)?;
+
+                    // Navigate up-tree
+                    let mut page_id = id;
+                    for (parent_id, idx) in path.iter().cloned().rev() {
+                        let max_opt = {
+                            let p = self.page(page_id).unwrap();
+                            if p.len() > 0 {
+                                Some(p.max().to_vec())
+                            } else {
+                                None
+                            }
+                        };
+                        let mut parent = self.page_mut(parent_id).unwrap();
+                        if let Some(max) = max_opt {
+                            if max < parent.key(idx).to_vec() {
+                                parent.remove(idx);
+                                parent.put_ref(&max, page_id);
+                            }
+                        } else {
+                            parent.remove(idx);
+                        }
+                        drop(parent);
+                        page_id = parent_id;
+                    }
+                    self.flush()?;
+                    return Ok(());
+                }
                 return Ok(());
             }
             let idx = idx_opt.unwrap();
@@ -353,10 +673,43 @@ impl<P: Page> Store for File<P> {
             let slot = slot_opt.unwrap();
 
             let id = page.id();
-            if slot.page == 0 {
-                debug!("remove: key={} page={} idx={}", hex(key), id, idx);
-                page.remove(idx);
-                drop(page);
+            if slot.is_leaf() {
+                // For overflow entries, verify the full key and free the overflow region
+                if slot.is_overflow() {
+                    let ov_page = slot.page;
+                    let m = slot.multiplier();
+                    let (full_key, _) = self.read_overflow(ov_page, m)?;
+                    if full_key.as_slice() != key {
+                        // Ceil'd entry didn't match -- try prefix fallback
+                        let found = self.find_overflow_by_prefix(&page, key)?;
+                        if let Some((ov_idx, ov_p, ov_m)) = found {
+                            page.remove(ov_idx);
+                            drop(page);
+                            self.free_overflow(ov_p, ov_m)?;
+                        } else {
+                            return Ok(()); // not found
+                        }
+                    } else {
+                        debug!("remove: key={} page={} idx={} (overflow)", hex(key), id, idx);
+                        page.remove(idx);
+                        drop(page);
+                        self.free_overflow(ov_page, m)?;
+                    }
+                } else if page.key(idx) != key {
+                    // Regular entry didn't match -- check overflow entries on this page
+                    let found = self.find_overflow_by_prefix(&page, key)?;
+                    if let Some((ov_idx, ov_p, ov_m)) = found {
+                        page.remove(ov_idx);
+                        drop(page);
+                        self.free_overflow(ov_p, ov_m)?;
+                    } else {
+                        return Ok(()); // not found
+                    }
+                } else {
+                    debug!("remove: key={} page={} idx={}", hex(key), id, idx);
+                    page.remove(idx);
+                    drop(page);
+                }
 
                 // Navigate up-tree and remove/update references if needed
                 let mut page_id = id;
@@ -476,7 +829,11 @@ impl<P: Page> Store for File<P> {
         }
         loop {
             let slot = page.slot(0).unwrap();
-            if slot.page == 0 {
+            if slot.is_leaf() {
+                if slot.is_overflow() {
+                    let (full_key, _) = self.read_overflow(slot.page, slot.multiplier())?;
+                    return Ok(Some(full_key));
+                }
                 return Ok(Some(page.min().to_vec()));
             } else {
                 let id = slot.page;
@@ -498,7 +855,11 @@ impl<P: Page> Store for File<P> {
         loop {
             let last = page.len() - 1;
             let slot = page.slot(last).unwrap();
-            if slot.page == 0 {
+            if slot.is_leaf() {
+                if slot.is_overflow() {
+                    let (full_key, _) = self.read_overflow(slot.page, slot.multiplier())?;
+                    return Ok(Some(full_key));
+                }
                 return Ok(Some(page.max().to_vec()));
             } else {
                 let id = slot.page;
@@ -526,11 +887,24 @@ impl<P: Page> Store for File<P> {
         loop {
             let idx = page.ceil(key).unwrap();
             let slot = page.slot(idx).unwrap();
-            if slot.page == 0 {
-                return if key < page.key(idx) {
-                    Ok(Some(page.key(idx).to_vec()))
-                } else if key == page.key(idx) && idx < page.len() - 1 {
-                    Ok(Some(page.key(idx + 1).to_vec()))
+            if slot.is_leaf() {
+                // Helper: resolve the full key for a slot (handles overflow)
+                let resolve_key = |p: &P, i: u32| -> Result<Vec<u8>> {
+                    let s = p.slot(i).unwrap();
+                    if s.is_overflow() {
+                        let (fk, _) = self.read_overflow(s.page, s.multiplier())?;
+                        Ok(fk)
+                    } else {
+                        Ok(p.key(i).to_vec())
+                    }
+                };
+
+                let current_key = resolve_key(&page, idx)?;
+                if key < current_key.as_slice() {
+                    return Ok(Some(current_key));
+                } else if key == current_key.as_slice() && idx < page.len() - 1 {
+                    let next_key = resolve_key(&page, idx + 1)?;
+                    return Ok(Some(next_key));
                 } else {
                     // ceil == key, need to take min value from parent's next adjacent subtree
                     for (parent_id, parent_idx) in path.iter().rev().cloned() {
@@ -541,7 +915,14 @@ impl<P: Page> Store for File<P> {
                             page = self.page(id).unwrap();
                             loop {
                                 let slot = page.slot(0).unwrap();
-                                if slot.page == 0 {
+                                if slot.is_leaf() {
+                                    if slot.is_overflow() {
+                                        let (fk, _) = self.read_overflow(
+                                            slot.page,
+                                            slot.multiplier(),
+                                        )?;
+                                        return Ok(Some(fk));
+                                    }
                                     return Ok(Some(page.min().to_vec()));
                                 } else {
                                     drop(page);
@@ -552,8 +933,8 @@ impl<P: Page> Store for File<P> {
                     }
 
                     // the key appears to be the maximum value stored in the tree
-                    Ok(None)
-                };
+                    return Ok(None);
+                }
             } else {
                 path.push((page.id(), idx));
                 let id = slot.page;
@@ -581,26 +962,46 @@ impl<P: Page> Store for File<P> {
         loop {
             let idx = page.ceil(key).unwrap();
             let slot = page.slot(idx).unwrap();
-            if slot.page == 0 {
-                return if idx > 0 && key > page.key(idx - 1) {
-                    Ok(Some(page.key(idx - 1).to_vec()))
-                } else {
-                    // ceil == key, need to take max value from parent's previous adjacent page
-                    for (parent_id, parent_idx) in path.iter().rev().cloned() {
-                        drop(page);
-                        page = self.page(parent_id).unwrap();
-                        if parent_idx > 0 {
-                            let idx = parent_idx - 1;
-                            let id = page.slot(idx).unwrap().page;
-                            drop(page);
-                            page = self.page(id).unwrap();
-                            return Ok(Some(page.max().to_vec()));
-                        }
+            if slot.is_leaf() {
+                if idx > 0 {
+                    let prev_slot = page.slot(idx - 1).unwrap();
+                    let prev_key = if prev_slot.is_overflow() {
+                        let (fk, _) =
+                            self.read_overflow(prev_slot.page, prev_slot.multiplier())?;
+                        fk
+                    } else {
+                        page.key(idx - 1).to_vec()
+                    };
+                    if key.to_vec() > prev_key {
+                        return Ok(Some(prev_key));
                     }
+                }
 
-                    // the key seems to be the minimum value stored in the tree
-                    Ok(None)
-                };
+                // ceil == key or first entry, need to take max from parent's previous subtree
+                for (parent_id, parent_idx) in path.iter().rev().cloned() {
+                    drop(page);
+                    page = self.page(parent_id).unwrap();
+                    if parent_idx > 0 {
+                        let pidx = parent_idx - 1;
+                        let id = page.slot(pidx).unwrap().page;
+                        drop(page);
+                        page = self.page(id).unwrap();
+                        // Get max key from this subtree leaf
+                        let last = page.len() - 1;
+                        let last_slot = page.slot(last).unwrap();
+                        if last_slot.is_overflow() {
+                            let (fk, _) = self.read_overflow(
+                                last_slot.page,
+                                last_slot.multiplier(),
+                            )?;
+                            return Ok(Some(fk));
+                        }
+                        return Ok(Some(page.max().to_vec()));
+                    }
+                }
+
+                // the key seems to be the minimum value stored in the tree
+                return Ok(None);
             } else {
                 path.push((page.id(), idx));
                 let id = slot.page;
@@ -714,46 +1115,52 @@ impl<P: Page> Tree<P> for File<P> {
                 let page = self.page(id).unwrap();
                 let copy = page.copy();
                 let half = page.len() as usize / 2;
-                let lo_max = copy.get(half - 1).map(|(k, _, _)| k).cloned().unwrap();
-                let hi_max = copy.last().map(|(k, _, _)| k).cloned().unwrap();
+                let (k, _, p, rv) = copy.get(half - 1).unwrap();
+                let lo_max = self.resolve_full_key(k, *p, *rv)?;
+                let (k, _, p, rv) = copy.last().unwrap();
+                let hi_max = self.resolve_full_key(k, *p, *rv)?;
                 (copy, lo_max, hi_max)
             };
             let half = copy.len() / 2;
 
             {
                 let mut lo = self.page_mut(lo_id).unwrap();
-                copy.iter().take(half).for_each(|(key, val, page)| {
+                copy.iter().take(half).for_each(|(key, val, page_ref, raw_vlen)| {
                     trace!(
                         "split: move k={} v={} p={} from {} to {}",
                         hex(key),
                         hex(val),
-                        *page,
+                        *page_ref,
                         id,
                         lo_id
                     );
-                    if *page == 0 {
+                    if *raw_vlen & OVERFLOW_FLAG != 0 {
+                        lo.put_overflow(key, *page_ref, *raw_vlen);
+                    } else if *page_ref == 0 {
                         lo.put_val(key, val);
                     } else {
-                        lo.put_ref(key, *page);
+                        lo.put_ref(key, *page_ref);
                     }
                 });
             }
 
             {
                 let mut hi = self.page_mut(hi_id).unwrap();
-                copy.iter().skip(half).for_each(|(key, val, page)| {
+                copy.iter().skip(half).for_each(|(key, val, page_ref, raw_vlen)| {
                     trace!(
                         "split: move k={} v={} p={} from {} to {}",
                         hex(key),
                         hex(val),
-                        *page,
+                        *page_ref,
                         id,
                         hi_id
                     );
-                    if *page == 0 {
+                    if *raw_vlen & OVERFLOW_FLAG != 0 {
+                        hi.put_overflow(key, *page_ref, *raw_vlen);
+                    } else if *page_ref == 0 {
                         hi.put_val(key, val);
                     } else {
-                        hi.put_ref(key, *page);
+                        hi.put_ref(key, *page_ref);
                     }
                 });
             }
@@ -769,7 +1176,10 @@ impl<P: Page> Tree<P> for File<P> {
         } else {
             let (copy, max) = {
                 let page = self.page(id).unwrap();
-                (page.copy(), page.max().to_vec())
+                let c = page.copy();
+                let (k, _, p, rv) = c.last().unwrap();
+                let full_max = self.resolve_full_key(k, *p, *rv)?;
+                (c, full_max)
             };
             let half = copy.len() / 2;
             let peer_id = self.next_id()?;
@@ -777,16 +1187,25 @@ impl<P: Page> Tree<P> for File<P> {
 
             let page_max = {
                 let mut page = self.page_mut(id).unwrap();
-                copy.iter().skip(half).for_each(|(key, _, _)| {
+                copy.iter().skip(half).for_each(|(key, _, _, _)| {
                     let idx = page.find(key).unwrap();
                     page.remove(idx);
                 });
-                page.max().to_vec()
+                // Resolve the max key of the remaining half (may be overflow)
+                let last = page.len() - 1;
+                let slot = page.slot(last).unwrap();
+                if slot.is_overflow() {
+                    let (fk, _) = self.read_overflow(slot.page, slot.multiplier())
+                        .unwrap_or_else(|_| (page.max().to_vec(), vec![]));
+                    fk
+                } else {
+                    page.max().to_vec()
+                }
             };
 
             let peer_max = {
                 let mut peer = self.page_mut(peer_id).unwrap();
-                copy.iter().skip(half).for_each(|(key, val, p)| {
+                copy.iter().skip(half).for_each(|(key, val, p, raw_vlen)| {
                     trace!(
                         "split: move k={} v={} p={} from {} to {}",
                         hex(key),
@@ -795,13 +1214,24 @@ impl<P: Page> Tree<P> for File<P> {
                         id,
                         peer_id
                     );
-                    if *p == 0 {
+                    if *raw_vlen & OVERFLOW_FLAG != 0 {
+                        peer.put_overflow(key, *p, *raw_vlen);
+                    } else if *p == 0 {
                         peer.put_val(key, val);
                     } else {
                         peer.put_ref(key, *p);
                     }
                 });
-                peer.max().to_vec()
+                // Resolve the max key of the peer (may be overflow)
+                let last = peer.len() - 1;
+                let slot = peer.slot(last).unwrap();
+                if slot.is_overflow() {
+                    let (fk, _) = self.read_overflow(slot.page, slot.multiplier())
+                        .unwrap_or_else(|_| (peer.max().to_vec(), vec![]));
+                    fk
+                } else {
+                    peer.max().to_vec()
+                }
             };
 
             {
@@ -868,7 +1298,7 @@ impl<P: Page> Tree<P> for File<P> {
 
         {
             let mut page = self.page_mut(dst_id).unwrap();
-            for (key, val, p) in src_copy {
+            for (key, val, p, raw_vlen) in src_copy {
                 trace!(
                     "merge: move k={} v={} p={} from {} to {}",
                     hex(&key),
@@ -877,7 +1307,9 @@ impl<P: Page> Tree<P> for File<P> {
                     src_id,
                     dst_id
                 );
-                if p == 0 {
+                if raw_vlen & OVERFLOW_FLAG != 0 {
+                    page.put_overflow(&key, p, raw_vlen);
+                } else if p == 0 {
                     page.put_val(&key, &val);
                 } else {
                     page.put_ref(&key, p);
@@ -917,14 +1349,32 @@ impl<P: Page> Tree<P> for File<P> {
             } else {
                 let entries = copy
                     .iter()
-                    .map(|(k, v, p)| format!("{}{}, {}, {}", prefix, hex(k), hex(v), p))
+                    .map(|(k, v, p, raw_vlen)| {
+                        if *raw_vlen & OVERFLOW_FLAG != 0 {
+                            format!(
+                                "{}{}, [OVERFLOW M={} PAGE={}], {}",
+                                prefix,
+                                hex(k),
+                                raw_vlen & !OVERFLOW_FLAG,
+                                p,
+                                p
+                            )
+                        } else {
+                            format!("{}{}, {}, {}", prefix, hex(k), hex(v), p)
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join("\n");
                 format!("{prefix}page={page_id}: (parent={parent_id}) {full}% full\n{entries}")
             });
 
             acc.push('\n');
-            let links = copy.iter().map(|(_, _, p)| p).cloned();
+            // Only follow child page links for internal nodes (not overflow refs)
+            let links = copy
+                .iter()
+                .filter(|(_, _, _, raw_vlen)| *raw_vlen & OVERFLOW_FLAG == 0)
+                .map(|(_, _, p, _)| p)
+                .cloned();
             links.for_each(|id| {
                 let mut p = prefix.clone();
                 p.push_str(&tab);
@@ -949,6 +1399,10 @@ mod tests {
     use rand::SeedableRng;
     use std::ops::Deref;
 
+    fn init_log() {
+        let _ = env_logger::try_init();
+    }
+
     fn get<P: Page>(page: &P, key: &[u8]) -> Option<(Vec<u8>, u32)> {
         page.find(key)
             .map(|idx| (page.val(idx).to_vec(), page.slot(idx).unwrap().page))
@@ -963,20 +1417,20 @@ mod tests {
         let size: u32 = 256;
 
         let data = vec![
-            (b"aaa".to_vec(), b"zxczxczxc".to_vec(), 0),
-            (b"bbb".to_vec(), b"asdasdasd".to_vec(), 0),
-            (b"ccc".to_vec(), b"qweqweqwe".to_vec(), 0),
-            (b"ddd".to_vec(), b"123123123".to_vec(), 0),
-            (b"xxx".to_vec(), vec![], 3333),
-            (b"yyy".to_vec(), vec![], 2222),
-            (b"zzz".to_vec(), vec![], 1111),
+            (b"aaa".to_vec(), b"zxczxczxc".to_vec(), 0u32, 9u32),
+            (b"bbb".to_vec(), b"asdasdasd".to_vec(), 0, 9),
+            (b"ccc".to_vec(), b"qweqweqwe".to_vec(), 0, 9),
+            (b"ddd".to_vec(), b"123123123".to_vec(), 0, 9),
+            (b"xxx".to_vec(), vec![], 3333, 0),
+            (b"yyy".to_vec(), vec![], 2222, 0),
+            (b"zzz".to_vec(), vec![], 1111, 0),
         ];
 
         {
             let file: File<Block> = File::make(path, size).unwrap();
             {
                 let mut page = file.root_mut();
-                for (k, v, p) in data.iter() {
+                for (k, v, p, _) in data.iter() {
                     if *p == 0 {
                         page.put_val(k, v);
                     } else {
@@ -993,7 +1447,7 @@ mod tests {
 
         assert_eq!(page.copy(), data);
 
-        for (k, v, p) in data.iter() {
+        for (k, v, p, _) in data.iter() {
             assert_eq!(get(&page, k), Some((v.to_vec(), *p)));
         }
 
@@ -1159,13 +1613,9 @@ mod tests {
             let mut result = Vec::with_capacity(data.len());
             let mut val = file.min().unwrap().unwrap().to_vec();
             result.push(val.clone());
-            loop {
-                if let Some(next) = file.above(&val).unwrap() {
-                    result.push(next.to_vec());
-                    val = next.to_vec();
-                } else {
-                    break;
-                }
+            while let Some(next) = file.above(&val).unwrap() {
+                result.push(next.to_vec());
+                val = next.to_vec();
             }
             result
         };
@@ -1220,13 +1670,9 @@ mod tests {
             let mut result = Vec::with_capacity(data.len());
             let mut val = file.max().unwrap().unwrap().to_vec();
             result.push(val.clone());
-            loop {
-                if let Some(next) = file.below(&val).unwrap() {
-                    result.push(next.to_vec());
-                    val = next.to_vec();
-                } else {
-                    break;
-                }
+            while let Some(next) = file.below(&val).unwrap() {
+                result.push(next.to_vec());
+                val = next.to_vec();
             }
             result
         };
@@ -1277,13 +1723,9 @@ mod tests {
             let mut result = Vec::with_capacity(data.len());
             let mut this = file.min().unwrap().unwrap().to_vec();
             result.push(this.clone());
-            loop {
-                if let Some(next) = file.above(&this).unwrap() {
-                    result.push(next.to_vec());
-                    this = next.to_vec();
-                } else {
-                    break;
-                }
+            while let Some(next) = file.above(&this).unwrap() {
+                result.push(next.to_vec());
+                this = next.to_vec();
             }
             result
         };
@@ -1291,13 +1733,9 @@ mod tests {
             let mut result = Vec::with_capacity(data.len());
             let mut this = file.max().unwrap().unwrap().to_vec();
             result.push(this.clone());
-            loop {
-                if let Some(next) = file.below(&this).unwrap() {
-                    result.push(next.to_vec());
-                    this = next.to_vec();
-                } else {
-                    break;
-                }
+            while let Some(next) = file.below(&this).unwrap() {
+                result.push(next.to_vec());
+                this = next.to_vec();
             }
             result
         };
@@ -1344,8 +1782,8 @@ mod tests {
     }
 
     #[test]
-    fn test_large() {
-        let path = Path::new("target/test_large.tmp");
+    fn test_large_value_overflow() {
+        let path = Path::new("target/test_large_value.tmp");
         if path.exists() {
             fs::remove_file(path).unwrap();
         }
@@ -1353,8 +1791,1267 @@ mod tests {
         let page_bytes: u32 = 256;
         let file: File<Block> = File::make(path, page_bytes).unwrap();
 
-        let big = vec![42u8; 1024];
-        let res = file.insert(&big, &big);
-        assert!(res.is_err());
+        // Key fits in page, value is larger than a page -- triggers overflow
+        let key = b"hello";
+        let val = vec![42u8; 1024];
+        file.insert(key, &val).unwrap();
+
+        let found = file.lookup(key).unwrap().unwrap();
+        assert_eq!(found, val);
+
+        // Remove the overflow entry
+        file.remove(key).unwrap();
+        assert!(file.lookup(key).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_large_key_overflow() {
+        let path = Path::new("target/test_large_key.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+
+        let page_bytes: u32 = 256;
+        let file: File<Block> = File::make(path, page_bytes).unwrap();
+
+        // Both key and value are larger than a page
+        let big_key = vec![42u8; 1024];
+        let big_val = vec![99u8; 2048];
+        file.insert(&big_key, &big_val).unwrap();
+
+        let found = file.lookup(&big_key).unwrap().unwrap();
+        assert_eq!(found, big_val);
+
+        file.remove(&big_key).unwrap();
+        assert!(file.lookup(&big_key).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_overflow_mixed() {
+        let path = Path::new("target/test_overflow_mixed.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+
+        let page_bytes: u32 = 256;
+        let file: File<Block> = File::make(path, page_bytes).unwrap();
+
+        // Mix of small inline entries and overflow entries
+        let small_data = [
+            (b"aaa".to_vec(), b"small_value_1".to_vec()),
+            (b"bbb".to_vec(), b"small_value_2".to_vec()),
+            (b"ccc".to_vec(), b"small_value_3".to_vec()),
+        ];
+        let big_val = vec![0xFFu8; 512];
+        let big_data = [
+            (b"ddd".to_vec(), big_val.clone()),
+            (b"eee".to_vec(), big_val.clone()),
+        ];
+
+        for (k, v) in small_data.iter().chain(big_data.iter()) {
+            file.insert(k, v).unwrap();
+        }
+
+        for (k, v) in small_data.iter().chain(big_data.iter()) {
+            let found = file.lookup(k).unwrap().unwrap();
+            assert_eq!(found.deref(), v.as_slice());
+        }
+
+        // Remove all
+        for (k, _) in small_data.iter().chain(big_data.iter()) {
+            file.remove(k).unwrap();
+        }
+        assert!(file.is_empty());
+    }
+
+    #[test]
+    fn test_overflow_persistence() {
+        let path = Path::new("target/test_overflow_persist.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+
+        let page_bytes: u32 = 256;
+        let key = b"persist_key";
+        let val = vec![0xABu8; 800];
+
+        {
+            let file: File<Block> = File::make(path, page_bytes).unwrap();
+            file.insert(key, &val).unwrap();
+        }
+
+        // Reopen and verify
+        {
+            let file: File<Block> = File::open(path).unwrap();
+            let found = file.lookup(key).unwrap().unwrap();
+            assert_eq!(found, val);
+        }
+    }
+
+    #[test]
+    fn test_overflow_with_split() {
+        // Overflow entries survive a split that reorganizes the tree
+        let path = Path::new("target/test_overflow_split.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+
+        let page_bytes: u32 = 256;
+        let file: File<Block> = File::make(path, page_bytes).unwrap();
+
+        let big_val = vec![0xCCu8; 512];
+
+        // Insert several small entries plus some overflow entries to trigger splits
+        let mut all = Vec::new();
+        for i in 0u8..10 {
+            let key = vec![b'a' + i; 4];
+            let val = vec![i; 4];
+            file.insert(&key, &val).unwrap();
+            all.push((key, val));
+        }
+
+        // Now insert overflow entries
+        for i in 0u8..3 {
+            let key = vec![b'A' + i; 8];
+            file.insert(&key, &big_val).unwrap();
+            all.push((key, big_val.clone()));
+        }
+
+        // Verify all entries are retrievable
+        for (k, v) in all.iter() {
+            let found = file.lookup(k).unwrap();
+            assert!(
+                found.is_some(),
+                "Key {} not found",
+                hex(k)
+            );
+            assert_eq!(found.unwrap().deref(), v.as_slice());
+        }
+
+        // Remove some and verify the rest
+        for (k, _) in all.iter().take(5) {
+            file.remove(k).unwrap();
+        }
+        for (k, v) in all.iter().skip(5) {
+            let found = file.lookup(k).unwrap();
+            assert!(
+                found.is_some(),
+                "Key {} not found after partial removal",
+                hex(k)
+            );
+            assert_eq!(found.unwrap().deref(), v.as_slice());
+        }
+    }
+
+    #[test]
+    fn test_overflow_persistence_mixed() {
+        // Mixed inline + overflow entries survive close and reopen
+        let path = Path::new("target/test_overflow_persist_mixed.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+
+        let page_bytes: u32 = 256;
+        let big_val = vec![0xDDu8; 600];
+
+        let data = [
+            (b"small1".to_vec(), b"val1".to_vec()),
+            (b"small2".to_vec(), b"val2".to_vec()),
+            (b"big1".to_vec(), big_val.clone()),
+            (b"big2".to_vec(), big_val.clone()),
+            (b"small3".to_vec(), b"val3".to_vec()),
+        ];
+
+        {
+            let file: File<Block> = File::make(path, page_bytes).unwrap();
+            for (k, v) in data.iter() {
+                file.insert(k, v).unwrap();
+            }
+        }
+
+        // Reopen and verify all entries persist
+        {
+            let file: File<Block> = File::open(path).unwrap();
+            for (k, v) in data.iter() {
+                let found = file.lookup(k).unwrap();
+                assert!(found.is_some(), "Key {} not found after reopen", hex(k));
+                assert_eq!(found.unwrap().deref(), v.as_slice());
+            }
+
+            // Also remove and verify
+            for (k, _) in data.iter() {
+                file.remove(k).unwrap();
+            }
+            assert!(file.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_overflow_replace() {
+        // Replacing an overflow entry with a new value
+        let path = Path::new("target/test_overflow_replace.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+
+        let page_bytes: u32 = 256;
+        let file: File<Block> = File::make(path, page_bytes).unwrap();
+
+        let key = b"replace_me";
+        let val1 = vec![0x11u8; 400];
+        let val2 = vec![0x22u8; 500];
+
+        file.insert(key, &val1).unwrap();
+        assert_eq!(file.lookup(key).unwrap().unwrap(), val1);
+
+        // Replace with a different overflow value
+        file.insert(key, &val2).unwrap();
+        assert_eq!(file.lookup(key).unwrap().unwrap(), val2);
+
+        file.remove(key).unwrap();
+        assert!(file.lookup(key).unwrap().is_none());
+    }
+
+    // ---- Coverage: open/make error paths ----
+
+    #[test]
+    fn test_make_file_exists() {
+        let path = Path::new("target/test_make_exists.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        let _file: File<Block> = File::make(path, 256).unwrap();
+        // Second make should fail
+        let result = File::<Block>::make(path, 256);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_open_short_file() {
+        let path = Path::new("target/test_open_short.tmp");
+        // Write a file that's too short
+        fs::write(path, b"short").unwrap();
+        let result = File::<Block>::open(path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_open_bad_magic() {
+        let path = Path::new("target/test_open_bad_magic.tmp");
+        // Write 16 bytes with wrong magic
+        let mut buf = vec![0u8; 272]; // HEAD(16) + one page(256)
+        buf[0..8].copy_from_slice(b"BADMAGIC");
+        buf[8..12].copy_from_slice(&256u32.to_be_bytes());
+        buf[12..16].copy_from_slice(&1u32.to_be_bytes());
+        fs::write(path, &buf).unwrap();
+        let result = File::<Block>::open(path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_open_page_size_too_large() {
+        let path = Path::new("target/test_open_large_page.tmp");
+        let mut buf = vec![0u8; 16 + 65536];
+        buf[0..8].copy_from_slice(b"YAKVDB42");
+        buf[8..12].copy_from_slice(&(65536u32 + 1).to_be_bytes()); // > u16::MAX
+        buf[12..16].copy_from_slice(&1u32.to_be_bytes());
+        fs::write(path, &buf).unwrap();
+        let result = File::<Block>::open(path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_open_incomplete_file() {
+        let path = Path::new("target/test_open_incomplete.tmp");
+        // Write valid header but not enough data for one full page
+        let mut buf = vec![0u8; 20]; // HEAD(16) + 4 bytes (not a full page)
+        buf[0..8].copy_from_slice(b"YAKVDB42");
+        buf[8..12].copy_from_slice(&256u32.to_be_bytes());
+        buf[12..16].copy_from_slice(&1u32.to_be_bytes());
+        fs::write(path, &buf).unwrap();
+        let result = File::<Block>::open(path);
+        assert!(result.is_err());
+    }
+
+    // ---- Coverage: page_size() ----
+
+    #[test]
+    fn test_page_size() {
+        let path = Path::new("target/test_page_size.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        let file: File<Block> = File::make(path, 512).unwrap();
+        assert_eq!(file.page_size(), 512);
+    }
+
+    // ---- Coverage: empty tree operations ----
+
+    #[test]
+    fn test_empty_tree_min_max() {
+        let path = Path::new("target/test_empty_minmax.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        let file: File<Block> = File::make(path, 256).unwrap();
+        assert!(file.is_empty());
+        assert_eq!(file.min().unwrap(), None);
+        assert_eq!(file.max().unwrap(), None);
+    }
+
+    #[test]
+    fn test_empty_tree_above_below() {
+        let path = Path::new("target/test_empty_abovebelow.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        let file: File<Block> = File::make(path, 256).unwrap();
+        assert_eq!(file.above(b"anything").unwrap(), None);
+        assert_eq!(file.below(b"anything").unwrap(), None);
+    }
+
+    // ---- Coverage: overflow with min/max/above/below ----
+
+    #[test]
+    fn test_overflow_min_max() {
+        let path = Path::new("target/test_overflow_minmax.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        let page_bytes: u32 = 256;
+        let file: File<Block> = File::make(path, page_bytes).unwrap();
+
+        let big_val = vec![0xAAu8; 512];
+        // Insert small keys with big values, triggering overflow
+        file.insert(b"aaa", &big_val).unwrap();
+        file.insert(b"zzz", &big_val).unwrap();
+
+        let min = file.min().unwrap().unwrap();
+        let max = file.max().unwrap().unwrap();
+        assert_eq!(min, b"aaa".to_vec());
+        assert_eq!(max, b"zzz".to_vec());
+    }
+
+    #[test]
+    fn test_overflow_above_below() {
+        let path = Path::new("target/test_overflow_abovebelow.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        let page_bytes: u32 = 256;
+        let file: File<Block> = File::make(path, page_bytes).unwrap();
+
+        let big_val = vec![0xBBu8; 512];
+        file.insert(b"bbb", &big_val).unwrap();
+        file.insert(b"ddd", &big_val).unwrap();
+        file.insert(b"fff", &big_val).unwrap();
+
+        // above
+        let above_b = file.above(b"bbb").unwrap();
+        assert_eq!(above_b, Some(b"ddd".to_vec()));
+        let above_d = file.above(b"ddd").unwrap();
+        assert_eq!(above_d, Some(b"fff".to_vec()));
+        let above_f = file.above(b"fff").unwrap();
+        assert_eq!(above_f, None);
+
+        // below
+        let below_f = file.below(b"fff").unwrap();
+        assert_eq!(below_f, Some(b"ddd".to_vec()));
+        let below_d = file.below(b"ddd").unwrap();
+        assert_eq!(below_d, Some(b"bbb".to_vec()));
+        let below_b = file.below(b"bbb").unwrap();
+        assert_eq!(below_b, None);
+    }
+
+    // ---- Coverage: dump with overflow entries ----
+
+    #[test]
+    fn test_dump_with_overflow() {
+        let path = Path::new("target/test_dump_overflow.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        let page_bytes: u32 = 256;
+        let file: File<Block> = File::make(path, page_bytes).unwrap();
+
+        let big_val = vec![0xCCu8; 400];
+        file.insert(b"key1", b"small_val").unwrap();
+        file.insert(b"key2", &big_val).unwrap();
+
+        let dump = file.dump();
+        assert!(!dump.is_empty());
+        // Dump should mention OVERFLOW for the big entry
+        assert!(dump.contains("OVERFLOW"));
+    }
+
+    // ---- Coverage: open with overflow regions and empty pages ----
+
+    #[test]
+    fn test_open_with_overflow_and_empty_pages() {
+        init_log();
+        let path = Path::new("target/test_open_overflow_empty.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+
+        let page_bytes: u32 = 256;
+        let big_val = vec![0xEEu8; 600];
+
+        // Insert many entries to create splits, then remove some to create empty pages
+        {
+            let file: File<Block> = File::make(path, page_bytes).unwrap();
+            for i in 0u8..15 {
+                let key = vec![b'a' + i; 4];
+                let val = vec![i; 4];
+                file.insert(&key, &val).unwrap();
+            }
+            // Insert an overflow entry
+            file.insert(b"zzzz", &big_val).unwrap();
+
+            // Remove some to create empty pages after merge
+            for i in 0u8..10 {
+                let key = vec![b'a' + i; 4];
+                file.remove(&key).unwrap();
+            }
+        }
+
+        // Reopen -- should correctly skip overflow regions and find empty pages
+        let file: File<Block> = File::open(path).unwrap();
+        // The remaining entries should still be accessible
+        let found = file.lookup(b"zzzz").unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap(), big_val);
+    }
+
+    // ---- Coverage: lookup/remove on keys not found (non-overflow) ----
+
+    #[test]
+    fn test_lookup_miss_with_entries() {
+        let path = Path::new("target/test_lookup_miss.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        let file: File<Block> = File::make(path, 256).unwrap();
+        file.insert(b"aaa", b"111").unwrap();
+        file.insert(b"ccc", b"333").unwrap();
+
+        // Key not in the tree (between existing keys)
+        assert!(file.lookup(b"bbb").unwrap().is_none());
+        // Key beyond max
+        assert!(file.lookup(b"zzz").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_remove_nonexistent() {
+        let path = Path::new("target/test_remove_miss.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        let file: File<Block> = File::make(path, 256).unwrap();
+        file.insert(b"aaa", b"111").unwrap();
+
+        // Remove key that doesn't exist -- should be ok
+        file.remove(b"bbb").unwrap();
+        // Original still there
+        assert_eq!(file.lookup(b"aaa").unwrap().unwrap().deref(), b"111");
+    }
+
+    // ---- Coverage: overflow entry not matching (scan miss) ----
+
+    #[test]
+    fn test_overflow_lookup_scan_miss() {
+        let path = Path::new("target/test_overflow_scan_miss.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        let file: File<Block> = File::make(path, 256).unwrap();
+
+        let big_val = vec![0xAAu8; 500];
+        file.insert(b"abc_key", &big_val).unwrap();
+
+        // Lookup a key that shares prefix with the overflow entry but differs
+        assert!(file.lookup(b"abc_key_extra").unwrap().is_none());
+        // Lookup a key that doesn't share prefix at all
+        assert!(file.lookup(b"xyz_key").unwrap().is_none());
+    }
+
+    // ---- Coverage: overflow entry insert into non-empty page (key fits inline, val overflow) ----
+
+    #[test]
+    fn test_insert_overflow_into_nonempty_page() {
+        let path = Path::new("target/test_insert_ov_nonempty.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        let file: File<Block> = File::make(path, 256).unwrap();
+
+        // First insert a small entry
+        file.insert(b"aaa", b"small").unwrap();
+
+        // Then insert an overflow entry into the same page
+        let big_val = vec![0xFFu8; 500];
+        file.insert(b"bbb", &big_val).unwrap();
+
+        assert_eq!(file.lookup(b"aaa").unwrap().unwrap().deref(), b"small");
+        assert_eq!(file.lookup(b"bbb").unwrap().unwrap(), big_val);
+    }
+
+    // ---- Coverage: remove overflow entry found by ceil (not prefix fallback) ----
+
+    #[test]
+    fn test_remove_overflow_ceil_match() {
+        let path = Path::new("target/test_remove_ov_ceil.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        let file: File<Block> = File::make(path, 256).unwrap();
+
+        let big_val = vec![0xDDu8; 500];
+        file.insert(b"hello", &big_val).unwrap();
+        assert!(file.lookup(b"hello").unwrap().is_some());
+
+        // Remove it -- ceil should find it because key fits inline
+        file.remove(b"hello").unwrap();
+        assert!(file.lookup(b"hello").unwrap().is_none());
+    }
+
+    // ---- Coverage: remove overflow entry where key doesn't match ----
+
+    #[test]
+    fn test_remove_overflow_key_mismatch() {
+        let path = Path::new("target/test_remove_ov_mismatch.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        let file: File<Block> = File::make(path, 256).unwrap();
+
+        let big_val = vec![0xCCu8; 500];
+        file.insert(b"hello", &big_val).unwrap();
+
+        // Try to remove a key that ceil matches to the overflow entry but isn't equal
+        file.remove(b"help").unwrap(); // "help" < "hello", but ceil("help") -> "hello"
+        // Original should still be there
+        assert!(file.lookup(b"hello").unwrap().is_some());
+    }
+
+    // ---- Coverage: above/below at boundaries ----
+
+    #[test]
+    fn test_above_beyond_max() {
+        let path = Path::new("target/test_above_beyond.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        let file: File<Block> = File::make(path, 256).unwrap();
+        file.insert(b"aaa", b"111").unwrap();
+        file.insert(b"bbb", b"222").unwrap();
+
+        // Key beyond max
+        assert_eq!(file.above(b"zzz").unwrap(), None);
+        // Key equal to max, no next
+        assert_eq!(file.above(b"bbb").unwrap(), None);
+        // Key below first
+        assert_eq!(file.above(b"000").unwrap(), Some(b"aaa".to_vec()));
+    }
+
+    #[test]
+    fn test_below_at_min() {
+        let path = Path::new("target/test_below_at_min.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        let file: File<Block> = File::make(path, 256).unwrap();
+        file.insert(b"bbb", b"222").unwrap();
+        file.insert(b"ccc", b"333").unwrap();
+
+        assert_eq!(file.below(b"bbb").unwrap(), None);
+        assert_eq!(file.below(b"aaa").unwrap(), None);
+        assert_eq!(file.below(b"ccc").unwrap(), Some(b"bbb".to_vec()));
+    }
+
+    // ---- Coverage: split with overflow entries at root level ----
+
+    #[test]
+    fn test_split_root_with_overflow() {
+        init_log();
+        let path = Path::new("target/test_split_root_ov.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        let page_bytes: u32 = 256;
+        let file: File<Block> = File::make(path, page_bytes).unwrap();
+
+        let big_val = vec![0xAAu8; 400];
+
+        // Each overflow entry uses ~(key_len + SLOT_BYTES) bytes inline on the page.
+        // With page_bytes=256, capacity=240. SPLIT_THRESHOLD=80% → need > 192 bytes.
+        // Using 20-byte keys: 20+16=36 bytes each. Need 6 entries → 216 > 192.
+        let keys: Vec<Vec<u8>> = (0..8).map(|i| format!("overflowkey_{:04}", i).into_bytes()).collect();
+        for key in &keys {
+            file.insert(key, &big_val).unwrap();
+        }
+
+        // Verify all entries survived the root split
+        for key in &keys {
+            let found = file.lookup(key).unwrap();
+            assert!(found.is_some(), "Key {:?} not found after root split", std::str::from_utf8(key));
+            assert_eq!(found.unwrap(), big_val);
+        }
+
+        // Tree should have structure visible in dump
+        let dump = file.dump();
+        assert!(dump.contains("OVERFLOW"));
+    }
+
+    // ---- Coverage: merge with overflow entries ----
+
+    #[test]
+    fn test_merge_with_overflow() {
+        init_log();
+        let path = Path::new("target/test_merge_ov.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        let page_bytes: u32 = 256;
+        let file: File<Block> = File::make(path, page_bytes).unwrap();
+
+        let big_val = vec![0xBBu8; 400];
+
+        // Insert many small entries spread across many leaves
+        for i in 0u8..20 {
+            let key = format!("s{:04}", i as u16 * 3);
+            file.insert(key.as_bytes(), &[i; 8]).unwrap();
+        }
+        // Insert overflow entries into different parts of the tree
+        file.insert(b"s0001", &big_val).unwrap();
+        file.insert(b"s0031", &big_val).unwrap();
+        file.insert(b"s0058", &big_val).unwrap();
+
+        // Aggressively remove small entries to trigger merges of pages with overflow
+        for i in 0u8..18 {
+            let key = format!("s{:04}", i as u16 * 3);
+            file.remove(key.as_bytes()).unwrap();
+        }
+
+        // Remaining entries should still be accessible
+        for i in 18u8..20 {
+            let key = format!("s{:04}", i as u16 * 3);
+            let found = file.lookup(key.as_bytes()).unwrap();
+            assert!(found.is_some(), "Key {} not found after merge", key);
+        }
+        assert_eq!(file.lookup(b"s0001").unwrap().unwrap(), big_val);
+        assert_eq!(file.lookup(b"s0031").unwrap().unwrap(), big_val);
+        assert_eq!(file.lookup(b"s0058").unwrap().unwrap(), big_val);
+    }
+
+    // ---- Coverage: large key overflow with remove via prefix fallback ----
+
+    #[test]
+    fn test_large_key_remove_via_prefix() {
+        let path = Path::new("target/test_large_key_remove_prefix.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        let page_bytes: u32 = 256;
+        let file: File<Block> = File::make(path, page_bytes).unwrap();
+
+        // Key larger than a page
+        let big_key = vec![0x42u8; 512];
+        let big_val = vec![0x99u8; 512];
+        file.insert(&big_key, &big_val).unwrap();
+
+        // Lookup via prefix scan
+        assert_eq!(file.lookup(&big_key).unwrap().unwrap(), big_val);
+
+        // Remove via prefix scan
+        file.remove(&big_key).unwrap();
+        assert!(file.lookup(&big_key).unwrap().is_none());
+    }
+
+    // ---- Coverage: above/below traversal through multi-level tree with overflow ----
+
+    #[test]
+    fn test_above_below_multilevel_overflow() {
+        init_log();
+        let path = Path::new("target/test_above_below_ml_ov.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        let page_bytes: u32 = 256;
+        let file: File<Block> = File::make(path, page_bytes).unwrap();
+
+        let big_val = vec![0xCCu8; 400];
+
+        // Create a multi-level tree with overflow entries
+        // Small entries to build tree structure
+        for i in 0u8..10 {
+            let key = vec![b'a' + i * 2; 4]; // a, c, e, g, i, k, m, o, q, s
+            file.insert(&key, &[i; 4]).unwrap();
+        }
+        // Overflow entries interspersed
+        file.insert(b"bbbb", &big_val).unwrap();
+        file.insert(b"llll", &big_val).unwrap();
+
+        // Test above/below traversal
+        let min = file.min().unwrap().unwrap();
+        let max = file.max().unwrap().unwrap();
+
+        // Walk up from min
+        let mut current = min.clone();
+        let mut count = 1;
+        while let Some(next) = file.above(&current).unwrap() {
+            assert!(next > current, "above should return strictly greater keys");
+            current = next;
+            count += 1;
+        }
+        assert_eq!(count, 12); // 10 small + 2 overflow
+
+        // Walk down from max
+        current = max;
+        count = 1;
+        while let Some(next) = file.below(&current).unwrap() {
+            assert!(next < current, "below should return strictly smaller keys");
+            current = next;
+            count += 1;
+        }
+        assert_eq!(count, 12);
+    }
+
+    // ---- Coverage: insert with key prefix path (key doesn't fit inline) ----
+
+    #[test]
+    fn test_insert_key_prefix_into_nonempty() {
+        // Use a larger page so the full key can serve as separator in internal nodes
+        let path = Path::new("target/test_insert_keyprefix_nonempty.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        let page_bytes: u32 = 512;
+        let file: File<Block> = File::make(path, page_bytes).unwrap();
+
+        // Insert a small entry first
+        file.insert(b"aaa", b"small").unwrap();
+
+        // Now insert a key that is larger than remaining page free space
+        // (triggers key prefix path in insert)
+        // page free after "aaa"+"small" = 512 - 16(head) - 16(slot) - 8(data) = 472
+        // key(460) + SLOT(16) = 476 > 472, so key doesn't fit -> prefix path
+        let big_key = vec![0xFFu8; 460];
+        let big_val = vec![0xEEu8; 300];
+        file.insert(&big_key, &big_val).unwrap();
+
+        // Verify both entries
+        assert_eq!(file.lookup(b"aaa").unwrap().unwrap().deref(), b"small");
+        assert_eq!(file.lookup(&big_key).unwrap().unwrap(), big_val);
+    }
+
+    // ---- Coverage: above/below needing subtree traversal where overflow is at boundary ----
+
+    #[test]
+    fn test_above_subtree_overflow_boundary() {
+        init_log();
+        // Construct a multi-level tree where above() must jump to the next subtree
+        // and the first entry in that subtree is an overflow entry.
+        let path = Path::new("target/test_above_subtree_ov.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        let page_bytes: u32 = 256;
+        let file: File<Block> = File::make(path, page_bytes).unwrap();
+
+        let big_val = vec![0xABu8; 400];
+
+        // Build a multi-level tree with many small entries
+        for i in 0u16..20 {
+            let key = format!("k{:04}", i * 3);
+            file.insert(key.as_bytes(), &[i as u8; 8]).unwrap();
+        }
+
+        // Now insert an overflow entry that will land near a subtree boundary
+        // This key should be between two existing small keys, and will be
+        // in a leaf that's at a subtree boundary
+        file.insert(b"k0031", &big_val).unwrap(); // between k0030 and k0033
+
+        // Query above() for keys near the overflow entry
+        // This will require subtree traversal if the overflow is the first entry in a subtree
+        for i in 0u16..20 {
+            let key = format!("k{:04}", i * 3);
+            if let Some(next) = file.above(key.as_bytes()).unwrap() {
+                assert!(next > key.as_bytes().to_vec());
+            }
+        }
+
+        // Query above the overflow entry
+        let above = file.above(b"k0031").unwrap();
+        if let Some(next) = above {
+            assert!(next > b"k0031".to_vec());
+        }
+    }
+
+    #[test]
+    fn test_below_subtree_overflow_boundary() {
+        init_log();
+        // Construct a multi-level tree where below() must jump to the previous subtree
+        // and the last entry is an overflow entry.
+        let path = Path::new("target/test_below_subtree_ov.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        let page_bytes: u32 = 256;
+        let file: File<Block> = File::make(path, page_bytes).unwrap();
+
+        let big_val = vec![0xCDu8; 400];
+
+        // Build the tree
+        for i in 0u16..20 {
+            let key = format!("m{:04}", i * 3);
+            file.insert(key.as_bytes(), &[i as u8; 8]).unwrap();
+        }
+
+        // Insert overflow entries near boundaries
+        file.insert(b"m0029", &big_val).unwrap();
+        file.insert(b"m0002", &big_val).unwrap();
+
+        // Query below() for keys near the overflow entries
+        for i in (0u16..20).rev() {
+            let key = format!("m{:04}", i * 3);
+            if let Some(prev) = file.below(key.as_bytes()).unwrap() {
+                assert!(prev < key.as_bytes().to_vec());
+            }
+        }
+
+        // Query below the overflow entry
+        let below = file.below(b"m0029").unwrap();
+        if let Some(prev) = below {
+            assert!(prev < b"m0029".to_vec());
+        }
+    }
+
+    // ---- Coverage: remove overflow entry from child page (not root) via prefix fallback ----
+
+    #[test]
+    fn test_remove_large_key_from_child_page() {
+        init_log();
+        // Use page_bytes=512 so the full key fits as a separator in internal nodes
+        // but doesn't fit inline in a leaf that already has entries.
+        let path = Path::new("target/test_remove_large_key_child.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        let page_bytes: u32 = 512;
+        let file: File<Block> = File::make(path, page_bytes).unwrap();
+
+        // Build a multi-level tree first with small entries
+        for i in 0u16..30 {
+            let key = format!("entry{:04}", i);
+            file.insert(key.as_bytes(), &[i as u8; 8]).unwrap();
+        }
+
+        // Insert a big key that requires the prefix overflow path in a leaf.
+        // max fit in leaf = 512 - 16 - slots/data already used. With a busy leaf:
+        // free ~350, so key of 460 bytes won't fit inline (460+16=476>350),
+        // but fits as separator in an empty root/internal node (476<496)
+        let big_key = vec![0x42u8; 460];
+        let val = b"bigval".to_vec();
+        file.insert(&big_key, &val).unwrap();
+
+        // Verify lookup
+        assert_eq!(file.lookup(&big_key).unwrap().unwrap().deref(), val.as_slice());
+
+        // Remove the big key -- since it's stored with a prefix, ceil won't find it
+        // exactly, so the prefix fallback path kicks in
+        file.remove(&big_key).unwrap();
+        assert!(file.lookup(&big_key).unwrap().is_none());
+
+        // All small entries should still be intact
+        for i in 0u16..30 {
+            let key = format!("entry{:04}", i);
+            assert!(file.lookup(key.as_bytes()).unwrap().is_some(),
+                "Entry {} missing after big key removal", i);
+        }
+    }
+
+    // ---- Coverage: next_id reuses freed pages ----
+
+    #[test]
+    fn test_next_id_reuse_freed_pages() {
+        init_log();
+        let path = Path::new("target/test_nextid_reuse.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        let page_bytes: u32 = 256;
+
+        // Create entries causing splits (many pages), then remove most
+        {
+            let file: File<Block> = File::make(path, page_bytes).unwrap();
+            // Insert enough to create multiple page splits
+            for i in 0u16..20 {
+                let key = format!("r{:04}", i);
+                file.insert(key.as_bytes(), &[i as u8; 8]).unwrap();
+            }
+            // Remove most entries to trigger merges that leave empty pages
+            for i in 0u16..18 {
+                let key = format!("r{:04}", i);
+                file.remove(key.as_bytes()).unwrap();
+            }
+        }
+
+        // Reopen -- open() should find empty pages and add them to the heap
+        {
+            let file: File<Block> = File::open(path).unwrap();
+            // Insert enough new entries to trigger splits and page allocation.
+            // next_id() should reuse freed page IDs from the empty heap.
+            for i in 0u16..20 {
+                let key = format!("n{:04}", i);
+                file.insert(key.as_bytes(), &[i as u8; 8]).unwrap();
+            }
+            // Verify
+            for i in 0u16..20 {
+                let key = format!("n{:04}", i);
+                assert!(file.lookup(key.as_bytes()).unwrap().is_some(),
+                    "Key n{:04} not found", i);
+            }
+        }
+    }
+
+    // ---- Coverage: merge page with overflow entries through the merge code path ----
+
+    #[test]
+    fn test_merge_moves_overflow_entries() {
+        init_log();
+        let path = Path::new("target/test_merge_moves_ov.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        let page_bytes: u32 = 256;
+        let file: File<Block> = File::make(path, page_bytes).unwrap();
+
+        let big_val = vec![0xEEu8; 400];
+
+        // Insert entries to create a multi-level tree
+        for i in 0u8..15 {
+            let key = format!("node_{:02}", i);
+            file.insert(key.as_bytes(), &[i; 8]).unwrap();
+        }
+
+        // Insert overflow entries spread across different leaf pages
+        file.insert(b"node_03_ov", &big_val).unwrap();
+        file.insert(b"node_08_ov", &big_val).unwrap();
+        file.insert(b"node_12_ov", &big_val).unwrap();
+
+        // Now remove most small entries to trigger merges
+        for i in 0u8..12 {
+            let key = format!("node_{:02}", i);
+            file.remove(key.as_bytes()).unwrap();
+        }
+
+        // The overflow entries should survive merges
+        assert_eq!(file.lookup(b"node_03_ov").unwrap().unwrap(), big_val);
+        assert_eq!(file.lookup(b"node_08_ov").unwrap().unwrap(), big_val);
+        assert_eq!(file.lookup(b"node_12_ov").unwrap().unwrap(), big_val);
+
+        // Remaining small entries
+        for i in 12u8..15 {
+            let key = format!("node_{:02}", i);
+            assert!(file.lookup(key.as_bytes()).unwrap().is_some());
+        }
+    }
+
+    // ---- Coverage: non-root split with overflow entries ----
+
+    #[test]
+    fn test_nonroot_split_with_overflow() {
+        init_log();
+        let path = Path::new("target/test_nonroot_split_ov.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        let page_bytes: u32 = 256;
+        let file: File<Block> = File::make(path, page_bytes).unwrap();
+
+        let big_val = vec![0xDDu8; 400];
+
+        // First build a multi-level tree
+        for i in 0u8..10 {
+            let key = format!("base{:03}", i * 10);
+            file.insert(key.as_bytes(), &[i; 8]).unwrap();
+        }
+
+        // Now insert overflow entries into a specific leaf page to make it split
+        for i in 0u8..4 {
+            let key = format!("base{:03}", i * 10 + 5); // between existing entries
+            file.insert(key.as_bytes(), &big_val).unwrap();
+        }
+
+        // Verify all entries
+        for i in 0u8..10 {
+            let key = format!("base{:03}", i * 10);
+            assert!(file.lookup(key.as_bytes()).unwrap().is_some(),
+                "base entry {} missing", i);
+        }
+        for i in 0u8..4 {
+            let key = format!("base{:03}", i * 10 + 5);
+            assert_eq!(file.lookup(key.as_bytes()).unwrap().unwrap(), big_val,
+                "overflow entry {} mismatch", i);
+        }
+    }
+
+    // ---- Coverage: dump with empty tree ----
+
+    #[test]
+    fn test_dump_empty() {
+        let path = Path::new("target/test_dump_empty.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        let file: File<Block> = File::make(path, 256).unwrap();
+        let dump = file.dump();
+        assert!(dump.contains("empty"));
+    }
+
+    // ---- Coverage: above/below where key matches last/first entry exactly ----
+
+    #[test]
+    fn test_above_equal_last_in_subtree() {
+        // Test that above() handles the case where the queried key equals
+        // the last entry in a leaf, requiring traversal to parent's next subtree
+        let path = Path::new("target/test_above_eq_last.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        let page_bytes: u32 = 256;
+        let file: File<Block> = File::make(path, page_bytes).unwrap();
+
+        // Build a 2-level tree
+        for i in 0u16..16 {
+            let key = format!("x{:04}", i);
+            file.insert(key.as_bytes(), &[i as u8; 8]).unwrap();
+        }
+
+        // Query above for each key -- ensures subtree traversal at boundaries
+        let mut keys: Vec<String> = (0..16).map(|i| format!("x{:04}", i)).collect();
+        keys.sort();
+
+        for w in keys.windows(2) {
+            let above = file.above(w[0].as_bytes()).unwrap();
+            assert_eq!(above, Some(w[1].as_bytes().to_vec()),
+                "above({}) should be {}", w[0], w[1]);
+        }
+        // Last key should have no above
+        assert_eq!(file.above(keys.last().unwrap().as_bytes()).unwrap(), None);
+    }
+
+    #[test]
+    fn test_below_equal_first_in_subtree() {
+        let path = Path::new("target/test_below_eq_first.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        let page_bytes: u32 = 256;
+        let file: File<Block> = File::make(path, page_bytes).unwrap();
+
+        for i in 0u16..16 {
+            let key = format!("y{:04}", i);
+            file.insert(key.as_bytes(), &[i as u8; 8]).unwrap();
+        }
+
+        let mut keys: Vec<String> = (0..16).map(|i| format!("y{:04}", i)).collect();
+        keys.sort();
+
+        for w in keys.windows(2) {
+            let below = file.below(w[1].as_bytes()).unwrap();
+            assert_eq!(below, Some(w[0].as_bytes().to_vec()),
+                "below({}) should be {}", w[1], w[0]);
+        }
+        // First key should have no below
+        assert_eq!(file.below(keys.first().unwrap().as_bytes()).unwrap(), None);
+    }
+
+    // ---- Coverage: min/max with overflow in multi-level tree ----
+
+    #[test]
+    fn test_min_max_overflow_multilevel() {
+        let path = Path::new("target/test_minmax_ov_ml.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        let page_bytes: u32 = 256;
+        let file: File<Block> = File::make(path, page_bytes).unwrap();
+
+        let big_val = vec![0xFFu8; 400];
+
+        // Build multi-level tree with small entries
+        for i in 1u16..15 {
+            let key = format!("q{:04}", i);
+            file.insert(key.as_bytes(), &[i as u8; 8]).unwrap();
+        }
+
+        // Make the min and max entries overflow
+        file.insert(b"q0000", &big_val).unwrap(); // new min is overflow
+        file.insert(b"q9999", &big_val).unwrap(); // new max is overflow
+
+        let min = file.min().unwrap().unwrap();
+        let max = file.max().unwrap().unwrap();
+        assert_eq!(min, b"q0000".to_vec());
+        assert_eq!(max, b"q9999".to_vec());
+    }
+
+    // ---- Coverage: insert overflow where parent needs update ----
+
+    #[test]
+    fn test_insert_overflow_updates_parent() {
+        let path = Path::new("target/test_insert_ov_parent.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        let page_bytes: u32 = 256;
+        let file: File<Block> = File::make(path, page_bytes).unwrap();
+
+        let big_val = vec![0xBBu8; 400];
+
+        // Build a multi-level tree
+        for i in 0u16..10 {
+            let key = format!("p{:04}", i * 10);
+            file.insert(key.as_bytes(), &[i as u8; 8]).unwrap();
+        }
+
+        // Insert an overflow entry with a key greater than the current max
+        // of a leaf page, triggering parent key update
+        file.insert(b"p0999", &big_val).unwrap();
+
+        // Verify
+        assert_eq!(file.lookup(b"p0999").unwrap().unwrap(), big_val);
+
+        // Check tree integrity by dumping
+        let dump = file.dump();
+        assert!(!dump.is_empty());
+    }
+
+    // ---- Coverage: comprehensive overflow stress test ----
+
+    #[test]
+    fn test_overflow_stress() {
+        init_log();
+        let path = Path::new("target/test_overflow_stress.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        let page_bytes: u32 = 256;
+        let file: File<Block> = File::make(path, page_bytes).unwrap();
+
+        let big_val = vec![0xFFu8; 400];
+        let mut all_keys: Vec<Vec<u8>> = Vec::new();
+
+        // Phase 1: Build a multi-level tree with many overflow entries
+        // to ensure overflow entries end up at subtree boundaries
+        for i in 0u32..30 {
+            let key = format!("ov{:06}", i * 7);
+            file.insert(key.as_bytes(), &big_val).unwrap();
+            all_keys.push(key.into_bytes());
+        }
+        all_keys.sort();
+
+        // Phase 2: Verify all entries
+        for key in &all_keys {
+            assert!(file.lookup(key).unwrap().is_some(),
+                "Missing key after insert: {:?}", std::str::from_utf8(key));
+        }
+
+        // Phase 3: Test above/below traversal (overflow entries at boundaries)
+        for w in all_keys.windows(2) {
+            let above = file.above(&w[0]).unwrap();
+            assert_eq!(above, Some(w[1].clone()),
+                "above({:?}) should be {:?}",
+                std::str::from_utf8(&w[0]),
+                std::str::from_utf8(&w[1]));
+        }
+        assert_eq!(file.above(all_keys.last().unwrap()).unwrap(), None);
+
+        for w in all_keys.windows(2) {
+            let below = file.below(&w[1]).unwrap();
+            assert_eq!(below, Some(w[0].clone()),
+                "below({:?}) should be {:?}",
+                std::str::from_utf8(&w[1]),
+                std::str::from_utf8(&w[0]));
+        }
+        assert_eq!(file.below(all_keys.first().unwrap()).unwrap(), None);
+
+        // Phase 4: min/max
+        assert_eq!(file.min().unwrap().unwrap(), all_keys[0]);
+        assert_eq!(file.max().unwrap().unwrap(), *all_keys.last().unwrap());
+
+        // Phase 5: dump should show overflow entries
+        let dump = file.dump();
+        assert!(dump.contains("OVERFLOW"));
+
+        // Phase 6: Remove half and verify rest
+        for key in all_keys.iter().step_by(2) {
+            file.remove(key).unwrap();
+        }
+        for (i, key) in all_keys.iter().enumerate() {
+            let found = file.lookup(key).unwrap();
+            if i % 2 == 0 {
+                assert!(found.is_none(), "Key {:?} should have been removed",
+                    std::str::from_utf8(key));
+            } else {
+                assert!(found.is_some(), "Key {:?} should still exist",
+                    std::str::from_utf8(key));
+            }
+        }
+    }
+
+    // ---- Coverage: mixed overflow and inline with full tree operations ----
+
+    #[test]
+    fn test_overflow_interleaved_with_inline() {
+        init_log();
+        let path = Path::new("target/test_overflow_interleaved.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        let page_bytes: u32 = 256;
+        let file: File<Block> = File::make(path, page_bytes).unwrap();
+
+        let big_val = vec![0xCCu8; 500];
+        let mut all: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+
+        // Interleave small and overflow entries
+        for i in 0u32..40 {
+            let key = format!("k{:06}", i);
+            let val = if i % 3 == 0 {
+                big_val.clone()
+            } else {
+                vec![i as u8; 8]
+            };
+            file.insert(key.as_bytes(), &val).unwrap();
+            all.push((key.into_bytes(), val));
+        }
+        all.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Test above/below on this mixed tree
+        for w in all.windows(2) {
+            let above = file.above(&w[0].0).unwrap();
+            assert_eq!(above.as_ref(), Some(&w[1].0));
+        }
+        for w in all.windows(2) {
+            let below = file.below(&w[1].0).unwrap();
+            assert_eq!(below.as_ref(), Some(&w[0].0));
+        }
+
+        // Remove overflow entries specifically, then remove small entries
+        for (key, val) in &all {
+            if val.len() > 100 {
+                file.remove(key).unwrap();
+            }
+        }
+        for (key, val) in &all {
+            let found = file.lookup(key).unwrap();
+            if val.len() > 100 {
+                assert!(found.is_none());
+            } else {
+                assert!(found.is_some());
+            }
+        }
     }
 }
