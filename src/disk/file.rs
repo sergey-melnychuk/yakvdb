@@ -17,7 +17,7 @@ use std::convert::TryInto;
 use std::sync::Arc;
 
 use parking_lot::{
-    MappedRwLockReadGuard, MappedRwLockWriteGuard, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard,
+    MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
 
 pub struct File<P: Page> {
@@ -37,16 +37,29 @@ pub struct File<P: Page> {
     /// The locks above guard individual page accesses only, while a tree operation
     /// spans many of them: `split` snapshots a page, releases the lock to allocate a
     /// peer page, then re-acquires it and expects the snapshot to still describe the
-    /// page. Reads are exclusive too, because `page()` looks a page up in a second
-    /// step after `cache()` put it there, and a concurrent reader can evict it in
-    /// between. This lock is what makes `Store` operations atomic.
-    ops: Arc<Mutex<()>>,
+    /// page. `insert` and `remove` take this lock exclusively, so no other operation
+    /// ever observes the tree mid-rewrite.
+    ///
+    /// The read-only operations share it: the tree cannot change underneath them,
+    /// and everything else they touch tolerates concurrency -- `page()` retries when
+    /// a page is evicted out from under it, and page reads are positional, so they
+    /// only need a shared lock on the file handle.
+    ops: Arc<RwLock<()>>,
 }
 
 const MAGIC: &[u8] = b"YAKVDB42";
 
 const HEAD: usize = MAGIC.len() + size_of::<Head>();
 const ROOT: u32 = 1;
+
+/// How many times `page`/`page_mut` reload a page that was evicted between
+/// `cache()` putting it there and the borrow that hands it to the caller.
+///
+/// A page is the most-recently-used entry the moment it lands in the cache, so
+/// losing it this many times in a row does not happen in practice. The bound is
+/// there so that a pathological workload fails the operation instead of spinning
+/// forever.
+const CACHE_RETRIES: usize = 32;
 
 // Percentage threshold for splitting (on insert) and merging (on delete) pages
 const SPLIT_THRESHOLD: u8 = 80;
@@ -105,7 +118,7 @@ impl<P: Page> File<P> {
             cache: Arc::new(RwLock::new(LruCache::new(32))),
             dirty: Arc::new(RwLock::new(HashSet::with_capacity(32))),
             empty: Arc::new(RwLock::new(BinaryHeap::with_capacity(32))),
-            ops: Arc::new(Mutex::new(())),
+            ops: Arc::new(RwLock::new(())),
         })
     }
 
@@ -159,7 +172,7 @@ impl<P: Page> File<P> {
             cache: Arc::new(RwLock::new(LruCache::new(32))),
             dirty: Arc::new(RwLock::new(HashSet::with_capacity(32))),
             empty: Arc::new(RwLock::new(BinaryHeap::with_capacity(16))),
-            ops: Arc::new(Mutex::new(())),
+            ops: Arc::new(RwLock::new(())),
         };
 
         let _ = this.cache.write().put(ROOT, root);
@@ -197,13 +210,29 @@ impl<P: Page> File<P> {
         Ok(this)
     }
 
-    fn load(&self, offset: usize, length: u32) -> io::Result<P> {
-        let mut page = P::reserve(length);
+    /// Read exactly `buf.len()` bytes starting at `offset`.
+    ///
+    /// `seek` + `read_exact` needs `&mut File`, which would force every read to
+    /// take the file lock exclusively and serialize readers against each other.
+    /// A positional read needs only `&File`, so readers share the handle. Writes
+    /// still seek, but they run under the exclusive `ops` lock anyway.
+    fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            self.file.read().read_exact_at(buf, offset)
+        }
+        #[cfg(not(unix))]
         {
             let mut file = self.file.write();
-            file.seek(SeekFrom::Start(offset as u64))?;
-            file.read_exact(page.as_mut())?;
+            file.seek(SeekFrom::Start(offset))?;
+            file.read_exact(buf)
         }
+    }
+
+    fn load(&self, offset: usize, length: u32) -> io::Result<P> {
+        let mut page = P::reserve(length);
+        self.read_exact_at(offset as u64, page.as_mut())?;
         debug!("Loading page {}", page.id());
         Ok(page)
     }
@@ -289,11 +318,7 @@ impl<P: Page> File<P> {
         let region_bytes = multiplier as usize * self.head.page_bytes as usize;
         let mut buf = vec![0u8; region_bytes];
         let offset = self.offset(start_page) as u64;
-        {
-            let mut f = self.file.write();
-            f.seek(SeekFrom::Start(offset))?;
-            f.read_exact(&mut buf)?;
-        }
+        self.read_exact_at(offset, &mut buf)?;
 
         let _id = u32::from_be_bytes(buf[0..4].try_into().unwrap());
         let magic = u32::from_be_bytes(buf[4..8].try_into().unwrap());
@@ -395,11 +420,7 @@ impl<P: Page> File<P> {
     /// Read only the overflow header to extract key_len and val_len.
     fn read_overflow_header(&self, page_offset: usize) -> io::Result<(u32, u32, u32)> {
         let mut hdr = [0u8; OVERFLOW_HEAD];
-        {
-            let mut f = self.file.write();
-            f.seek(SeekFrom::Start(page_offset as u64))?;
-            f.read_exact(&mut hdr)?;
-        }
+        self.read_exact_at(page_offset as u64, &mut hdr)?;
         let magic = u32::from_be_bytes(hdr[4..8].try_into().unwrap());
         let key_len = u32::from_be_bytes(hdr[8..12].try_into().unwrap());
         let val_len = u32::from_be_bytes(hdr[12..16].try_into().unwrap());
@@ -409,7 +430,7 @@ impl<P: Page> File<P> {
 
 impl<P: Page> Store for File<P> {
     fn lookup(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let _op = self.ops.lock();
+        let _op = self.ops.read();
         debug!("lookup: {}", hex(key));
         let mut seen = HashSet::with_capacity(8);
         let mut page = self.root();
@@ -466,7 +487,7 @@ impl<P: Page> Store for File<P> {
     }
 
     fn insert(&self, key: &[u8], val: &[u8]) -> Result<()> {
-        let _op = self.ops.lock();
+        let _op = self.ops.write();
         debug!("insert: {} -> {}", hex(key), hex(val));
         let mut page = self.root_mut();
         let mut seen = HashSet::with_capacity(8);
@@ -634,7 +655,7 @@ impl<P: Page> Store for File<P> {
     }
 
     fn remove(&self, key: &[u8]) -> Result<()> {
-        let _op = self.ops.lock();
+        let _op = self.ops.write();
         debug!("remove: {}", hex(key));
         let mut page = self.root_mut();
         let mut seen = HashSet::with_capacity(8);
@@ -834,12 +855,12 @@ impl<P: Page> Store for File<P> {
     }
 
     fn is_empty(&self) -> bool {
-        let _op = self.ops.lock();
+        let _op = self.ops.read();
         self.root().len() == 0
     }
 
     fn min(&self) -> Result<Option<Vec<u8>>> {
-        let _op = self.ops.lock();
+        let _op = self.ops.read();
         let mut page = self.root();
         if page.len() == 0 {
             return Ok(None);
@@ -865,7 +886,7 @@ impl<P: Page> Store for File<P> {
     }
 
     fn max(&self) -> Result<Option<Vec<u8>>> {
-        let _op = self.ops.lock();
+        let _op = self.ops.read();
         let mut page = self.root();
         if page.len() == 0 {
             return Ok(None);
@@ -892,7 +913,7 @@ impl<P: Page> Store for File<P> {
     }
 
     fn above(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let _op = self.ops.lock();
+        let _op = self.ops.read();
         debug!("above: {}", hex(key));
 
         let mut path = Vec::with_capacity(8);
@@ -927,6 +948,10 @@ impl<P: Page> Store for File<P> {
                 } else {
                     // ceil == key, need to take min value from parent's next adjacent subtree
                     for (parent_id, parent_idx) in path.iter().rev().cloned() {
+                        // `page` holds a read guard on the cache and `page()` may
+                        // need the write guard: releasing it first is what keeps
+                        // this from deadlocking against itself.
+                        drop(page);
                         page = self.page(parent_id).unwrap();
                         if parent_idx < page.len() - 1 {
                             let id = page.slot(parent_idx + 1).unwrap().page;
@@ -968,7 +993,7 @@ impl<P: Page> Store for File<P> {
     }
 
     fn below(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let _op = self.ops.lock();
+        let _op = self.ops.read();
         debug!("below: {}", hex(key));
 
         let mut path = Vec::with_capacity(8);
@@ -1043,8 +1068,19 @@ impl<P: Page> Tree<P> for File<P> {
 
     fn page(&self, id: u32) -> Option<MappedRwLockReadGuard<'_, P>> {
         self.cache(id).ok()?;
-        let page = RwLockReadGuard::map(self.cache.read(), |cache| cache.get(&id).unwrap());
-        Some(page)
+        for _ in 0..CACHE_RETRIES {
+            // On failure `try_map` hands the guard back: it has to be dropped
+            // before `cache()`, which takes the write guard, or this deadlocks
+            // against itself. The page was evicted between `cache()` putting it
+            // there and the borrow below, so load it again and retry.
+            match RwLockReadGuard::try_map(self.cache.read(), |cache| cache.get(&id)) {
+                Ok(page) => return Some(page),
+                Err(guard) => drop(guard),
+            }
+            self.cache(id).ok()?;
+        }
+        error!("Page {id} evicted {CACHE_RETRIES} times while being read");
+        None
     }
 
     fn root_mut(&self) -> MappedRwLockWriteGuard<'_, P> {
@@ -1055,8 +1091,15 @@ impl<P: Page> Tree<P> for File<P> {
     fn page_mut(&self, id: u32) -> Option<MappedRwLockWriteGuard<'_, P>> {
         self.cache(id).ok()?;
         self.mark(id);
-        let page = RwLockWriteGuard::map(self.cache.write(), |cache| cache.get_mut(&id).unwrap());
-        Some(page)
+        for _ in 0..CACHE_RETRIES {
+            match RwLockWriteGuard::try_map(self.cache.write(), |cache| cache.get_mut(&id)) {
+                Ok(page) => return Some(page),
+                Err(guard) => drop(guard),
+            }
+            self.cache(id).ok()?;
+        }
+        error!("Page {id} evicted {CACHE_RETRIES} times while being written");
+        None
     }
 
     fn cache(&self, id: u32) -> io::Result<()> {

@@ -182,3 +182,53 @@ fn test_concurrent_readers_only() {
         h.join().expect("worker thread panicked");
     }
 }
+
+#[test]
+fn test_concurrent_iteration() {
+    // `above`/`below` walk back up to a parent page part-way through a
+    // traversal. `above` used to fetch that parent while still holding a read
+    // guard on the page cache, which deadlocks the moment another thread wants
+    // the write guard to load a page of its own.
+    let path = tmp("iterate");
+    let db = Arc::new(KV::make(Path::new(&path), PAGE).unwrap());
+
+    let n = 2000usize;
+    for i in 0..n {
+        db.insert(&key(i), &val(i)).unwrap();
+    }
+
+    let min = db.min().unwrap().expect("min");
+    let max = db.max().unwrap().expect("max");
+    assert_eq!(min, key(0));
+    assert_eq!(max, key(n - 1));
+
+    let mut handles = Vec::with_capacity(8);
+    for w in 0..8 {
+        let db = db.clone();
+        let (min, max) = (min.clone(), max.clone());
+        handles.push(thread::spawn(move || {
+            let mut count = 1usize;
+            if w % 2 == 0 {
+                let mut cur = min;
+                while let Some(next) = db.above(&cur).unwrap() {
+                    assert!(next > cur, "above went backwards");
+                    cur = next;
+                    count += 1;
+                }
+                assert_eq!(cur, max, "ascending walk ended early");
+            } else {
+                let mut cur = max;
+                while let Some(prev) = db.below(&cur).unwrap() {
+                    assert!(prev < cur, "below went forwards");
+                    cur = prev;
+                    count += 1;
+                }
+                assert_eq!(cur, min, "descending walk ended early");
+            }
+            assert_eq!(count, n, "walk visited the wrong number of keys");
+        }));
+    }
+    for h in handles {
+        h.join().expect("worker thread panicked");
+    }
+}

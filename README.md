@@ -27,14 +27,21 @@ PLAN:
   - `max`
   - `len` (iterate from `min` to `max`)
   - basic defragment/restore utilities
-- [ ] let reads run concurrently instead of one at a time
-  - make `ops` an `RwLock` and take `read()` in `lookup`/`min`/`max`/`above`/`below`
-  - blocked on `page()`/`page_mut()`: they resolve the cache entry in a second
-    step after `cache()` put it there, so a concurrent reader can evict it in
-    between - they need a single locked step, or a retry on eviction
-  - even then the payoff is small while page reads go through `self.file.write()`
-    (`seek` + `read_exact` needs `&mut File`): positional reads (`FileExt::read_at`
-    on unix) are the prerequisite for readers to actually run in parallel
+- [x] let reads run concurrently instead of one at a time
+  - `ops` is an `RwLock`: `insert`/`remove` take `write()`, the read-only
+    operations take `read()` and run at the same time as each other
+  - `page()`/`page_mut()` retry when a page is evicted between `cache()` putting
+    it there and the borrow that hands it to the caller
+  - page reads are positional (`FileExt::read_exact_at` on unix), so they need
+    only a shared lock on the file handle instead of `&mut File` for `seek`
+  - measured on 20k keys, 40k lookups, release: 300k op/s flat at any thread
+    count before, 487k (1 thread) / 666k (4 threads) after
+- [ ] cut page-cache contention between concurrent readers
+  - every page access calls `LruCache::touch`, which takes `lru.write()` to move
+    the key to the most-recently-used end: one exclusive lock per page read, and
+    now the limit on how far reads scale (8 threads are slower than 4)
+  - wants an approximation that reads can update without excluding each other -
+    a CLOCK/second-chance referenced bit, or sharding the cache by page id
 - [ ] sweep `page(id).unwrap()`/`page_mut(id).unwrap()` into typed errors
   - a corrupted file should fail one operation, not the process
   - `split`/`check` were done already, the rest is its own pass
