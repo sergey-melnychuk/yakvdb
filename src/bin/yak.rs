@@ -8,7 +8,6 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use yakvdb::api::page::Page;
-use yakvdb::api::tree::Tree;
 use yakvdb::api::Store;
 use yakvdb::disk::block::Block;
 use yakvdb::disk::file::File;
@@ -220,7 +219,7 @@ fn main() {
                     "len" | "size" | "count" => {
                         let mut len = 0u64;
                         for id in 1..=page_count {
-                            if let Some(page) = file.page(id) {
+                            if let Some(page) = file.read_page(id) {
                                 len += page.len() as u64;
                             }
                         }
@@ -389,7 +388,7 @@ fn main() {
                         let mut size = 0u64;
                         let mut free = 0u64;
                         for id in 1..=page_count {
-                            if let Some(page) = file.page(id) {
+                            if let Some(page) = file.read_page(id) {
                                 size += page.cap() as u64;
                                 free += page.free() as u64;
                             }
@@ -401,7 +400,7 @@ fn main() {
                     "tree" => {
                         // Helper function to determine page type
                         fn page_type(file: &File<Block>, id: u32) -> &'static str {
-                            if let Some(page) = file.page(id) {
+                            if let Some(page) = file.read_page(id) {
                                 if page.len() == 0 {
                                     return "EMPTY";
                                 }
@@ -429,7 +428,7 @@ fn main() {
                         output_lines.push(format!("{:-<45}", ""));
 
                         for id in 1..=page_count {
-                            if let Some(page) = file.page(id) {
+                            if let Some(page) = file.read_page(id) {
                                 let page_type = page_type(&file, id);
                                 let fill_percent = page.full();
 
@@ -474,7 +473,7 @@ fn main() {
                             continue;
                         }
                         if let Ok(page_id) = args[1].parse::<u32>() {
-                            if let Some(page) = file.page(page_id) {
+                            if let Some(page) = file.read_page(page_id) {
                                 // Determine page type
                                 let page_type = if page.len() == 0 {
                                     "EMPTY"
@@ -563,7 +562,10 @@ fn main() {
                         }
                     }
                     "root" => {
-                        let root_page = file.root();
+                        let Some(root_page) = file.read_root() else {
+                            println!("Root page could not be read");
+                            continue;
+                        };
                         let page_type = if root_page.len() == 0 {
                             "EMPTY"
                         } else {

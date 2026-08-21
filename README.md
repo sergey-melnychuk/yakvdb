@@ -10,8 +10,8 @@ PLAN:
     `min`/`max`/`above`/`below`) are serialized by an operation-level lock, so
     one runs at a time and a shared `Arc<KV>` is safe to use from many threads
     (reads included: they are exclusive too, not shared)
-  - `Tree` methods are internal and assume the caller already holds that lock:
-    calling them directly from several threads bypasses it
+  - `Tree` is crate-private: its methods assume the caller already holds that
+    lock, so reaching them from outside would bypass it
   - the `next_id`/`alloc_overflow` races are subsumed by the operation lock:
     do not add separate locks for them
 - [x] split `Tree` trait into pub KV-only and internal page-aware
@@ -46,11 +46,15 @@ PLAN:
   - a corrupted file should fail one operation, not the process
   - `try_page`/`try_page_mut` return `Error::Tree` instead of `None`, and all
     38 call sites in `Result`-returning functions use `?`
-  - `root()`/`root_mut()` still `unwrap`: they return the guard directly, so
-    changing them means changing the `Tree` trait - see the item below
-- [ ] seal the `Tree` trait, or mark it `#[doc(hidden)]`
-  - a caller using `Tree` directly from several threads still bypasses `ops`
-  - a public API break: `src/bin/yak.rs` and downstream users call `Tree::flush`
+  - `root()`/`root_mut()` return `Result` too, which was free to do once the
+    `Tree` trait stopped being public
+- [x] make the `Tree` trait crate-private
+  - a caller reaching `Tree` directly bypassed `ops` altogether, and sealing the
+    trait would only have blocked outside *implementations*, not outside *calls*
+  - `File` gained safe equivalents that take the lock: `read_page`/`read_root`
+    hand back an owned page copy rather than a guard, plus `sync` and `dump`
+  - this also stops `parking_lot` guard types leaking into the public API
+  - a public API break, hence 0.7.0: `yakvdb::api::tree` is gone
 
 ---
 
@@ -73,8 +77,9 @@ On insert/remove each page performs O(K) cleanup to keep keys ordered, as well a
 Each insert/remove gets flushed to disk for durability.
 
 ### API
+* [Store](src/api/mod.rs) is the public key-value API (impl: [File](src/disk/file.rs))
 * [Page](src/api/page.rs) defines BTree node (impl: [Block](src/disk/block.rs))
-* [Tree](src/api/tree.rs) defines full BTree (impl: [File](src/disk/file.rs))
+* [Tree](src/api/tree.rs) defines the page-aware BTree internals (crate-private)
 
 ### Demo
 

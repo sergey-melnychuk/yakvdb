@@ -272,6 +272,44 @@ impl<P: Page> File<P> {
         self.head.page_bytes
     }
 
+    /// A copy of the page with the given `id`, or `None` if it cannot be read.
+    ///
+    /// Inspection tools -- the `yak` CLI -- need to look at raw pages. Handing
+    /// out a page guard would let a caller hold a lock across arbitrary work,
+    /// and reach page-level state without going through the operation lock at
+    /// all, which is the reason `Tree` is not public. A copy costs one page of
+    /// memory and keeps both problems inside the crate.
+    pub fn read_page(&self, id: u32) -> Option<P> {
+        let _op = self.ops.read();
+        let page = self.page(id)?;
+        let mut copy = P::reserve(self.head.page_bytes);
+        copy.as_mut().copy_from_slice(page.as_ref());
+        Some(copy)
+    }
+
+    /// A copy of the root page, or `None` if it cannot be read. See `read_page`.
+    pub fn read_root(&self) -> Option<P> {
+        self.read_page(ROOT)
+    }
+
+    /// A debugging dump of the whole tree, with keys and values as hex strings.
+    ///
+    /// Walks every page, so it is only useful on small trees.
+    pub fn dump(&self) -> String {
+        let _op = self.ops.read();
+        Tree::dump(self)
+    }
+
+    /// Write every page modified so far to disk.
+    ///
+    /// `insert` and `remove` already flush on their own; this is for callers
+    /// that want to force it. It takes the operation lock, unlike the internal
+    /// `Tree::flush`, which assumes the caller is already holding it.
+    pub fn sync(&self) -> Result<()> {
+        let _op = self.ops.write();
+        Tree::flush(self)
+    }
+
     // ---- Overflow I/O ----
 
     /// Compute the number of pages needed for an overflow region holding `data_len` bytes.
@@ -450,7 +488,7 @@ impl<P: Page> Store for File<P> {
         let _op = self.ops.read();
         debug!("lookup: {}", hex(key));
         let mut seen = HashSet::with_capacity(8);
-        let mut page = self.root();
+        let mut page = self.root()?;
         loop {
             let idx_opt = page.ceil(key);
 
@@ -506,7 +544,7 @@ impl<P: Page> Store for File<P> {
     fn insert(&self, key: &[u8], val: &[u8]) -> Result<()> {
         let _op = self.ops.write();
         debug!("insert: {} -> {}", hex(key), hex(val));
-        let mut page = self.root_mut();
+        let mut page = self.root_mut()?;
         let mut seen = HashSet::with_capacity(8);
         let mut path = Vec::with_capacity(8);
         loop {
@@ -674,7 +712,7 @@ impl<P: Page> Store for File<P> {
     fn remove(&self, key: &[u8]) -> Result<()> {
         let _op = self.ops.write();
         debug!("remove: {}", hex(key));
-        let mut page = self.root_mut();
+        let mut page = self.root_mut()?;
         let mut seen = HashSet::with_capacity(8);
         let mut path = Vec::with_capacity(8);
         loop {
@@ -875,12 +913,14 @@ impl<P: Page> Store for File<P> {
 
     fn is_empty(&self) -> bool {
         let _op = self.ops.read();
-        self.root().len() == 0
+        // A root that cannot be read is not an empty tree: report the file as
+        // non-empty so a caller does not mistake a broken one for a fresh one.
+        self.root().map(|page| page.len() == 0).unwrap_or(false)
     }
 
     fn min(&self) -> Result<Option<Vec<u8>>> {
         let _op = self.ops.read();
-        let mut page = self.root();
+        let mut page = self.root()?;
         if page.len() == 0 {
             return Ok(None);
         }
@@ -902,7 +942,7 @@ impl<P: Page> Store for File<P> {
 
     fn max(&self) -> Result<Option<Vec<u8>>> {
         let _op = self.ops.read();
-        let mut page = self.root();
+        let mut page = self.root()?;
         if page.len() == 0 {
             return Ok(None);
         }
@@ -928,7 +968,7 @@ impl<P: Page> Store for File<P> {
         debug!("above: {}", hex(key));
 
         let mut path = Vec::with_capacity(8);
-        let mut page = self.root();
+        let mut page = self.root()?;
         if page.len() == 0 {
             return Ok(None);
         }
@@ -1004,7 +1044,7 @@ impl<P: Page> Store for File<P> {
         debug!("below: {}", hex(key));
 
         let mut path = Vec::with_capacity(8);
-        let mut page = self.root();
+        let mut page = self.root()?;
         if page.len() == 0 {
             return Ok(None);
         }
@@ -1065,8 +1105,8 @@ impl<P: Page> Store for File<P> {
 }
 
 impl<P: Page> Tree<P> for File<P> {
-    fn root(&self) -> MappedRwLockReadGuard<'_, P> {
-        self.page(ROOT).unwrap()
+    fn root(&self) -> Result<MappedRwLockReadGuard<'_, P>> {
+        self.try_page(ROOT)
     }
 
     fn page(&self, id: u32) -> Option<MappedRwLockReadGuard<'_, P>> {
@@ -1086,9 +1126,9 @@ impl<P: Page> Tree<P> for File<P> {
         None
     }
 
-    fn root_mut(&self) -> MappedRwLockWriteGuard<'_, P> {
+    fn root_mut(&self) -> Result<MappedRwLockWriteGuard<'_, P>> {
         self.mark(ROOT);
-        self.page_mut(ROOT).unwrap()
+        self.try_page_mut(ROOT)
     }
 
     fn page_mut(&self, id: u32) -> Option<MappedRwLockWriteGuard<'_, P>> {
@@ -1517,7 +1557,7 @@ mod tests {
         {
             let file: File<Block> = File::make(path, size).unwrap();
             {
-                let mut page = file.root_mut();
+                let mut page = file.root_mut().unwrap();
                 for (k, v, p, _) in data.iter() {
                     if *p == 0 {
                         page.put_val(k, v);
@@ -1526,7 +1566,7 @@ mod tests {
                     }
                 }
             };
-            let page = file.root();
+            let page = file.root().unwrap();
             file.save(page.deref()).unwrap();
         }
 
@@ -1575,7 +1615,7 @@ mod tests {
             assert!(file.lookup(k).unwrap().is_none());
         }
 
-        let root = file.root();
+        let root = file.root().unwrap();
         assert_eq!(root.copy(), vec![]);
     }
 
@@ -1657,7 +1697,7 @@ mod tests {
         }
         debug!("{}", file.dump());
 
-        let root = file.root();
+        let root = file.root().unwrap();
         let copy = root.copy();
         assert_eq!(copy, vec![]);
     }
@@ -1864,7 +1904,7 @@ mod tests {
             assert_eq!(found, None);
         }
 
-        let copy = file.root().copy();
+        let copy = file.root().unwrap().copy();
         debug!("{}", file.dump());
         assert!(copy.is_empty());
     }

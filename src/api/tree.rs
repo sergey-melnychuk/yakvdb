@@ -2,15 +2,21 @@ use crate::api::error::Result;
 use crate::api::page::Page;
 use parking_lot::{MappedRwLockReadGuard, MappedRwLockWriteGuard};
 
-pub trait Tree<P: Page> {
+/// The page-aware internals of the tree.
+///
+/// Crate-private on purpose: every method here assumes the caller already
+/// holds `File`'s operation lock, so reaching them from outside would bypass
+/// the very thing that makes `Store` operations atomic. `File` exposes safe
+/// equivalents -- `read_page`, `read_root`, `sync` -- that take the lock.
+pub(crate) trait Tree<P: Page> {
     /// Get an immutable reference to a root page.
-    fn root(&self) -> MappedRwLockReadGuard<'_, P>;
+    fn root(&self) -> Result<MappedRwLockReadGuard<'_, P>>;
 
     /// Get an immutable reference to a page having given id, if such page exists.
     fn page(&self, id: u32) -> Option<MappedRwLockReadGuard<'_, P>>;
 
     /// Get a mutable reference to a root page.
-    fn root_mut(&self) -> MappedRwLockWriteGuard<'_, P>;
+    fn root_mut(&self) -> Result<MappedRwLockWriteGuard<'_, P>>;
 
     /// Get a mutable reference to a page having given id, if such page exists.
     fn page_mut(&self, id: u32) -> Option<MappedRwLockWriteGuard<'_, P>>;

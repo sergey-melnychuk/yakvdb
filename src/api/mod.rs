@@ -1,6 +1,6 @@
 pub mod error;
 pub mod page;
-pub mod tree;
+pub(crate) mod tree;
 
 use crate::{
     api::error::Result,
