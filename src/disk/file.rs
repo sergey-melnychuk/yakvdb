@@ -162,7 +162,7 @@ impl<P: Page> File<P> {
             ops: Arc::new(Mutex::new(())),
         };
 
-        this.cache.write().put(ROOT, root);
+        let _ = this.cache.write().put(ROOT, root);
 
         let total_pages = (len - HEAD) as u32 / this.head.page_bytes;
         debug!("Processing pages for compaction: {total_pages}");
@@ -1063,7 +1063,17 @@ impl<P: Page> Tree<P> for File<P> {
         let has_id = self.cache.read().has(&id);
         if !has_id {
             let page = self.load(self.offset(id), self.head.page_bytes)?;
-            self.cache.write().put(id, page);
+            let evicted = self.cache.write().put(id, page);
+            // An evicted page may still hold unflushed changes: write it back
+            // rather than dropping it, otherwise the modification is lost and a
+            // later read silently resurrects the stale on-disk version.
+            if let Some((evicted_id, evicted_page)) = evicted {
+                let was_dirty = self.dirty.write().remove(&evicted_id);
+                if was_dirty {
+                    debug!("Writing back dirty page {evicted_id} on eviction");
+                    self.save(&evicted_page)?;
+                }
+            }
         }
         Ok(())
     }

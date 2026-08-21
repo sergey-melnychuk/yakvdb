@@ -9,7 +9,8 @@ pub(crate) trait Cache<K: Clone + Eq + PartialEq + Hash, V> {
     fn has(&self, key: &K) -> bool;
     fn get(&self, key: &K) -> Option<&V>;
     fn get_mut(&mut self, key: &K) -> Option<&mut V>;
-    fn put(&mut self, key: K, value: V);
+    /// Insert an entry, returning the entry evicted to make room, if any.
+    fn put(&mut self, key: K, value: V) -> Option<(K, V)>;
 }
 
 pub(crate) struct LruCache<K, V> {
@@ -75,12 +76,14 @@ impl<K: Clone + Hash + Eq + Display, V> Cache<K, V> for LruCache<K, V> {
         }
     }
 
-    fn put(&mut self, key: K, value: V) {
-        if let Some(evicted) = self.touch(&key) {
-            self.map.remove(&evicted);
+    fn put(&mut self, key: K, value: V) -> Option<(K, V)> {
+        let evicted = self.touch(&key).and_then(|evicted| {
             debug!("Evicted page {evicted}");
-        }
+            let value = self.map.remove(&evicted)?;
+            Some((evicted, value))
+        });
         self.map.insert(key, value);
+        evicted
     }
 }
 
@@ -99,6 +102,21 @@ mod tests {
         let mut keys = cache.map.keys().cloned().collect::<Vec<_>>();
         keys.sort();
         assert_eq!(keys, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn test_eviction_keeps_map_bounded() {
+        let cap = 3;
+        let mut cache = LruCache::new(cap);
+        for i in 0..100 {
+            cache.put(i, i);
+        }
+        assert_eq!(cache.map.len(), cap, "map must not grow past capacity");
+        assert_eq!(cache.lru.read().len(), cap, "lru must not grow past capacity");
+        // the most recent `cap` keys survived
+        let mut keys = cache.map.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        assert_eq!(keys, vec![97, 98, 99]);
     }
 
     #[test]
