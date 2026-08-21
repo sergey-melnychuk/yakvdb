@@ -27,6 +27,20 @@ PLAN:
   - `max`
   - `len` (iterate from `min` to `max`)
   - basic defragment/restore utilities
+- [ ] let reads run concurrently instead of one at a time
+  - make `ops` an `RwLock` and take `read()` in `lookup`/`min`/`max`/`above`/`below`
+  - blocked on `page()`/`page_mut()`: they resolve the cache entry in a second
+    step after `cache()` put it there, so a concurrent reader can evict it in
+    between - they need a single locked step, or a retry on eviction
+  - even then the payoff is small while page reads go through `self.file.write()`
+    (`seek` + `read_exact` needs `&mut File`): positional reads (`FileExt::read_at`
+    on unix) are the prerequisite for readers to actually run in parallel
+- [ ] sweep `page(id).unwrap()`/`page_mut(id).unwrap()` into typed errors
+  - a corrupted file should fail one operation, not the process
+  - `split`/`check` were done already, the rest is its own pass
+- [ ] seal the `Tree` trait, or mark it `#[doc(hidden)]`
+  - a caller using `Tree` directly from several threads still bypasses `ops`
+  - a public API break: `src/bin/yak.rs` and downstream users call `Tree::flush`
 
 ---
 
