@@ -1217,10 +1217,12 @@ impl<P: Page> Tree<P> for File<P> {
 
             let page_max = {
                 let mut page = self.page_mut(id).unwrap();
-                copy.iter().skip(half).for_each(|(key, _, _, _)| {
-                    let idx = page.find(key).unwrap();
+                for (key, _, _, _) in copy.iter().skip(half) {
+                    let idx = page.find(key).ok_or_else(|| {
+                        Error::Tree(id, format!("Key not found while splitting: {}", hex(key)))
+                    })?;
                     page.remove(idx);
-                });
+                }
                 // Resolve the max key of the remaining half (may be overflow)
                 let last = page.len() - 1;
                 let slot = page.slot(last).unwrap();
@@ -1266,7 +1268,12 @@ impl<P: Page> Tree<P> for File<P> {
 
             {
                 let mut parent = self.page_mut(parent_id).unwrap();
-                let idx = parent.find(&max).unwrap();
+                let idx = parent.find(&max).ok_or_else(|| {
+                    Error::Tree(
+                        parent_id,
+                        format!("Child entry not found in parent: {}", hex(&max)),
+                    )
+                })?;
                 parent.remove(idx);
                 parent.put_ref(&page_max, id);
                 parent.put_ref(&peer_max, peer_id);
@@ -1287,7 +1294,12 @@ impl<P: Page> Tree<P> for File<P> {
 
         let (parent_key, parent_ref) = {
             let parent = self.page(parent_id).unwrap();
-            let page_idx = parent.find(&page_max).unwrap();
+            let page_idx = parent.find(&page_max).ok_or_else(|| {
+                Error::Tree(
+                    parent_id,
+                    format!("Child entry not found in parent: {}", hex(&page_max)),
+                )
+            })?;
             let parent_key = parent.key(page_idx).to_vec();
             let parent_ref = parent
                 .slot(page_idx)
