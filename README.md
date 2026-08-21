@@ -6,10 +6,10 @@ PLAN:
   - distinct RW locks on pages in the pool?
   - cannot use it in async context now:
     - the trait `Sync` is not implemented for `RefCell<...>`
-  - the guarantee: `Store` operations (`lookup`/`insert`/`remove`/`is_empty`/
-    `min`/`max`/`above`/`below`) are serialized by an operation-level lock, so
-    one runs at a time and a shared `Arc<KV>` is safe to use from many threads
-    (reads included: they are exclusive too, not shared)
+  - the guarantee: every `Store` operation takes an operation-level lock, so a
+    shared `Arc<KV>` is safe to use from many threads. `insert`/`remove` take it
+    exclusively and never overlap with anything; `lookup`/`is_empty`/`min`/`max`/
+    `above`/`below` share it and do run at the same time as each other
   - `Tree` is crate-private: its methods assume the caller already holds that
     lock, so reaching them from outside would bypass it
   - the `next_id`/`alloc_overflow` races are subsumed by the operation lock:
