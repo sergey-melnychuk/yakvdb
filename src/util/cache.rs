@@ -27,31 +27,28 @@ impl<K: Clone + Eq + Hash + Display, V> LruCache<K, V> {
         }
     }
 
+    /// Move `key` to the most-recently-used end, evicting the least-recently-used
+    /// key first if the cache is at capacity. Returns the evicted key, if any.
+    ///
+    /// The whole update happens under a single write guard: `get(&self)` mutates
+    /// the recency list through interior mutability, so two concurrent readers
+    /// would otherwise race between locating an index and removing it.
     fn touch(&self, key: &K) -> Option<K> {
-        let existing = if !self.map.contains_key(key) {
-            None
-        } else {
-            self.lru
-                .read()
-                .iter()
-                .enumerate()
-                .find(|(_, x)| x == &key)
-                .map(|(i, _)| i)
-        };
+        let mut lru = self.lru.write();
 
-        if let Some(idx) = existing {
-            let mut lru = self.lru.write();
+        if let Some(idx) = lru.iter().position(|x| x == key) {
             lru.remove(idx);
             lru.push(key.clone());
-        } else {
-            let mut lru = self.lru.write();
-            if lru.len() == self.cap {
-                let evicted = lru.remove(0);
-                return Some(evicted);
-            }
-            lru.push(key.clone());
+            return None;
         }
-        None
+
+        let evicted = if lru.len() >= self.cap {
+            Some(lru.remove(0))
+        } else {
+            None
+        };
+        lru.push(key.clone());
+        evicted
     }
 }
 

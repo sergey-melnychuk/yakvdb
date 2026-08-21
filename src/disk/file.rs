@@ -17,7 +17,7 @@ use std::convert::TryInto;
 use std::sync::Arc;
 
 use parking_lot::{
-    MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
+    MappedRwLockReadGuard, MappedRwLockWriteGuard, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
 
 pub struct File<P: Page> {
@@ -31,6 +31,16 @@ pub struct File<P: Page> {
 
     /// Min-heap of available page identifiers (this helps avoid "gaps": empty pages inside file).
     empty: Arc<RwLock<BinaryHeap<Reverse<u32>>>>,
+
+    /// Serializes whole tree operations against each other.
+    ///
+    /// The locks above guard individual page accesses only, while a tree operation
+    /// spans many of them: `split` snapshots a page, releases the lock to allocate a
+    /// peer page, then re-acquires it and expects the snapshot to still describe the
+    /// page. Reads are exclusive too, because `page()` looks a page up in a second
+    /// step after `cache()` put it there, and a concurrent reader can evict it in
+    /// between. This lock is what makes `Store` operations atomic.
+    ops: Arc<Mutex<()>>,
 }
 
 const MAGIC: &[u8] = b"YAKVDB42";
@@ -95,6 +105,7 @@ impl<P: Page> File<P> {
             cache: Arc::new(RwLock::new(LruCache::new(32))),
             dirty: Arc::new(RwLock::new(HashSet::with_capacity(32))),
             empty: Arc::new(RwLock::new(BinaryHeap::with_capacity(32))),
+            ops: Arc::new(Mutex::new(())),
         })
     }
 
@@ -148,6 +159,7 @@ impl<P: Page> File<P> {
             cache: Arc::new(RwLock::new(LruCache::new(32))),
             dirty: Arc::new(RwLock::new(HashSet::with_capacity(32))),
             empty: Arc::new(RwLock::new(BinaryHeap::with_capacity(16))),
+            ops: Arc::new(Mutex::new(())),
         };
 
         this.cache.write().put(ROOT, root);
@@ -397,6 +409,7 @@ impl<P: Page> File<P> {
 
 impl<P: Page> Store for File<P> {
     fn lookup(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let _op = self.ops.lock();
         debug!("lookup: {}", hex(key));
         let mut seen = HashSet::with_capacity(8);
         let mut page = self.root();
@@ -453,6 +466,7 @@ impl<P: Page> Store for File<P> {
     }
 
     fn insert(&self, key: &[u8], val: &[u8]) -> Result<()> {
+        let _op = self.ops.lock();
         debug!("insert: {} -> {}", hex(key), hex(val));
         let mut page = self.root_mut();
         let mut seen = HashSet::with_capacity(8);
@@ -620,6 +634,7 @@ impl<P: Page> Store for File<P> {
     }
 
     fn remove(&self, key: &[u8]) -> Result<()> {
+        let _op = self.ops.lock();
         debug!("remove: {}", hex(key));
         let mut page = self.root_mut();
         let mut seen = HashSet::with_capacity(8);
@@ -819,10 +834,12 @@ impl<P: Page> Store for File<P> {
     }
 
     fn is_empty(&self) -> bool {
+        let _op = self.ops.lock();
         self.root().len() == 0
     }
 
     fn min(&self) -> Result<Option<Vec<u8>>> {
+        let _op = self.ops.lock();
         let mut page = self.root();
         if page.len() == 0 {
             return Ok(None);
@@ -848,6 +865,7 @@ impl<P: Page> Store for File<P> {
     }
 
     fn max(&self) -> Result<Option<Vec<u8>>> {
+        let _op = self.ops.lock();
         let mut page = self.root();
         if page.len() == 0 {
             return Ok(None);
@@ -874,6 +892,7 @@ impl<P: Page> Store for File<P> {
     }
 
     fn above(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let _op = self.ops.lock();
         debug!("above: {}", hex(key));
 
         let mut path = Vec::with_capacity(8);
@@ -949,6 +968,7 @@ impl<P: Page> Store for File<P> {
     }
 
     fn below(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let _op = self.ops.lock();
         debug!("below: {}", hex(key));
 
         let mut path = Vec::with_capacity(8);
