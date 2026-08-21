@@ -83,7 +83,7 @@ Each insert/remove gets flushed to disk for durability.
 
 ### Demo
 
-Just `cargo run --release` to run example from [main.rs](src/main.rs):
+Just `cargo run --release --example main` to run the example in [examples/main.rs](examples/main.rs):
 * create/open database (file)
 * generate random key-value pairs
 * insert all key-value pairs
@@ -129,21 +129,28 @@ $ RUST_LOG=info cargo run --release
 ### Code
 
 ```rust
-use std::cell::Ref;
-use crate::api::error::Result;
-use crate::disk::block::Block;
-use crate::disk::file::File;
+use std::path::Path;
+use std::sync::Arc;
+use yakvdb::api::error::Result;
+use yakvdb::api::{Store, KV};
 
-// Create new database with given page_size
-let mut db: File<Block> = File::make(path, /*page_size=*/4096).unwrap();
-// Or open a database from an existing file
-let mut db: File<Block> = File::open(path).unwrap();
+// Create a new database with the given page size...
+let db: KV = KV::make(Path::new("/tmp/db.yak"), /*page_size=*/ 4096).unwrap();
+// ...or open an existing one:
+// let db: KV = KV::open(Path::new("/tmp/db.yak")).unwrap();
 
-let r: Result<Optional<Ref<u8>>> = db.lookup(&b"key");
-let _: Result<()> = db.insert(&b"key", &b"val");
-let _: Result<()> = db.remove(&b"key");
+let _: Result<()> = db.insert(b"key", b"val");
+let _: Result<Option<Vec<u8>>> = db.lookup(b"key");
+let _: Result<()> = db.remove(b"key");
 
-// To iterate: db.min(), db.max(), db.above(&[u8]), db.below(&[u8])
+// To iterate: db.min(), db.max(), db.above(b"key"), db.below(b"key")
+
+// `insert` and `remove` flush on their own, `sync` forces it:
+let _: Result<()> = db.sync();
+
+// Every method takes `&self` and `KV` is `Send + Sync`, so one handle can
+// be shared across threads:
+let db = Arc::new(db);
 ```
 
 ### Other
