@@ -42,9 +42,12 @@ PLAN:
     now the limit on how far reads scale (8 threads are slower than 4)
   - wants an approximation that reads can update without excluding each other -
     a CLOCK/second-chance referenced bit, or sharding the cache by page id
-- [ ] sweep `page(id).unwrap()`/`page_mut(id).unwrap()` into typed errors
+- [x] sweep `page(id).unwrap()`/`page_mut(id).unwrap()` into typed errors
   - a corrupted file should fail one operation, not the process
-  - `split`/`check` were done already, the rest is its own pass
+  - `try_page`/`try_page_mut` return `Error::Tree` instead of `None`, and all
+    38 call sites in `Result`-returning functions use `?`
+  - `root()`/`root_mut()` still `unwrap`: they return the guard directly, so
+    changing them means changing the `Tree` trait - see the item below
 - [ ] seal the `Tree` trait, or mark it `#[doc(hidden)]`
   - a caller using `Tree` directly from several threads still bypasses `ops`
   - a public API break: `src/bin/yak.rs` and downstream users call `Tree::flush`

@@ -251,6 +251,23 @@ impl<P: Page> File<P> {
         HEAD + (id - 1) as usize * self.head.page_bytes as usize
     }
 
+    /// `Tree::page`, reporting a missing page as an error instead of `None`.
+    ///
+    /// A page id the tree refers to but that cannot be read means the file is
+    /// inconsistent -- from a crash mid-write, or a bug. That should fail the
+    /// operation in progress and leave the rest of the process alone, which is
+    /// what the callers of these two get by using `?` instead of `unwrap`.
+    fn try_page(&self, id: u32) -> Result<MappedRwLockReadGuard<'_, P>> {
+        self.page(id)
+            .ok_or_else(|| Error::Tree(id, "Page not found".to_string()))
+    }
+
+    /// `Tree::page_mut`, reporting a missing page as an error instead of `None`.
+    fn try_page_mut(&self, id: u32) -> Result<MappedRwLockWriteGuard<'_, P>> {
+        self.page_mut(id)
+            .ok_or_else(|| Error::Tree(id, "Page not found".to_string()))
+    }
+
     pub fn page_size(&self) -> u32 {
         self.head.page_bytes
     }
@@ -512,7 +529,7 @@ impl<P: Page> Store for File<P> {
                     let ov_page = self.alloc_overflow(m)?;
                     self.write_overflow(ov_page, key, val, m)?;
                     let raw_vlen = OVERFLOW_FLAG | m;
-                    let mut page = self.page_mut(id).unwrap();
+                    let mut page = self.try_page_mut(id)?;
                     page.put_overflow(key, ov_page, raw_vlen);
                     drop(page);
                 } else {
@@ -527,7 +544,7 @@ impl<P: Page> Store for File<P> {
                     let ov_page = self.alloc_overflow(m)?;
                     self.write_overflow(ov_page, key, val, m)?;
                     let raw_vlen = OVERFLOW_FLAG | m;
-                    let mut page = self.page_mut(id).unwrap();
+                    let mut page = self.try_page_mut(id)?;
                     page.put_overflow(prefix, ov_page, raw_vlen);
                     drop(page);
                 }
@@ -539,7 +556,7 @@ impl<P: Page> Store for File<P> {
 
             drop(page);
             if let Some((parent_id, parent_idx)) = path.last().cloned() {
-                let mut parent_page = self.page_mut(parent_id).unwrap();
+                let mut parent_page = self.try_page_mut(parent_id)?;
                 let parent_key = parent_page.key(parent_idx);
                 if key > parent_key {
                     parent_page.remove(parent_idx);
@@ -547,7 +564,7 @@ impl<P: Page> Store for File<P> {
                     drop(parent_page);
                 }
             }
-            page = self.page_mut(id).unwrap();
+            page = self.try_page_mut(id)?;
 
             let slot_opt = page.slot(idx);
             if slot_opt.is_none() {
@@ -563,7 +580,7 @@ impl<P: Page> Store for File<P> {
                     page.remove(idx);
                     drop(page);
                     self.free_overflow(old_ov_page, old_m)?;
-                    page = self.page_mut(id).unwrap();
+                    page = self.try_page_mut(id)?;
                 }
 
                 let inline_len = (key.len() + val.len()) as u32;
@@ -586,7 +603,7 @@ impl<P: Page> Store for File<P> {
                     let ov_page = self.alloc_overflow(m)?;
                     self.write_overflow(ov_page, key, val, m)?;
                     let raw_vlen = OVERFLOW_FLAG | m;
-                    let mut page = self.page_mut(id).unwrap();
+                    let mut page = self.try_page_mut(id)?;
                     page.put_overflow(key, ov_page, raw_vlen);
                     let full = page.full();
                     drop(page);
@@ -608,7 +625,7 @@ impl<P: Page> Store for File<P> {
                     let ov_page = self.alloc_overflow(m)?;
                     self.write_overflow(ov_page, key, val, m)?;
                     let raw_vlen = OVERFLOW_FLAG | m;
-                    let mut page = self.page_mut(id).unwrap();
+                    let mut page = self.try_page_mut(id)?;
                     page.put_overflow(prefix, ov_page, raw_vlen);
                     let full = page.full();
                     drop(page);
@@ -621,7 +638,7 @@ impl<P: Page> Store for File<P> {
                 while let Some((page_id, _)) = path.pop() {
                     let (parent_id, _) = path.last().cloned().unwrap_or_default();
                     let full = {
-                        let page = self.page(page_id).unwrap();
+                        let page = self.try_page(page_id)?;
                         page.full()
                     };
                     if full > SPLIT_THRESHOLD {
@@ -676,14 +693,14 @@ impl<P: Page> Store for File<P> {
                     let mut page_id = id;
                     for (parent_id, idx) in path.iter().cloned().rev() {
                         let max_opt = {
-                            let p = self.page(page_id).unwrap();
+                            let p = self.try_page(page_id)?;
                             if p.len() > 0 {
                                 Some(p.max().to_vec())
                             } else {
                                 None
                             }
                         };
-                        let mut parent = self.page_mut(parent_id).unwrap();
+                        let mut parent = self.try_page_mut(parent_id)?;
                         if let Some(max) = max_opt {
                             if max < parent.key(idx).to_vec() {
                                 parent.remove(idx);
@@ -750,10 +767,10 @@ impl<P: Page> Store for File<P> {
                 // Navigate up-tree and remove/update references if needed
                 let mut page_id = id;
                 for (parent_id, mut idx) in path.iter().cloned().rev() {
-                    let full = self.page(page_id).unwrap().full();
+                    let full = self.try_page(page_id)?.full();
                     if full < MERGE_THRESHOLD {
                         let peer_id = {
-                            let parent = self.page(parent_id).unwrap();
+                            let parent = self.try_page(parent_id)?;
                             let mut peers = Vec::with_capacity(2);
                             if idx > 0 {
                                 let peer = parent.slot(idx - 1).unwrap().page;
@@ -765,17 +782,19 @@ impl<P: Page> Store for File<P> {
                             }
                             drop(parent);
 
-                            peers
+                            // A `for` loop rather than `filter_map`, so that a
+                            // peer that cannot be read fails the operation
+                            // instead of quietly dropping out of the candidates.
+                            let mut candidates = Vec::with_capacity(peers.len());
+                            for peer_id in peers {
+                                let peer = self.try_page(peer_id)?;
+                                let full = peer.full();
+                                if peer.len() > 0 && full < MERGE_THRESHOLD {
+                                    candidates.push((peer_id, full));
+                                }
+                            }
+                            candidates
                                 .into_iter()
-                                .filter_map(|peer_id| {
-                                    let peer = self.page(peer_id).unwrap();
-                                    let full = peer.full();
-                                    if peer.len() > 0 && full < MERGE_THRESHOLD {
-                                        Some((peer_id, full))
-                                    } else {
-                                        None
-                                    }
-                                })
                                 .min_by_key(|(_, full)| *full)
                                 .map(|(peer_id, _)| peer_id)
                         };
@@ -784,11 +803,11 @@ impl<P: Page> Store for File<P> {
                                 "merge: found peer_id={peer_id} to merge page_id={page_id} (parent_id={parent_id})"
                             );
                             let peer_max = {
-                                let peer = self.page(peer_id).unwrap();
+                                let peer = self.try_page(peer_id)?;
                                 peer.max().to_vec()
                             };
                             trace!("\t merge: peer_max={}", hex(&peer_max));
-                            let mut parent = self.page_mut(parent_id).unwrap();
+                            let mut parent = self.try_page_mut(parent_id)?;
                             parent.remove(idx);
                             let peer_idx = parent.ceil(&peer_max).unwrap();
                             trace!("\t merge: parent remove: peer_idx={peer_idx} idx={idx}");
@@ -797,11 +816,11 @@ impl<P: Page> Store for File<P> {
 
                             self.merge(page_id, peer_id)?;
                             let page_max = {
-                                let peer = self.page(peer_id).unwrap();
+                                let peer = self.try_page(peer_id)?;
                                 peer.max().to_vec()
                             };
                             trace!("\t merge: page_max={}", hex(&page_max));
-                            let mut parent = self.page_mut(parent_id).unwrap();
+                            let mut parent = self.try_page_mut(parent_id)?;
                             trace!(
                                 "\t merge: parent insert: page_max={}, peer_id={}",
                                 hex(&page_max),
@@ -814,7 +833,7 @@ impl<P: Page> Store for File<P> {
                     }
 
                     let max_opt = {
-                        let page = self.page(page_id).unwrap();
+                        let page = self.try_page(page_id)?;
                         if page.len() > 0 {
                             Some(page.max().to_vec())
                         } else {
@@ -822,7 +841,7 @@ impl<P: Page> Store for File<P> {
                         }
                     };
 
-                    let mut parent = self.page_mut(parent_id).unwrap();
+                    let mut parent = self.try_page_mut(parent_id)?;
                     if let Some(max) = max_opt {
                         if max < parent.key(idx).to_vec() {
                             parent.remove(idx);
@@ -876,11 +895,7 @@ impl<P: Page> Store for File<P> {
             } else {
                 let id = slot.page;
                 drop(page);
-                if let Some(next) = self.page(id) {
-                    page = next;
-                } else {
-                    return Err(Error::Tree(id, "Page not found".to_string()));
-                }
+                page = self.try_page(id)?;
             }
         }
     }
@@ -903,11 +918,7 @@ impl<P: Page> Store for File<P> {
             } else {
                 let id = slot.page;
                 drop(page);
-                if let Some(next) = self.page(id) {
-                    page = next;
-                } else {
-                    return Err(Error::Tree(id, "Page not found".to_string()));
-                }
+                page = self.try_page(id)?;
             }
         }
     }
@@ -952,11 +963,11 @@ impl<P: Page> Store for File<P> {
                         // need the write guard: releasing it first is what keeps
                         // this from deadlocking against itself.
                         drop(page);
-                        page = self.page(parent_id).unwrap();
+                        page = self.try_page(parent_id)?;
                         if parent_idx < page.len() - 1 {
                             let id = page.slot(parent_idx + 1).unwrap().page;
                             drop(page);
-                            page = self.page(id).unwrap();
+                            page = self.try_page(id)?;
                             loop {
                                 let slot = page.slot(0).unwrap();
                                 if slot.is_leaf() {
@@ -970,7 +981,7 @@ impl<P: Page> Store for File<P> {
                                     return Ok(Some(page.min().to_vec()));
                                 } else {
                                     drop(page);
-                                    page = self.page(slot.page).unwrap();
+                                    page = self.try_page(slot.page)?;
                                 }
                             }
                         }
@@ -983,11 +994,7 @@ impl<P: Page> Store for File<P> {
                 path.push((page.id(), idx));
                 let id = slot.page;
                 drop(page);
-                if let Some(next) = self.page(id) {
-                    page = next;
-                } else {
-                    return Err(Error::Tree(id, "Page not found".to_string()));
-                }
+                page = self.try_page(id)?;
             }
         }
     }
@@ -1025,12 +1032,12 @@ impl<P: Page> Store for File<P> {
                 // ceil == key or first entry, need to take max from parent's previous subtree
                 for (parent_id, parent_idx) in path.iter().rev().cloned() {
                     drop(page);
-                    page = self.page(parent_id).unwrap();
+                    page = self.try_page(parent_id)?;
                     if parent_idx > 0 {
                         let pidx = parent_idx - 1;
                         let id = page.slot(pidx).unwrap().page;
                         drop(page);
-                        page = self.page(id).unwrap();
+                        page = self.try_page(id)?;
                         // Get max key from this subtree leaf
                         let last = page.len() - 1;
                         let last_slot = page.slot(last).unwrap();
@@ -1051,11 +1058,7 @@ impl<P: Page> Store for File<P> {
                 path.push((page.id(), idx));
                 let id = slot.page;
                 drop(page);
-                if let Some(next) = self.page(id) {
-                    page = next;
-                } else {
-                    return Err(Error::Tree(id, "Page not found".to_string()));
-                }
+                page = self.try_page(id)?;
             }
         }
     }
@@ -1157,7 +1160,7 @@ impl<P: Page> Tree<P> for File<P> {
         if !is_empty {
             let id = self.empty.write().pop().unwrap().0;
             let temp = P::create(id, self.head.page_bytes);
-            let mut page = self.page_mut(id).unwrap();
+            let mut page = self.try_page_mut(id)?;
             page.as_mut().copy_from_slice(temp.as_ref());
             return Ok(id);
         }
@@ -1185,7 +1188,7 @@ impl<P: Page> Tree<P> for File<P> {
             debug!("split: root={id} into lo={lo_id} and hi={hi_id} (parent={parent_id})");
 
             let (copy, lo_max, hi_max) = {
-                let page = self.page(id).unwrap();
+                let page = self.try_page(id)?;
                 let copy = page.copy();
                 let half = page.len() as usize / 2;
                 let (k, _, p, rv) = copy.get(half - 1).unwrap();
@@ -1197,7 +1200,7 @@ impl<P: Page> Tree<P> for File<P> {
             let half = copy.len() / 2;
 
             {
-                let mut lo = self.page_mut(lo_id).unwrap();
+                let mut lo = self.try_page_mut(lo_id)?;
                 copy.iter().take(half).for_each(|(key, val, page_ref, raw_vlen)| {
                     trace!(
                         "split: move k={} v={} p={} from {} to {}",
@@ -1218,7 +1221,7 @@ impl<P: Page> Tree<P> for File<P> {
             }
 
             {
-                let mut hi = self.page_mut(hi_id).unwrap();
+                let mut hi = self.try_page_mut(hi_id)?;
                 copy.iter().skip(half).for_each(|(key, val, page_ref, raw_vlen)| {
                     trace!(
                         "split: move k={} v={} p={} from {} to {}",
@@ -1239,7 +1242,7 @@ impl<P: Page> Tree<P> for File<P> {
             }
 
             {
-                let mut page = self.page_mut(id).unwrap();
+                let mut page = self.try_page_mut(id)?;
                 page.clear();
                 page.put_ref(&lo_max, lo_id);
                 page.put_ref(&hi_max, hi_id);
@@ -1248,7 +1251,7 @@ impl<P: Page> Tree<P> for File<P> {
             Ok(())
         } else {
             let (copy, max) = {
-                let page = self.page(id).unwrap();
+                let page = self.try_page(id)?;
                 let c = page.copy();
                 let (k, _, p, rv) = c.last().unwrap();
                 let full_max = self.resolve_full_key(k, *p, *rv)?;
@@ -1259,7 +1262,7 @@ impl<P: Page> Tree<P> for File<P> {
             debug!("split: page={id} into peer={peer_id} (parent={parent_id})");
 
             let page_max = {
-                let mut page = self.page_mut(id).unwrap();
+                let mut page = self.try_page_mut(id)?;
                 for (key, _, _, _) in copy.iter().skip(half) {
                     let idx = page.find(key).ok_or_else(|| {
                         Error::Tree(id, format!("Key not found while splitting: {}", hex(key)))
@@ -1279,7 +1282,7 @@ impl<P: Page> Tree<P> for File<P> {
             };
 
             let peer_max = {
-                let mut peer = self.page_mut(peer_id).unwrap();
+                let mut peer = self.try_page_mut(peer_id)?;
                 copy.iter().skip(half).for_each(|(key, val, p, raw_vlen)| {
                     trace!(
                         "split: move k={} v={} p={} from {} to {}",
@@ -1310,7 +1313,7 @@ impl<P: Page> Tree<P> for File<P> {
             };
 
             {
-                let mut parent = self.page_mut(parent_id).unwrap();
+                let mut parent = self.try_page_mut(parent_id)?;
                 let idx = parent.find(&max).ok_or_else(|| {
                     Error::Tree(
                         parent_id,
@@ -1331,12 +1334,12 @@ impl<P: Page> Tree<P> for File<P> {
 
     fn check(&self, parent_id: u32, page_id: u32) -> Result<()> {
         let page_max = {
-            let page = self.page(page_id).unwrap();
+            let page = self.try_page(page_id)?;
             page.max().to_vec()
         };
 
         let (parent_key, parent_ref) = {
-            let parent = self.page(parent_id).unwrap();
+            let parent = self.try_page(parent_id)?;
             let page_idx = parent.find(&page_max).ok_or_else(|| {
                 Error::Tree(
                     parent_id,
@@ -1377,12 +1380,12 @@ impl<P: Page> Tree<P> for File<P> {
     fn merge(&self, src_id: u32, dst_id: u32) -> Result<()> {
         debug!("merge: src={src_id} into dst={dst_id}");
         let src_copy = {
-            let page = self.page(src_id).unwrap();
+            let page = self.try_page(src_id)?;
             page.copy()
         };
 
         {
-            let mut page = self.page_mut(dst_id).unwrap();
+            let mut page = self.try_page_mut(dst_id)?;
             for (key, val, p, raw_vlen) in src_copy {
                 trace!(
                     "merge: move k={} v={} p={} from {} to {}",
@@ -1404,7 +1407,7 @@ impl<P: Page> Tree<P> for File<P> {
         };
 
         {
-            let mut page = self.page_mut(src_id).unwrap();
+            let mut page = self.try_page_mut(src_id)?;
             page.clear();
         }
 
