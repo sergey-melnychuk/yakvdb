@@ -3,7 +3,7 @@ use sled::Db;
 use std::cell::RefCell;
 use std::path::Path;
 use std::time::SystemTime;
-use yakvdb::api::{Durability, Options, Store};
+use yakvdb::api::{Durability, Options, Store, WriteBuffer};
 
 use yakvdb::disk::block::Block;
 use yakvdb::disk::file::File;
@@ -321,12 +321,23 @@ fn main() {
             ),
             _ => Durability::Os,
         };
+        // BUFFER=<records>: records waiting in memory before a write() (1)
+        let records = std::env::var("BUFFER")
+            .ok()
+            .and_then(|b| b.parse().ok())
+            .unwrap_or(1);
         let options = Options {
             durability,
+            write_buffer: WriteBuffer {
+                records,
+                ..WriteBuffer::default()
+            },
             ..Options::default()
         };
         let file: File<Block> = File::make_with(path, size, options).unwrap();
-        info!("target={target} file={path:?} count={count} page={size} durability={durability:?}");
+        info!(
+            "target={target} file={path:?} count={count} page={size} durability={durability:?} buffer={records}"
+        );
 
         benchmark(SelfStorage(file), count);
         std::fs::remove_file(path).ok();

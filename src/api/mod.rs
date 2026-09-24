@@ -36,11 +36,42 @@ pub enum Durability {
     Sync,
 }
 
+/// How long committed records may wait in memory before they are written to
+/// the OS, under `Durability::Os` and `Durability::Periodic`: whichever limit
+/// is reached first triggers the write. `Durability::Sync` ignores it.
+///
+/// A record waiting in memory is lost if the process crashes, so this trades
+/// the last few writes for speed: writing each record costs a system call,
+/// which is most of what an insert costs. Checkpoints, `sync` and closing the
+/// database write out everything waiting, whatever the limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteBuffer {
+    /// Write once this many records are waiting. With 1, the default, every
+    /// write reaches the OS before it returns: a process crash loses nothing.
+    pub records: usize,
+    /// ... or once the waiting records take this many bytes.
+    pub bytes: usize,
+    /// ... or once this much time has passed, checked by a background thread,
+    /// so that records do not wait indefinitely when writes stop coming.
+    pub interval: Option<Duration>,
+}
+
+impl Default for WriteBuffer {
+    fn default() -> Self {
+        Self {
+            records: 1,
+            bytes: 1024 * 1024,
+            interval: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Options {
     /// Upper limit on the page cache; see `DEFAULT_CACHE_BYTES`.
     pub cache_bytes: usize,
     pub durability: Durability,
+    pub write_buffer: WriteBuffer,
     /// Checkpoint once this much of the cache holds modified pages. Capped at
     /// half the cache: modified pages stay in memory until a checkpoint.
     ///
@@ -57,6 +88,7 @@ impl Default for Options {
         Self {
             cache_bytes: DEFAULT_CACHE_BYTES,
             durability: Durability::default(),
+            write_buffer: WriteBuffer::default(),
             checkpoint_dirty_bytes: DEFAULT_CACHE_BYTES / 2,
             checkpoint_wal_bytes: 64 * 1024 * 1024,
         }

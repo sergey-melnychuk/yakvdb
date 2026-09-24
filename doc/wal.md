@@ -305,6 +305,15 @@ What the implementation does differently from the design above, or adds:
   nothing dirty and nothing freed, closing or `sync` does no I/O.
 - **Bounded buffers.** A checkpoint's page images go through the append
   buffer, which is given back after a flush if it grew past 1 MiB.
+- **Write buffer.** Under `Os` and `Periodic`, `Options::write_buffer`
+  lets committed records wait in memory before the `write()` that hands them
+  to the OS: up to a number of records (1 by default: every commit is
+  written), a number of bytes, or an interval enforced by the background
+  flusher. That `write()` is most of what an insert costs, so a buffer of a
+  hundred records roughly triples insert throughput, at the price of losing
+  those records to a process crash. Checkpoints, `sync` and closing write out
+  whatever waits, and so does closing a poisoned database: its buffered
+  records are all of writes that succeeded.
 - **No-op removes are not logged.** Removing a key that is not there changes
   nothing, dirties nothing, and does not wait for a commit.
 - **Recovery cleans up.** After replaying, `open` checkpoints, which also

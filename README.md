@@ -73,6 +73,10 @@ PLAN:
     the writers committing at the same time; `write_batch` is atomic
   - a database is open through one handle at a time: `make`/`open` lock the
     file, since opening replays and rotates the log
+  - `Options::write_buffer` lets commits wait in memory before the `write()`
+    that hands them to the OS (a number of records, bytes, or an interval):
+    that system call is most of an insert, so buffering trades the last few
+    writes on a process crash for speed; 1 record, the default, loses none
   - measured on 1M keys, release, `Os`: insert 277k/s, lookup 1.19M/s,
     remove 235k/s before, 281k/1.21M/231k after, while no mode can now leave
     the file half-updated; `Sync` on macOS (`F_FULLFSYNC`): 287 inserts/s from
@@ -179,7 +183,8 @@ let db: KV = KV::make(Path::new("/tmp/db.yak"), /*page_size=*/ 4096).unwrap();
 // ...or open an existing one, recovering it if it was not closed cleanly:
 // let db: KV = KV::open(Path::new("/tmp/db.yak")).unwrap();
 // `make_with`/`open_with` take `Options`: the page cache limit (256 MiB by
-// default, growing with the tree) and the `Durability`:
+// default, growing with the tree), the `Durability`, and the `WriteBuffer`
+// (how many commits may wait in memory before they are written to the OS):
 // let db = KV::open_with(path, Options { durability: Durability::Sync, ..Options::default() });
 
 let _: Result<()> = db.insert(b"key", b"val");

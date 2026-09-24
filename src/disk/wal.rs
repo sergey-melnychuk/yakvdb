@@ -402,6 +402,33 @@ struct State {
     segment_bytes: u64,
 }
 
+/// What `Wal::commit` waits for.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Commit {
+    /// Wait for the fsync; the other fields then do not apply.
+    pub(crate) sync: bool,
+    /// Otherwise, write to the OS once this many records wait in memory ...
+    pub(crate) records: u64,
+    /// ... or once they take this many bytes.
+    pub(crate) bytes: usize,
+}
+
+impl Commit {
+    /// Every commit waits for its fsync.
+    pub(crate) const SYNC: Commit = Commit {
+        sync: true,
+        records: 1,
+        bytes: 0,
+    };
+    /// Every commit waits for its write to the OS.
+    #[cfg(test)]
+    pub(crate) const WRITE: Commit = Commit {
+        sync: false,
+        records: 1,
+        bytes: 0,
+    };
+}
+
 /// The write-ahead log of an open database, with group commit.
 ///
 /// Writers `append` a record while holding the database's operation lock,
@@ -412,7 +439,7 @@ struct State {
 /// fsync, on behalf of every writer waiting at that moment.
 pub(crate) struct Wal {
     dir: PathBuf,
-    sync_on_commit: bool,
+    commit: Commit,
     state: Mutex<State>,
     cond: Condvar,
     /// Only ever locked by a leader or by `rotate`, so never contended by writers.
@@ -424,21 +451,22 @@ pub(crate) struct Wal {
 }
 
 impl Wal {
-    /// Start a log in `dir` at a new segment `segment_id`, numbering records from `next_lsn`.
-    ///
-    /// `sync_on_commit` decides what `commit` waits for: the fsync, or only the
-    /// write to the OS.
+    /// Start a log in `dir` at a new segment `segment_id`, numbering records
+    /// from `next_lsn`, with `commit` deciding what a commit waits for.
     pub(crate) fn create(
         dir: &Path,
         segment_id: u64,
         next_lsn: u64,
-        sync_on_commit: bool,
+        commit: Commit,
     ) -> io::Result<Self> {
         let segment = Segment::create(dir, segment_id)?;
         sync_dir(dir)?;
         Ok(Self {
             dir: dir.to_path_buf(),
-            sync_on_commit,
+            commit: Commit {
+                records: commit.records.max(1),
+                ..commit
+            },
             state: Mutex::new(State {
                 buf: Vec::with_capacity(BUFFER_BYTES),
                 spare: Vec::with_capacity(BUFFER_BYTES),
@@ -470,9 +498,29 @@ impl Wal {
         lsn
     }
 
-    /// Wait until record `lsn` is as durable as this log promises on commit.
+    /// Wait until record `lsn` is as durable as this log promises on commit:
+    /// fsynced, written to the OS, or -- while the buffer limits allow --
+    /// merely buffered.
     pub(crate) fn commit(&self, lsn: u64) -> io::Result<()> {
-        self.flush(lsn, self.sync_on_commit)
+        // With a buffer of one record every commit writes: skip the check.
+        if !self.commit.sync && self.commit.records > 1 {
+            let st = self.state.lock();
+            if st.written >= lsn {
+                return Ok(());
+            }
+            let waiting = st.appended - st.written;
+            if !st.failed && waiting < self.commit.records && st.buf.len() < self.commit.bytes {
+                return Ok(());
+            }
+        }
+        self.flush(lsn, self.commit.sync)
+    }
+
+    /// Records and bytes appended but not yet written to the OS.
+    #[cfg(test)]
+    pub(crate) fn buffered(&self) -> (u64, usize) {
+        let st = self.state.lock();
+        (st.appended - st.written, st.buf.len())
     }
 
     /// Write, and if `sync` also fsync, everything appended so far.
@@ -585,22 +633,40 @@ impl Wal {
     }
 }
 
-/// Background thread that fsyncs the log every `interval`: `Durability::Periodic`.
+/// Background thread that writes the log to the OS every `write_every`
+/// (`WriteBuffer::interval`) and fsyncs it every `sync_every`
+/// (`Durability::Periodic`).
 pub(crate) struct Flusher {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl Flusher {
-    pub(crate) fn start(wal: Arc<Wal>, interval: Duration) -> Self {
-        let interval = interval.max(MIN_FLUSH_INTERVAL);
+    pub(crate) fn start(
+        wal: Arc<Wal>,
+        write_every: Option<Duration>,
+        sync_every: Option<Duration>,
+    ) -> Self {
+        let write_every = write_every.map(|every| every.max(MIN_FLUSH_INTERVAL));
+        let sync_every = sync_every.map(|every| every.max(MIN_FLUSH_INTERVAL));
+        let tick = match (write_every, sync_every) {
+            (Some(write), Some(sync)) => write.min(sync),
+            (write, sync) => write.or(sync).unwrap_or(Duration::from_secs(1)),
+        };
         let stop = Arc::new(AtomicBool::new(false));
         let handle = {
             let stop = stop.clone();
             thread::spawn(move || {
+                let mut last_sync = std::time::Instant::now();
                 while !stop.load(Ordering::Acquire) {
-                    thread::park_timeout(interval);
-                    if let Err(e) = wal.flush_all(true) {
+                    thread::park_timeout(tick);
+                    let sync = sync_every.is_some_and(|every| last_sync.elapsed() >= every);
+                    if sync {
+                        last_sync = std::time::Instant::now();
+                    } else if write_every.is_none() {
+                        continue;
+                    }
+                    if let Err(e) = wal.flush_all(sync) {
                         error!("WAL flusher stopped: {e}");
                         break;
                     }
@@ -862,7 +928,7 @@ mod tests {
     fn test_group_commit() {
         let dir = PathBuf::from("target/test_wal_group_commit");
         let _ = fs::remove_dir_all(&dir);
-        let wal = Arc::new(Wal::create(&dir, 1, 1, true).unwrap());
+        let wal = Arc::new(Wal::create(&dir, 1, 1, Commit::SYNC).unwrap());
 
         let threads = 8;
         let per_thread = 50;
@@ -912,7 +978,7 @@ mod tests {
     fn test_buffers_shrink_after_big_flush() {
         let dir = PathBuf::from("target/test_wal_buffers_shrink");
         let _ = fs::remove_dir_all(&dir);
-        let wal = Wal::create(&dir, 1, 1, false).unwrap();
+        let wal = Wal::create(&dir, 1, 1, Commit::WRITE).unwrap();
         let big = vec![0u8; 4 * 1024 * 1024];
         wal.append(&Record::Page { id: 1, bytes: &big });
         wal.flush_all(false).unwrap();
@@ -923,5 +989,44 @@ mod tests {
         assert!(st.spare.capacity() <= KEEP_BUFFER_BYTES);
         drop(st);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_commit_buffers_up_to_the_limits() {
+        let dir = PathBuf::from("target/test_wal_commit_buffers");
+        let _ = fs::remove_dir_all(&dir);
+        let commit = Commit {
+            sync: false,
+            records: 3,
+            bytes: 1024 * 1024,
+        };
+        let wal = Wal::create(&dir, 1, 1, commit).unwrap();
+        for _ in 0..2 {
+            let lsn = wal.append(&insert(b"k"));
+            wal.commit(lsn).unwrap();
+        }
+        assert_eq!(wal.buffered().0, 2, "two records fit the limit of three");
+        let lsn = wal.append(&insert(b"k"));
+        wal.commit(lsn).unwrap();
+        assert_eq!(wal.buffered(), (0, 0), "the third one writes them all");
+
+        let bytes = Commit {
+            sync: false,
+            records: 1000,
+            bytes: 100,
+        };
+        let dir2 = PathBuf::from("target/test_wal_commit_buffers_bytes");
+        let _ = fs::remove_dir_all(&dir2);
+        let wal = Wal::create(&dir2, 1, 1, bytes).unwrap();
+        for _ in 0..20 {
+            let lsn = wal.append(&insert(b"k"));
+            wal.commit(lsn).unwrap();
+            assert!(
+                wal.buffered().1 < 100,
+                "never more than the byte limit waits"
+            );
+        }
+        fs::remove_dir_all(&dir).unwrap();
+        fs::remove_dir_all(&dir2).unwrap();
     }
 }

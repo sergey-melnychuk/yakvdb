@@ -3,6 +3,7 @@ use crate::api::error::{Error, Result};
 use crate::api::page::{OVERFLOW_FLAG, Page};
 use crate::api::tree::Tree;
 use crate::api::{Durability, Options};
+use crate::disk::wal::Commit;
 use crate::disk::wal::{self, Flusher, Op, Record, Wal};
 use crate::util::cache::{Cache, ClockCache};
 use crate::util::hex::hex;
@@ -150,10 +151,13 @@ impl<P: Page> File<P> {
             .max(1);
         let checkpointed_lsn = AtomicU64::new(wal.last_lsn());
         let wal = Arc::new(wal);
-        let flusher = match options.durability {
-            Durability::Periodic(interval) => Some(Flusher::start(wal.clone(), interval)),
-            Durability::Os | Durability::Sync => None,
+        let (write_every, sync_every) = match options.durability {
+            Durability::Os => (options.write_buffer.interval, None),
+            Durability::Periodic(every) => (options.write_buffer.interval, Some(every)),
+            Durability::Sync => (None, None),
         };
+        let flusher = (write_every.is_some() || sync_every.is_some())
+            .then(|| Flusher::start(wal.clone(), write_every, sync_every));
         Self {
             file: Arc::new(RwLock::new(file)),
             head,
@@ -210,7 +214,7 @@ impl<P: Page> File<P> {
         file.write_all(buf.as_ref())?;
         file.sync_all()?;
 
-        let wal = Wal::create(&wal_dir, 1, 1, options.durability == Durability::Sync)?;
+        let wal = Wal::create(&wal_dir, 1, 1, commit_policy(&options))?;
         Ok(Self::new(file, head, &options, wal))
     }
 
@@ -289,8 +293,12 @@ impl<P: Page> File<P> {
         file.read_exact(root.as_mut())?;
 
         let next_segment = segments.last().map(|(id, _)| id + 1).unwrap_or(1);
-        let sync = options.durability == Durability::Sync;
-        let wal = Wal::create(&wal_dir, next_segment, plan.last_lsn + 1, sync)?;
+        let wal = Wal::create(
+            &wal_dir,
+            next_segment,
+            plan.last_lsn + 1,
+            commit_policy(&options),
+        )?;
         let this = Self::new(file, head, &options, wal);
 
         let _ = this.cache.write().put(ROOT, root, |_| false);
@@ -1701,9 +1709,14 @@ impl<P: Page> Tree<P> for File<P> {
 
 impl<P: Page> Drop for File<P> {
     /// Checkpoint on close, leaving the log empty and the next open quick.
-    /// Skipped after a failed write: then the next open recovers instead.
+    /// Skipped after a failed write: then the next open recovers instead,
+    /// from a log that still gets the records waiting in memory, since those
+    /// are all of writes that succeeded.
     fn drop(&mut self) {
         if self.poisoned.load(Ordering::Acquire) {
+            if let Err(e) = self.wal.flush_all(false) {
+                error!("Writing the log on close failed: {e}");
+            }
             return;
         }
         let _op = self.ops.write();
@@ -1725,6 +1738,18 @@ fn lock(file: &fs::File, path: &Path) -> io::Result<()> {
         ),
         fs::TryLockError::Error(e) => e,
     })
+}
+
+/// What a commit waits for, from the options.
+fn commit_policy(options: &Options) -> Commit {
+    match options.durability {
+        Durability::Sync => Commit::SYNC,
+        Durability::Os | Durability::Periodic(_) => Commit {
+            sync: false,
+            records: options.write_buffer.records as u64,
+            bytes: options.write_buffer.bytes,
+        },
+    }
 }
 
 /// The log of the database at `path`: the directory `<path>.wal`.
@@ -1752,6 +1777,7 @@ fn write_at(file: &fs::File, offset: u64, buf: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::WriteBuffer;
     use crate::disk::block::Block;
     use crate::util;
     use crate::util::hex::hex;
@@ -4102,6 +4128,108 @@ mod tests {
             .expect("dump deadlocked");
         assert!(len > 0);
         drop(Arc::try_unwrap(file).ok().unwrap());
+        cleanup(&path);
+    }
+
+    // ---- write buffer ----
+
+    fn buffered(records: usize, bytes: usize, interval: Option<std::time::Duration>) -> Options {
+        Options {
+            write_buffer: WriteBuffer {
+                records,
+                bytes,
+                interval,
+            },
+            ..Options::default()
+        }
+    }
+
+    fn keys_present(file: &File<Block>, n: usize) -> Vec<usize> {
+        (0..n)
+            .filter(|i| {
+                file.lookup(format!("key-{i:04}").as_bytes())
+                    .unwrap()
+                    .is_some()
+            })
+            .collect()
+    }
+
+    /// With a buffer of 100 records, a crash loses what had not reached 100.
+    #[test]
+    fn test_buffered_records_up_to_the_limit_are_lost_on_crash() {
+        let path = fresh("test_buffered_records_lost_on_crash");
+        {
+            let file: File<Block> =
+                File::make_with(&path, 256, buffered(100, 1 << 20, None)).unwrap();
+            for i in 0..150 {
+                file.insert(format!("key-{i:04}").as_bytes(), b"v").unwrap();
+            }
+            crash(file);
+        }
+        let file: File<Block> = File::open(&path).unwrap();
+        assert_eq!(keys_present(&file, 150), (0..100).collect::<Vec<_>>());
+        drop(file);
+        cleanup(&path);
+    }
+
+    /// Closing, like a checkpoint or `sync`, writes out whatever is buffered.
+    #[test]
+    fn test_buffered_records_survive_close() {
+        let path = fresh("test_buffered_records_survive_close");
+        {
+            let file: File<Block> =
+                File::make_with(&path, 256, buffered(1000, 1 << 20, None)).unwrap();
+            for i in 0..150 {
+                file.insert(format!("key-{i:04}").as_bytes(), b"v").unwrap();
+            }
+        }
+        let file: File<Block> = File::open(&path).unwrap();
+        assert_eq!(keys_present(&file, 150).len(), 150);
+        drop(file);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_buffer_interval_writes_in_background() {
+        let path = fresh("test_buffer_interval_writes_in_background");
+        {
+            let options = buffered(1000, 1 << 20, Some(std::time::Duration::from_millis(5)));
+            let file: File<Block> = File::make_with(&path, 256, options).unwrap();
+            for i in 0..10 {
+                file.insert(format!("key-{i:04}").as_bytes(), b"v").unwrap();
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while file.wal.buffered().0 > 0 {
+                assert!(std::time::Instant::now() < deadline, "never written");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            crash(file);
+        }
+        let file: File<Block> = File::open(&path).unwrap();
+        assert_eq!(keys_present(&file, 10).len(), 10);
+        drop(file);
+        cleanup(&path);
+    }
+
+    /// A failed write poisons the database, but the buffered records before
+    /// it are of writes that succeeded: closing still writes them.
+    #[test]
+    fn test_poisoned_close_keeps_buffered_records() {
+        let path = fresh("test_poisoned_close_keeps_buffered_records");
+        {
+            let file: File<Block> =
+                File::make_with(&path, 256, buffered(1000, 1 << 20, None)).unwrap();
+            for i in 0..10 {
+                file.insert(format!("key-{i:04}").as_bytes(), b"v").unwrap();
+            }
+            FAIL_APPLY_AFTER.with(|left| left.set(0));
+            assert!(file.insert(b"failed", b"v").is_err());
+            FAIL_APPLY_AFTER.with(|left| left.set(usize::MAX));
+        }
+        let file: File<Block> = File::open(&path).unwrap();
+        assert_eq!(keys_present(&file, 10).len(), 10);
+        assert_eq!(file.lookup(b"failed").unwrap(), None);
+        drop(file);
         cleanup(&path);
     }
 }
