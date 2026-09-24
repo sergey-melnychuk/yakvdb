@@ -98,6 +98,9 @@ pub trait Page: AsRef<[u8]> + AsMut<[u8]> {
     /// Returns slot index if operation was successful.
     fn put_overflow(&mut self, key: &[u8], overflow_page: u32, raw_vlen: u32) -> Option<u32>;
 
+    /// Keep the first `len` slots and drop the rest, repacking the data.
+    fn truncate(&mut self, len: u32);
+
     /// Remove the slot of a given index.
     /// Automatic defragmentation is performed to maximize available capacity.
     fn remove(&mut self, idx: u32);

@@ -30,6 +30,7 @@ rustyline = "14.0"
 atty = "0.2"
 crossterm = "0.27"
 crc32c = "0.6"
+rustc-hash = "2"
 
 [dev-dependencies]
 sled = "0.34.7"

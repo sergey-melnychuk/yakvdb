@@ -8,8 +8,9 @@ use crate::util::cache::{Cache, ClockCache};
 use crate::util::hex::hex;
 use bytes::{Buf, BufMut, BytesMut};
 use log::{debug, error, trace};
+use rustc_hash::FxHashSet;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::BinaryHeap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
@@ -28,7 +29,7 @@ pub struct File<P: Page> {
 
     /// In-memory page cache. All page access happens only through cached page representation.
     cache: Arc<RwLock<ClockCache<u32, P>>>,
-    dirty: Arc<RwLock<HashSet<u32>>>,
+    dirty: Arc<RwLock<FxHashSet<u32>>>,
 
     /// Min-heap of available page identifiers (this helps avoid "gaps": empty pages inside file).
     empty: Arc<RwLock<BinaryHeap<Reverse<u32>>>>,
@@ -157,7 +158,7 @@ impl<P: Page> File<P> {
             file: Arc::new(RwLock::new(file)),
             head,
             cache: Arc::new(RwLock::new(ClockCache::new(pages))),
-            dirty: Arc::new(RwLock::new(HashSet::with_capacity(32))),
+            dirty: Arc::new(RwLock::new(FxHashSet::default())),
             empty: Arc::new(RwLock::new(BinaryHeap::with_capacity(32))),
             ops: Arc::new(RwLock::new(())),
             wal,
@@ -593,10 +594,9 @@ impl<P: Page> File<P> {
     /// overflow region. Returns how full the page is afterwards.
     fn put_leaf(&self, id: u32, key: &[u8], val: &[u8]) -> Result<u8> {
         let prefix_len = {
-            let page = self.try_page(id)?;
+            // every way through here changes the page: take it mutably at once
+            let mut page = self.try_page_mut(id)?;
             if page.fits((key.len() + val.len()) as u32) {
-                drop(page);
-                let mut page = self.try_page_mut(id)?;
                 page.put_val(key, val);
                 return Ok(page.full());
             }
@@ -827,7 +827,9 @@ impl<P: Page> File<P> {
         // marked dirty and written out by the next flush -- only once it is
         // certain to change. Most inserts change the leaf alone.
         let mut id = ROOT;
-        let mut path: Vec<(u32, u32)> = Vec::with_capacity(8);
+        // (page id, index of the entry followed, whether `key` is beyond the
+        // page's largest key -- then that entry's key has to become `key`)
+        let mut path: Vec<(u32, u32, bool)> = Vec::with_capacity(8);
         loop {
             if path.len() >= MAX_DEPTH {
                 return Err(Error::Tree(
@@ -835,26 +837,28 @@ impl<P: Page> File<P> {
                     format!("Cyclic reference detected: {path:?}"),
                 ));
             }
-            let parent_id = path.last().map(|(id, _)| *id).unwrap_or_default();
+            let parent_id = path.last().map(|(id, _, _)| *id).unwrap_or_default();
 
-            let (idx, slot) = {
+            let (idx, slot, beyond) = {
                 let page = self.try_page(id)?;
                 if page.len() == 0 {
                     drop(page);
                     self.put_leaf(id, key, val)?;
                     return Ok(());
                 }
-                let idx = page.ceil(key).unwrap_or_else(|| page.len() - 1);
-                (idx, page.slot(idx))
+                match page.ceil(key) {
+                    Some(idx) => (idx, page.slot(idx), false),
+                    None => (page.len() - 1, page.slot(page.len() - 1), true),
+                }
             };
 
-            if let Some((parent_id, parent_idx)) = path.last().cloned() {
-                let stale = key > self.try_page(parent_id)?.key(parent_idx);
-                if stale {
-                    let mut parent_page = self.try_page_mut(parent_id)?;
-                    parent_page.remove(parent_idx);
-                    parent_page.put_ref(key, id);
-                }
+            // `ceil` found nothing at or above `key` in the parent exactly when
+            // `key` is beyond the parent's entry for this page: no need to read
+            // the parent again to find out.
+            if let Some(&(parent_id, parent_idx, true)) = path.last() {
+                let mut parent_page = self.try_page_mut(parent_id)?;
+                parent_page.remove(parent_idx);
+                parent_page.put_ref(key, id);
             }
 
             let slot = slot.ok_or_else(|| Error::Tree(id, format!("Slot not found: {idx}")))?;
@@ -871,8 +875,8 @@ impl<P: Page> File<P> {
                     self.split(id, parent_id)?;
                 }
 
-                while let Some((page_id, _)) = path.pop() {
-                    let (parent_id, _) = path.last().cloned().unwrap_or_default();
+                while let Some((page_id, _, _)) = path.pop() {
+                    let parent_id = path.last().map(|(id, _, _)| *id).unwrap_or_default();
                     let full = {
                         let page = self.try_page(page_id)?;
                         page.full()
@@ -885,7 +889,7 @@ impl<P: Page> File<P> {
                 return Ok(());
             }
 
-            path.push((id, idx));
+            path.push((id, idx, beyond));
             id = slot.page;
         }
     }
@@ -1481,12 +1485,8 @@ impl<P: Page> Tree<P> for File<P> {
 
             let page_max = {
                 let mut page = self.try_page_mut(id)?;
-                for (key, _, _, _) in copy.iter().skip(half) {
-                    let idx = page.find(key).ok_or_else(|| {
-                        Error::Tree(id, format!("Key not found while splitting: {}", hex(key)))
-                    })?;
-                    page.remove(idx);
-                }
+                // the upper half moves to the peer: one pass, not one remove per entry
+                page.truncate(half as u32);
                 // Resolve the max key of the remaining half (may be overflow)
                 let last = page.len() - 1;
                 let slot = page.slot(last).unwrap();
@@ -1915,7 +1915,7 @@ mod tests {
             result
         };
 
-        let mut removed = HashSet::with_capacity(size as usize);
+        let mut removed = std::collections::HashSet::with_capacity(size as usize);
         for key in keys.iter() {
             debug!("remove: key={}", hex(key));
             file.remove(key).unwrap();

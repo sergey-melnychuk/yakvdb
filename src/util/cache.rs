@@ -1,4 +1,5 @@
 use log::debug;
+use rustc_hash::FxBuildHasher;
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::hash::Hash;
@@ -31,7 +32,9 @@ struct Frame<K, V> {
 /// takes the first frame whose bit was already clear: a page is evicted only if
 /// nothing touched it since the hand last went by.
 pub(crate) struct ClockCache<K, V> {
-    map: HashMap<K, usize>,
+    /// Keyed by page id: a one-multiply hash, not SipHash, which costs more
+    /// than the rest of a cache hit and protects against nothing here.
+    map: HashMap<K, usize, FxBuildHasher>,
     frames: Vec<Frame<K, V>>,
     hand: usize,
     cap: usize,
@@ -44,7 +47,7 @@ impl<K: Clone + Eq + Hash + Display, V> ClockCache<K, V> {
     pub(crate) fn new(size: usize) -> Self {
         let cap = size.max(1);
         Self {
-            map: HashMap::new(),
+            map: HashMap::default(),
             frames: Vec::new(),
             hand: 0,
             cap,

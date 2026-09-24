@@ -251,6 +251,33 @@ impl Page for Block {
         *self.lo.get_mut() = if n == 1 { self.cap() } else { lo + len };
     }
 
+    fn truncate(&mut self, len: u32) {
+        let n = self.len();
+        if len >= n {
+            return;
+        }
+        // Repack the kept entries against the end of the page, reading them
+        // from a copy: their old places may overlap the new ones.
+        let old = self.buf.clone();
+        let cap = self.cap();
+        let mut offset = cap;
+        for idx in 0..len {
+            let pos = slot_pos(idx);
+            let at = get_u32(&old, pos) as usize;
+            let klen = get_u32(&old, pos + 4);
+            let vlen = get_u32(&old, pos + 8);
+            let slot = Slot::new(at as u32, klen, vlen, 0);
+            let bytes = (klen + slot.inline_vlen()) as usize;
+            offset -= bytes as u32;
+            self.buf[offset as usize..offset as usize + bytes]
+                .copy_from_slice(&old[at..at + bytes]);
+            put_u32(&mut self.buf, pos, offset);
+        }
+        self.buf[slot_pos(len)..offset as usize].fill(0);
+        put_size(&mut self.buf, len);
+        *self.lo.get_mut() = offset;
+    }
+
     fn copy(&self) -> Vec<(Vec<u8>, Vec<u8>, u32, u32)> {
         (0..self.len())
             .filter_map(|idx| self.slot(idx))
@@ -720,6 +747,51 @@ mod tests {
                 page.free(),
                 page.cap() - HEAD as u32 - model.len() as u32 * SLOT as u32 - used,
                 "data must stay packed against the end of the page"
+            );
+        }
+    }
+
+    #[test]
+    fn test_truncate() {
+        let mut rng = StdRng::seed_from_u64(9);
+        for len in [0usize, 1, 7, 20, 39, 40, 41] {
+            let mut page = Block::create(1, 4096);
+            let mut entries = vec![];
+            while entries.len() < 40 {
+                let key = rng.r#gen::<u64>().to_be_bytes().to_vec();
+                let val = vec![rng.r#gen::<u8>(); rng.gen_range(0..40)];
+                if page.find(&key).is_none() {
+                    page.put_val(&key, &val).unwrap();
+                    entries.push((key, val));
+                }
+            }
+            // remove a few to leave the data out of slot order
+            for _ in 0..5 {
+                let idx = rng.gen_range(0..page.len());
+                let key = page.key(idx).to_vec();
+                page.remove(idx);
+                entries.retain(|(k, _)| *k != key);
+            }
+            entries.sort();
+
+            page.truncate(len as u32);
+            let kept = len.min(entries.len());
+            assert_eq!(page.len() as usize, kept);
+            for (idx, (key, val)) in entries.iter().take(kept).enumerate() {
+                assert_eq!(page.key(idx as u32), key.as_slice());
+                assert_eq!(page.val(idx as u32), val.as_slice());
+            }
+            let mut copy = Block::reserve(page.cap());
+            copy.as_mut().copy_from_slice(page.as_ref());
+            assert_eq!(copy.free(), page.free());
+            let used: u32 = entries
+                .iter()
+                .take(kept)
+                .map(|(k, v)| (k.len() + v.len()) as u32)
+                .sum();
+            assert_eq!(
+                page.free(),
+                page.cap() - HEAD as u32 - kept as u32 * SLOT as u32 - used
             );
         }
     }
