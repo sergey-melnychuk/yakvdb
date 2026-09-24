@@ -2,13 +2,30 @@ use crate::api::page::{Page, Slot};
 use crate::util::bsearch::bsearch;
 use bytes::{BufMut, BytesMut};
 use std::mem::size_of;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 pub struct Block {
     buf: BytesMut,
+    /// Offset of the lowest key/value byte in the page (`cap` when empty), or
+    /// `UNKNOWN` when it has to be recomputed from the slots.
+    ///
+    /// Key/value data grows down from the end of the page and is kept packed,
+    /// so this is where the next entry goes and, with the slot count, all that
+    /// `free` needs. Caching it turns `free`, `fits` and `full` from a scan of
+    /// every slot into arithmetic. It is not stored on disk, so the file format
+    /// is unchanged: a freshly loaded page starts at `UNKNOWN`.
+    ///
+    /// Atomic only so that `free(&self)` can fill it in lazily while `Block`
+    /// stays `Sync`; every write that changes it goes through `&mut self`.
+    lo: AtomicU32,
 }
+
+const UNKNOWN: u32 = 0;
 
 impl AsMut<[u8]> for Block {
     fn as_mut(&mut self) -> &mut [u8] {
+        // the caller may rewrite anything, slots included
+        *self.lo.get_mut() = UNKNOWN;
         &mut self.buf[..]
     }
 }
@@ -25,48 +42,61 @@ const SIZE_OFFSET: usize = 8;
 const RESERVED: u32 = 0xC0DEFACE;
 
 impl Block {
-    fn put_entry(&mut self, key: &[u8], val: &[u8], page: u32) -> Option<u32> {
-        if !self.fits((key.len() + val.len()) as u32) {
+    fn new(buf: BytesMut, lo: u32) -> Self {
+        Self {
+            buf,
+            lo: AtomicU32::new(lo),
+        }
+    }
+
+    /// See `lo`: the offset of the lowest data byte, computed on first use.
+    fn data_lo(&self) -> u32 {
+        let lo = self.lo.load(Ordering::Relaxed);
+        if lo != UNKNOWN {
+            return lo;
+        }
+        let lo = (0..self.len())
+            .map(|idx| get_u32(&self.buf, slot_pos(idx)))
+            .min()
+            .unwrap_or_else(|| self.cap());
+        self.lo.store(lo, Ordering::Relaxed);
+        lo
+    }
+
+    /// Insert an entry keeping slots ordered by key, replacing an equal key.
+    ///
+    /// `val` is the bytes stored inline after the key, while `vlen` is the raw
+    /// slot field: the same as `val.len()` for a regular entry, but carrying
+    /// `OVERFLOW_FLAG | multiplier` for an overflow one, whose value is elsewhere.
+    fn put_entry(&mut self, key: &[u8], val: &[u8], vlen: u32, page: u32) -> Option<u32> {
+        let len = (key.len() + val.len()) as u32;
+        if !self.fits(len) {
             return None;
         }
 
-        let ceil_opt = self.ceil(key);
-        if let Some(idx) = &ceil_opt {
-            if self.key(*idx) == key {
-                self.remove(*idx);
-            }
+        let n = self.len();
+        let idx = self.ceil(key).unwrap_or(n);
+        if idx < n && self.key(idx) == key {
+            // `idx` is still where the new entry belongs once the old one is gone
+            self.remove(idx);
         }
 
-        let size = self.len();
-        let idx = self.ceil(key).unwrap_or(size);
+        let n = self.len();
+        let offset = self.data_lo() - len;
 
-        let mut slots = (0..size)
-            .filter_map(|idx| self.slot(idx))
-            .collect::<Vec<_>>();
-
-        let klen = key.len() as u32;
-        let vlen = val.len() as u32;
-        let end = slots
-            .iter()
-            .map(|slot| slot.offset)
-            .min()
-            .unwrap_or_else(|| self.cap());
-        let offset = end - klen - vlen;
-        let slot = Slot::new(offset, klen, vlen, page);
-
-        slots.insert(idx as usize, slot);
-        slots
-            .into_iter()
-            .enumerate()
-            .for_each(|(idx, slot)| put_slot(&mut self.buf, idx as u32, &slot));
-
-        let n = self.len() + 1;
-        put_size(&mut self.buf, n);
+        // `fits` guaranteed one more slot does not run into the data
+        let at = slot_pos(idx);
+        self.buf.copy_within(at..slot_pos(n), at + SLOT);
+        put_slot(
+            &mut self.buf,
+            idx,
+            &Slot::new(offset, key.len() as u32, vlen, page),
+        );
+        put_size(&mut self.buf, n + 1);
 
         put_slice(&mut self.buf, offset as usize, key);
-        if !val.is_empty() {
-            put_slice(&mut self.buf, offset as usize + key.len(), val);
-        }
+        put_slice(&mut self.buf, offset as usize + key.len(), val);
+        *self.lo.get_mut() = offset;
 
         Some(idx)
     }
@@ -74,20 +104,13 @@ impl Block {
 
 impl Page for Block {
     fn reserve(capacity: u32) -> Self {
-        let mut buf = BytesMut::with_capacity(capacity as usize);
-        buf.extend_from_slice(&vec![0u8; capacity as usize]);
-        Self { buf }
+        Self::new(BytesMut::zeroed(capacity as usize), UNKNOWN)
     }
 
     fn create(id: u32, cap: u32) -> Self {
-        let mut buf = BytesMut::with_capacity(cap as usize);
-        buf.put_u32(id);
-        buf.put_u32(cap);
-        buf.put_u32(0);
-        buf.put_u32(RESERVED);
-        assert_eq!(buf.len(), HEAD);
-        buf.extend_from_slice(&vec![0u8; cap as usize - HEAD]);
-        Self { buf }
+        let mut buf = BytesMut::zeroed(cap as usize);
+        put_head(&mut buf, id, cap);
+        Self::new(buf, cap)
     }
 
     fn id(&self) -> u32 {
@@ -106,7 +129,7 @@ impl Page for Block {
         if idx >= self.len() {
             return None;
         }
-        let pos = HEAD + U32 * 4 * idx as usize;
+        let pos = slot_pos(idx);
         let offset = get_u32(&self.buf, pos);
         let klen = get_u32(&self.buf, pos + 4);
         let vlen = get_u32(&self.buf, pos + 8);
@@ -144,21 +167,10 @@ impl Page for Block {
     }
 
     fn free(&self) -> u32 {
-        let size = self.len();
-        if size == 0 {
-            return self.cap() - HEAD as u32;
-        }
-        let lo = HEAD as u32 + size * SLOT as u32;
-        // For overflow entries klen bytes are stored inline but no value bytes,
-        // so we only look at actual data offsets.
-        let hi = (0..size)
-            .filter_map(|idx| self.slot(idx))
-            .map(|slot| slot.offset)
-            .min()
-            .unwrap_or(lo);
-
-        assert!(lo <= hi);
-        hi - lo
+        let slots_end = slot_pos(self.len()) as u32;
+        let data_lo = self.data_lo();
+        assert!(slots_end <= data_lo);
+        data_lo - slots_end
     }
 
     fn full(&self) -> u8 {
@@ -199,105 +211,52 @@ impl Page for Block {
     }
 
     fn put_val(&mut self, key: &[u8], val: &[u8]) -> Option<u32> {
-        self.put_entry(key, val, 0)
+        self.put_entry(key, val, val.len() as u32, 0)
     }
 
     fn put_ref(&mut self, key: &[u8], page: u32) -> Option<u32> {
-        self.put_entry(key, &[], page)
+        self.put_entry(key, &[], 0, page)
     }
 
     fn put_overflow(&mut self, key: &[u8], overflow_page: u32, raw_vlen: u32) -> Option<u32> {
         // Overflow entries store only the key inline (no value bytes).
         // The vlen field carries OVERFLOW_FLAG | multiplier.
-        if !self.fits(key.len() as u32) {
-            return None;
-        }
-
-        let ceil_opt = self.ceil(key);
-        if let Some(idx) = &ceil_opt {
-            if self.key(*idx) == key {
-                self.remove(*idx);
-            }
-        }
-
-        let size = self.len();
-        let idx = self.ceil(key).unwrap_or(size);
-
-        let mut slots = (0..size)
-            .filter_map(|idx| self.slot(idx))
-            .collect::<Vec<_>>();
-
-        let klen = key.len() as u32;
-        let end = slots
-            .iter()
-            .map(|slot| slot.offset)
-            .min()
-            .unwrap_or_else(|| self.cap());
-        let offset = end - klen;
-        let slot = Slot::new(offset, klen, raw_vlen, overflow_page);
-
-        slots.insert(idx as usize, slot);
-        slots
-            .into_iter()
-            .enumerate()
-            .for_each(|(idx, slot)| put_slot(&mut self.buf, idx as u32, &slot));
-
-        let n = self.len() + 1;
-        put_size(&mut self.buf, n);
-
-        put_slice(&mut self.buf, offset as usize, key);
-
-        Some(idx)
+        self.put_entry(key, &[], raw_vlen, overflow_page)
     }
 
     fn remove(&mut self, idx: u32) {
-        let size = self.len();
-        if idx >= size {
+        let n = self.len();
+        if idx >= n {
             return;
         }
 
-        let mut slots = (0..size)
-            .filter_map(|idx| self.slot(idx))
-            .collect::<Vec<_>>();
+        let removed = self.slot(idx).unwrap();
+        let off = removed.offset;
+        let len = removed.klen + removed.inline_vlen();
+        let lo = self.data_lo();
 
-        let removed = slots.remove(idx as usize);
-        let inline_bytes = removed.klen + removed.inline_vlen();
-        let blank = vec![0u8; inline_bytes as usize];
-        put_slice(&mut self.buf, removed.offset as usize, &blank);
-
-        put_size(&mut self.buf, size - 1);
-
-        let total: u32 = slots
-            .iter()
-            .map(|slot| slot.klen + slot.inline_vlen())
-            .sum();
-        let mut offset = self.cap() - total;
-
-        let copy = slots
-            .iter()
-            .map(|slot| {
-                (
-                    get_key(&self.buf, slot).to_vec(),
-                    get_val(&self.buf, slot).to_vec(),
-                )
-            })
-            .collect::<Vec<_>>();
-
-        for (i, (key, val)) in copy.iter().enumerate() {
-            slots.get_mut(i).unwrap().offset = offset;
-            put_slice(&mut self.buf, offset as usize, key);
-            offset += key.len() as u32;
-            if !val.is_empty() {
-                put_slice(&mut self.buf, offset as usize, val);
-                offset += val.len() as u32;
+        if len > 0 {
+            // Close the gap: everything stored below the removed entry moves up
+            // by its length, so the data stays packed against the end of the page.
+            self.buf
+                .copy_within(lo as usize..off as usize, (lo + len) as usize);
+            self.buf[lo as usize..(lo + len) as usize].fill(0);
+            for i in 0..n {
+                let pos = slot_pos(i);
+                let offset = get_u32(&self.buf, pos);
+                if i != idx && offset < off {
+                    put_u32(&mut self.buf, pos, offset + len);
+                }
             }
         }
 
-        slots.push(Slot::empty());
-        slots
-            .into_iter()
-            .enumerate()
-            .for_each(|(idx, slot)| put_slot(&mut self.buf, idx as u32, &slot));
+        let at = slot_pos(idx);
+        let end = slot_pos(n);
+        self.buf.copy_within(at + SLOT..end, at);
+        self.buf[end - SLOT..end].fill(0);
+        put_size(&mut self.buf, n - 1);
+
+        *self.lo.get_mut() = if n == 1 { self.cap() } else { lo + len };
     }
 
     fn copy(&self) -> Vec<(Vec<u8>, Vec<u8>, u32, u32)> {
@@ -315,15 +274,10 @@ impl Page for Block {
     }
 
     fn clear(&mut self) {
-        let len = self.cap() as usize;
-        let mut tmp = BytesMut::with_capacity(len);
-        tmp.put_u32(self.id());
-        tmp.put_u32(self.cap());
-        tmp.put_u32(0);
-        tmp.put_u32(RESERVED);
-        self.buf[..HEAD].copy_from_slice(tmp.as_ref());
-        let blank = vec![0xFFu8; len - HEAD];
-        self.buf[HEAD..].copy_from_slice(&blank);
+        let (id, cap) = (self.id(), self.cap());
+        put_head(&mut self.buf, id, cap);
+        self.buf[HEAD..].fill(0xFF);
+        *self.lo.get_mut() = cap;
     }
 
     fn is_empty(&self) -> bool {
@@ -334,6 +288,18 @@ impl Page for Block {
 const U32: usize = size_of::<u32>();
 const SLOT: usize = size_of::<Slot>();
 const HEAD: usize = 4 * U32; // page header: id, length, size, reserved
+
+fn slot_pos(idx: u32) -> usize {
+    HEAD + idx as usize * SLOT
+}
+
+fn put_head(buf: &mut BytesMut, id: u32, cap: u32) {
+    let mut head = &mut buf[..HEAD];
+    head.put_u32(id);
+    head.put_u32(cap);
+    head.put_u32(0);
+    head.put_u32(RESERVED);
+}
 
 fn get_u32(buf: &BytesMut, pos: usize) -> u32 {
     let mut src = [0u8; U32];
@@ -366,7 +332,7 @@ fn put_size(buf: &mut BytesMut, val: u32) {
 }
 
 fn put_slot(buf: &mut BytesMut, idx: u32, slot: &Slot) {
-    let pos = HEAD + idx as usize * SLOT;
+    let pos = slot_pos(idx);
     put_u32(buf, pos, slot.offset);
     put_u32(buf, pos + 4, slot.klen);
     put_u32(buf, pos + 8, slot.vlen);
@@ -643,7 +609,7 @@ mod tests {
     fn test_large_key() {
         let mut page = Block::create(1, 64);
         let buf = vec![42u8; 256];
-        let opt = page.put_entry(&buf, &buf, 0);
+        let opt = page.put_val(&buf, &buf);
         assert!(opt.is_none());
     }
 
@@ -712,5 +678,53 @@ mod tests {
         let slot = page.slot(0).unwrap();
         assert_eq!(slot.page, 20);
         assert_eq!(slot.vlen, 0x80000002);
+    }
+
+    /// Random puts and removes against a `BTreeMap`, checking after every step
+    /// that the page holds exactly the model, in order, and that the cached
+    /// data offset agrees with one recomputed from scratch.
+    #[test]
+    fn test_random_ops_match_model() {
+        use std::collections::BTreeMap;
+
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut page = Block::create(1, 4096);
+        let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+
+        for _ in 0..20_000 {
+            let key = {
+                let len = rng.gen_range(1..24);
+                (0..len).map(|_| rng.gen_range(0..4u8)).collect::<Vec<_>>()
+            };
+            if rng.gen_bool(0.6) {
+                let val = vec![rng.gen::<u8>(); rng.gen_range(0..64)];
+                if page.put_val(&key, &val).is_some() {
+                    model.insert(key, val);
+                } else {
+                    assert!(!page.fits((key.len() + val.len()) as u32));
+                }
+            } else if let Some(idx) = page.find(&key) {
+                page.remove(idx);
+                model.remove(&key);
+            }
+
+            assert_eq!(page.len() as usize, model.len());
+            for (idx, (key, val)) in model.iter().enumerate() {
+                assert_eq!(page.key(idx as u32), key.as_slice());
+                assert_eq!(page.val(idx as u32), val.as_slice());
+            }
+
+            // A copy made through `as_mut` knows nothing and recomputes.
+            let mut copy = Block::reserve(page.cap());
+            copy.as_mut().copy_from_slice(page.as_ref());
+            assert_eq!(copy.free(), page.free());
+
+            let used: u32 = model.iter().map(|(k, v)| (k.len() + v.len()) as u32).sum();
+            assert_eq!(
+                page.free(),
+                page.cap() - HEAD as u32 - model.len() as u32 * SLOT as u32 - used,
+                "data must stay packed against the end of the page"
+            );
+        }
     }
 }

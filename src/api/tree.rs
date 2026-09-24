@@ -15,9 +15,6 @@ pub(crate) trait Tree<P: Page> {
     /// Get an immutable reference to a page having given id, if such page exists.
     fn page(&self, id: u32) -> Option<MappedRwLockReadGuard<'_, P>>;
 
-    /// Get a mutable reference to a root page.
-    fn root_mut(&self) -> Result<MappedRwLockWriteGuard<'_, P>>;
-
     /// Get a mutable reference to a page having given id, if such page exists.
     fn page_mut(&self, id: u32) -> Option<MappedRwLockWriteGuard<'_, P>>;
 

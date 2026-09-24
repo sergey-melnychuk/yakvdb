@@ -1,9 +1,8 @@
 use log::debug;
-use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::hash::Hash;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) trait Cache<K: Clone + Eq + PartialEq + Hash, V> {
     fn has(&self, key: &K) -> bool;
@@ -13,77 +12,103 @@ pub(crate) trait Cache<K: Clone + Eq + PartialEq + Hash, V> {
     fn put(&mut self, key: K, value: V) -> Option<(K, V)>;
 }
 
-pub(crate) struct LruCache<K, V> {
-    map: HashMap<K, V>,
-    lru: Arc<RwLock<Vec<K>>>,
+struct Frame<K, V> {
+    key: K,
+    val: V,
+    /// Set on every access, cleared by the clock hand as it sweeps past.
+    referenced: AtomicBool,
+}
+
+/// A CLOCK (second-chance) cache: an approximation of LRU that costs O(1) per access.
+///
+/// A true LRU has to move the key to the most-recently-used end on every read,
+/// which is a mutation, and so an exclusive lock, on the read path. Here a read
+/// only sets the frame's `referenced` bit, which an atomic store does through
+/// `&self`: readers holding the cache's shared lock do not exclude each other.
+///
+/// Eviction sweeps the hand over the frames, clearing `referenced` bits, and
+/// takes the first frame whose bit was already clear: a page is evicted only if
+/// nothing touched it since the hand last went by.
+pub(crate) struct ClockCache<K, V> {
+    map: HashMap<K, usize>,
+    frames: Vec<Frame<K, V>>,
+    hand: usize,
     cap: usize,
 }
 
-impl<K: Clone + Eq + Hash + Display, V> LruCache<K, V> {
+impl<K: Clone + Eq + Hash + Display, V> ClockCache<K, V> {
     pub(crate) fn new(size: usize) -> Self {
+        let cap = size.max(1);
         Self {
-            map: HashMap::with_capacity(size),
-            lru: Arc::new(RwLock::new(Vec::with_capacity(size))),
-            cap: size,
+            map: HashMap::with_capacity(cap),
+            frames: Vec::with_capacity(cap),
+            hand: 0,
+            cap,
         }
     }
 
-    /// Move `key` to the most-recently-used end, evicting the least-recently-used
-    /// key first if the cache is at capacity. Returns the evicted key, if any.
+    /// Advance the hand to the first frame not referenced since the last sweep.
     ///
-    /// The whole update happens under a single write guard: `get(&self)` mutates
-    /// the recency list through interior mutability, so two concurrent readers
-    /// would otherwise race between locating an index and removing it.
-    fn touch(&self, key: &K) -> Option<K> {
-        let mut lru = self.lru.write();
-
-        if let Some(idx) = lru.iter().position(|x| x == key) {
-            lru.remove(idx);
-            lru.push(key.clone());
-            return None;
+    /// Terminates within two turns: the first turn clears every bit it passes.
+    fn victim(&mut self) -> usize {
+        loop {
+            let idx = self.hand;
+            self.hand = (self.hand + 1) % self.cap;
+            if !self.frames[idx].referenced.swap(false, Ordering::Relaxed) {
+                return idx;
+            }
         }
-
-        let evicted = if lru.len() >= self.cap {
-            Some(lru.remove(0))
-        } else {
-            None
-        };
-        lru.push(key.clone());
-        evicted
     }
 }
 
-impl<K: Clone + Hash + Eq + Display, V> Cache<K, V> for LruCache<K, V> {
+impl<K: Clone + Hash + Eq + Display, V> Cache<K, V> for ClockCache<K, V> {
     fn has(&self, key: &K) -> bool {
         self.map.contains_key(key)
     }
 
     fn get(&self, key: &K) -> Option<&V> {
-        if !self.map.contains_key(key) {
-            None
-        } else {
-            self.touch(key);
-            self.map.get(key)
+        let frame = &self.frames[*self.map.get(key)?];
+        // Load before storing: hot frames (the root, the upper levels) are read
+        // by every operation, and an unconditional store would have each reader
+        // take their cache line exclusively, however rarely the bit changes.
+        if !frame.referenced.load(Ordering::Relaxed) {
+            frame.referenced.store(true, Ordering::Relaxed);
         }
+        Some(&frame.val)
     }
 
     fn get_mut(&mut self, key: &K) -> Option<&mut V> {
-        if !self.map.contains_key(key) {
-            None
-        } else {
-            self.touch(key);
-            self.map.get_mut(key)
-        }
+        let frame = &mut self.frames[*self.map.get(key)?];
+        *frame.referenced.get_mut() = true;
+        Some(&mut frame.val)
     }
 
     fn put(&mut self, key: K, value: V) -> Option<(K, V)> {
-        let evicted = self.touch(&key).and_then(|evicted| {
-            debug!("Evicted page {evicted}");
-            let value = self.map.remove(&evicted)?;
-            Some((evicted, value))
-        });
-        self.map.insert(key, value);
-        evicted
+        if let Some(&idx) = self.map.get(&key) {
+            let frame = &mut self.frames[idx];
+            frame.val = value;
+            *frame.referenced.get_mut() = true;
+            return None;
+        }
+
+        let frame = Frame {
+            key: key.clone(),
+            val: value,
+            referenced: AtomicBool::new(false),
+        };
+
+        if self.frames.len() < self.cap {
+            self.map.insert(key, self.frames.len());
+            self.frames.push(frame);
+            return None;
+        }
+
+        let idx = self.victim();
+        let old = std::mem::replace(&mut self.frames[idx], frame);
+        self.map.remove(&old.key);
+        self.map.insert(key, idx);
+        debug!("Evicted page {}", old.key);
+        Some((old.key, old.val))
     }
 }
 
@@ -91,41 +116,66 @@ impl<K: Clone + Hash + Eq + Display, V> Cache<K, V> for LruCache<K, V> {
 mod tests {
     use super::*;
 
+    fn keys(cache: &ClockCache<u32, u32>) -> Vec<u32> {
+        let mut keys = cache.map.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        keys
+    }
+
     #[test]
     fn test_eviction() {
-        let mut cache = LruCache::new(3);
+        let mut cache = ClockCache::new(3);
         cache.put(1, 0);
         cache.put(2, 0);
         cache.put(3, 0);
-        cache.put(4, 0);
+        let evicted = cache.put(4, 0);
 
-        let mut keys = cache.map.keys().cloned().collect::<Vec<_>>();
-        keys.sort();
-        assert_eq!(keys, vec![2, 3, 4]);
+        assert_eq!(evicted, Some((1, 0)));
+        assert_eq!(keys(&cache), vec![2, 3, 4]);
     }
 
     #[test]
     fn test_eviction_keeps_map_bounded() {
         let cap = 3;
-        let mut cache = LruCache::new(cap);
+        let mut cache = ClockCache::new(cap);
         for i in 0..100 {
             cache.put(i, i);
         }
         assert_eq!(cache.map.len(), cap, "map must not grow past capacity");
         assert_eq!(
-            cache.lru.read().len(),
+            cache.frames.len(),
             cap,
-            "lru must not grow past capacity"
+            "frames must not grow past capacity"
         );
-        // the most recent `cap` keys survived
-        let mut keys = cache.map.keys().cloned().collect::<Vec<_>>();
-        keys.sort();
-        assert_eq!(keys, vec![97, 98, 99]);
+        // untouched entries leave in insertion order: the most recent `cap` survived
+        assert_eq!(keys(&cache), vec![97, 98, 99]);
+    }
+
+    #[test]
+    fn test_referenced_entry_gets_second_chance() {
+        let mut cache = ClockCache::new(3);
+        cache.put(1, 0);
+        cache.put(2, 0);
+        cache.put(3, 0);
+        assert!(cache.get(&1).is_some());
+
+        // 1 was read since it went in, so the hand passes it over and takes 2
+        assert_eq!(cache.put(4, 0), Some((2, 0)));
+        assert_eq!(keys(&cache), vec![1, 3, 4]);
+    }
+
+    #[test]
+    fn test_put_existing_replaces_value() {
+        let mut cache = ClockCache::new(2);
+        cache.put(1, 10);
+        assert_eq!(cache.put(1, 11), None);
+        assert_eq!(cache.get(&1), Some(&11));
+        assert_eq!(cache.frames.len(), 1);
     }
 
     #[test]
     fn test_get_miss() {
-        let mut cache: LruCache<u32, u32> = LruCache::new(4);
+        let mut cache: ClockCache<u32, u32> = ClockCache::new(4);
         assert!(!cache.has(&1));
         assert!(cache.get(&1).is_none());
         assert!(cache.get_mut(&1).is_none());

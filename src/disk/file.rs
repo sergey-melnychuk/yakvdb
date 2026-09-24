@@ -2,7 +2,7 @@ use crate::api::error::{Error, Result};
 use crate::api::page::{Page, OVERFLOW_FLAG};
 use crate::api::tree::Tree;
 use crate::api::Store;
-use crate::util::cache::{Cache, LruCache};
+use crate::util::cache::{Cache, ClockCache};
 use crate::util::hex::hex;
 use bytes::{Buf, BufMut, BytesMut};
 use log::{debug, error, trace};
@@ -26,7 +26,7 @@ pub struct File<P: Page> {
     head: Head,
 
     /// In-memory page cache. All page access happens only through cached page representation.
-    cache: Arc<RwLock<LruCache<u32, P>>>,
+    cache: Arc<RwLock<ClockCache<u32, P>>>,
     dirty: Arc<RwLock<HashSet<u32>>>,
 
     /// Min-heap of available page identifiers (this helps avoid "gaps": empty pages inside file).
@@ -48,6 +48,18 @@ pub struct File<P: Page> {
 }
 
 const MAGIC: &[u8] = b"YAKVDB42";
+
+/// Page cache size used by `make` and `open`: 64 MiB, i.e. 16384 pages of 4 KiB.
+///
+/// The cache is the only thing standing between a page access and a `pread`,
+/// and every operation touches a page per tree level, so the more of the tree
+/// it holds the better. Use `make_with_cache`/`open_with_cache` to pick another size.
+pub const DEFAULT_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Upper bound on the tree depth, to report a reference cycle in a corrupted
+/// file instead of following it forever. A B-tree with a fan-out of at least 2
+/// would need more than 2^64 entries to get this deep.
+const MAX_DEPTH: usize = 64;
 
 const HEAD: usize = MAGIC.len() + size_of::<Head>();
 const ROOT: u32 = 1;
@@ -84,7 +96,30 @@ struct Head {
 }
 
 impl<P: Page> File<P> {
+    /// Create a new database file, with the default page cache size.
     pub fn make(path: &Path, page_bytes: u32) -> io::Result<Self> {
+        Self::make_with_cache(path, page_bytes, DEFAULT_CACHE_BYTES)
+    }
+
+    /// Open an existing database file, with the default page cache size.
+    pub fn open(path: &Path) -> io::Result<Self> {
+        Self::open_with_cache(path, DEFAULT_CACHE_BYTES)
+    }
+
+    fn new(file: fs::File, head: Head, cache_bytes: usize) -> Self {
+        let pages = (cache_bytes / head.page_bytes as usize).max(1);
+        Self {
+            file: Arc::new(RwLock::new(file)),
+            head,
+            cache: Arc::new(RwLock::new(ClockCache::new(pages))),
+            dirty: Arc::new(RwLock::new(HashSet::with_capacity(32))),
+            empty: Arc::new(RwLock::new(BinaryHeap::with_capacity(32))),
+            ops: Arc::new(RwLock::new(())),
+        }
+    }
+
+    /// Create a new database file whose page cache holds up to `cache_bytes`.
+    pub fn make_with_cache(path: &Path, page_bytes: u32, cache_bytes: usize) -> io::Result<Self> {
         if path.exists() {
             return Err(io::Error::other(format!("File exists: {path:?}")));
         }
@@ -112,17 +147,11 @@ impl<P: Page> File<P> {
         file.write_all(buf.as_ref())?;
         file.flush()?;
 
-        Ok(Self {
-            file: Arc::new(RwLock::new(file)),
-            head,
-            cache: Arc::new(RwLock::new(LruCache::new(32))),
-            dirty: Arc::new(RwLock::new(HashSet::with_capacity(32))),
-            empty: Arc::new(RwLock::new(BinaryHeap::with_capacity(32))),
-            ops: Arc::new(RwLock::new(())),
-        })
+        Ok(Self::new(file, head, cache_bytes))
     }
 
-    pub fn open(path: &Path) -> io::Result<Self> {
+    /// Open an existing database file whose page cache holds up to `cache_bytes`.
+    pub fn open_with_cache(path: &Path, cache_bytes: usize) -> io::Result<Self> {
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -166,14 +195,7 @@ impl<P: Page> File<P> {
         let mut root = P::reserve(head.page_bytes);
         file.read_exact(root.as_mut())?;
 
-        let this = Self {
-            file: Arc::new(RwLock::new(file)),
-            head,
-            cache: Arc::new(RwLock::new(LruCache::new(32))),
-            dirty: Arc::new(RwLock::new(HashSet::with_capacity(32))),
-            empty: Arc::new(RwLock::new(BinaryHeap::with_capacity(16))),
-            ops: Arc::new(RwLock::new(())),
-        };
+        let this = Self::new(file, head, cache_bytes);
 
         let _ = this.cache.write().put(ROOT, root);
 
@@ -239,11 +261,21 @@ impl<P: Page> File<P> {
 
     fn save(&self, page: &P) -> io::Result<()> {
         debug!("Saving page {}", page.id());
-        let offset = self.offset(page.id()) as u64;
+        self.write_all_at(self.offset(page.id()) as u64, page.as_ref())
+    }
+
+    /// Write all of `buf` starting at `offset`: one `pwrite` instead of `seek` + `write`.
+    fn write_all_at(&self, offset: u64, buf: &[u8]) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            self.file.read().write_all_at(buf, offset)
+        }
+        #[cfg(not(unix))]
         {
             let mut file = self.file.write();
             file.seek(SeekFrom::Start(offset))?;
-            file.write_all(page.as_ref())
+            file.write_all(buf)
         }
     }
 
@@ -321,7 +353,7 @@ impl<P: Page> File<P> {
     /// Allocate `multiplier` contiguous pages at the end of the file.
     /// Returns the starting page id.
     fn alloc_overflow(&self, multiplier: u32) -> Result<u32> {
-        let len = self.file.write().metadata().unwrap().len();
+        let len = self.file.read().metadata()?.len();
         let id = 1 + ((len - HEAD as u64) / self.head.page_bytes as u64) as u32;
         let region_bytes = multiplier as usize * self.head.page_bytes as usize;
         let zeroes = vec![0u8; region_bytes];
@@ -463,6 +495,70 @@ impl<P: Page> File<P> {
         }
     }
 
+    /// Put a key-value pair into leaf page `id`, moving the value -- and, if
+    /// even the key does not fit, all but a prefix of the key -- out to an
+    /// overflow region. Returns how full the page is afterwards.
+    fn put_leaf(&self, id: u32, key: &[u8], val: &[u8]) -> Result<u8> {
+        let prefix_len = {
+            let page = self.try_page(id)?;
+            if page.fits((key.len() + val.len()) as u32) {
+                drop(page);
+                let mut page = self.try_page_mut(id)?;
+                page.put_val(key, val);
+                return Ok(page.full());
+            }
+            if page.fits(key.len() as u32) {
+                key.len()
+            } else {
+                let max_prefix = page.free().saturating_sub(SLOT_BYTES as u32) as usize;
+                max_prefix.min(key.len())
+            }
+        };
+
+        let m = Self::overflow_multiplier(self.head.page_bytes, key.len() + val.len());
+        let ov_page = self.alloc_overflow(m)?;
+        self.write_overflow(ov_page, key, val, m)?;
+        let mut page = self.try_page_mut(id)?;
+        page.put_overflow(&key[..prefix_len], ov_page, OVERFLOW_FLAG | m);
+        Ok(page.full())
+    }
+
+    /// The largest key in page `id`, or `None` if the page is empty.
+    fn page_max(&self, id: u32) -> Result<Option<Vec<u8>>> {
+        let page = self.try_page(id)?;
+        Ok(if page.len() > 0 {
+            Some(page.max().to_vec())
+        } else {
+            None
+        })
+    }
+
+    /// Bring the parent's entry `idx` for child `page_id` in line with the
+    /// child's largest key, `max`, or drop the entry if the child is empty.
+    ///
+    /// Checks through a read guard first, so a parent that is already right --
+    /// the usual case -- is not marked dirty.
+    fn update_parent_ref(
+        &self,
+        parent_id: u32,
+        idx: u32,
+        page_id: u32,
+        max: Option<Vec<u8>>,
+    ) -> Result<()> {
+        let stale = match &max {
+            Some(max) => max.as_slice() < self.try_page(parent_id)?.key(idx),
+            None => true,
+        };
+        if stale {
+            let mut parent = self.try_page_mut(parent_id)?;
+            parent.remove(idx);
+            if let Some(max) = max {
+                parent.put_ref(&max, page_id);
+            }
+        }
+        Ok(())
+    }
+
     /// Read only the overflow header to extract key_len and val_len.
     fn read_overflow_header(&self, page_offset: usize) -> io::Result<(u32, u32, u32)> {
         let mut hdr = [0u8; OVERFLOW_HEAD];
@@ -478,9 +574,8 @@ impl<P: Page> Store for File<P> {
     fn lookup(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let _op = self.ops.read();
         debug!("lookup: {}", hex(key));
-        let mut seen = HashSet::with_capacity(8);
         let mut page = self.root()?;
-        loop {
+        for _ in 0..MAX_DEPTH {
             let idx_opt = page.ceil(key);
 
             // When ceil returns None, the search key is greater than all inline keys.
@@ -517,11 +612,6 @@ impl<P: Page> Store for File<P> {
             } else {
                 let id = page.id();
                 drop(page);
-                if seen.contains(&slot.page) {
-                    return Err(Error::Tree(id, "Cyclic reference detected".to_string()));
-                }
-                seen.insert(id);
-
                 let page_opt = self.page(slot.page);
                 if page_opt.is_none() {
                     return Err(Error::Tree(id, format!("Page not found: {}", slot.page)));
@@ -529,125 +619,62 @@ impl<P: Page> Store for File<P> {
                 page = page_opt.unwrap();
             }
         }
+        Err(Error::Tree(
+            page.id(),
+            "Cyclic reference detected".to_string(),
+        ))
     }
 
     fn insert(&self, key: &[u8], val: &[u8]) -> Result<()> {
         let _op = self.ops.write();
         debug!("insert: {} -> {}", hex(key), hex(val));
-        let mut page = self.root_mut()?;
-        let mut seen = HashSet::with_capacity(8);
-        let mut path = Vec::with_capacity(8);
+        // Walk down through read guards: a page is taken mutably -- and so
+        // marked dirty and written out by the next flush -- only once it is
+        // certain to change. Most inserts change the leaf alone.
+        let mut id = ROOT;
+        let mut path: Vec<(u32, u32)> = Vec::with_capacity(8);
         loop {
-            let id = page.id();
-            let parent_id = path.last().cloned().map(|(id, _)| id).unwrap_or_default();
-
-            if page.len() == 0 {
-                let inline_len = (key.len() + val.len()) as u32;
-                if page.fits(inline_len) {
-                    // Fast path: key+value fits inline
-                    page.put_val(key, val);
-                    drop(page);
-                } else if page.fits(key.len() as u32) {
-                    // Key fits inline but value doesn't -- use overflow
-                    drop(page);
-                    let m = Self::overflow_multiplier(self.head.page_bytes, key.len() + val.len());
-                    let ov_page = self.alloc_overflow(m)?;
-                    self.write_overflow(ov_page, key, val, m)?;
-                    let raw_vlen = OVERFLOW_FLAG | m;
-                    let mut page = self.try_page_mut(id)?;
-                    page.put_overflow(key, ov_page, raw_vlen);
-                    drop(page);
-                } else {
-                    // Even the key doesn't fit -- store a prefix inline + overflow
-                    let max_prefix = page.free().saturating_sub(SLOT_BYTES as u32) as usize;
-                    let prefix = &key[..max_prefix.min(key.len())];
-                    drop(page);
-                    let m = Self::overflow_multiplier(self.head.page_bytes, key.len() + val.len());
-                    let ov_page = self.alloc_overflow(m)?;
-                    self.write_overflow(ov_page, key, val, m)?;
-                    let raw_vlen = OVERFLOW_FLAG | m;
-                    let mut page = self.try_page_mut(id)?;
-                    page.put_overflow(prefix, ov_page, raw_vlen);
-                    drop(page);
-                }
-                self.flush()?;
-                return Ok(());
+            if path.len() >= MAX_DEPTH {
+                return Err(Error::Tree(
+                    id,
+                    format!("Cyclic reference detected: {path:?}"),
+                ));
             }
+            let parent_id = path.last().map(|(id, _)| *id).unwrap_or_default();
 
-            let idx = page.ceil(key).unwrap_or_else(|| page.len() - 1);
+            let (idx, slot) = {
+                let page = self.try_page(id)?;
+                if page.len() == 0 {
+                    drop(page);
+                    self.put_leaf(id, key, val)?;
+                    self.flush()?;
+                    return Ok(());
+                }
+                let idx = page.ceil(key).unwrap_or_else(|| page.len() - 1);
+                (idx, page.slot(idx))
+            };
 
-            drop(page);
             if let Some((parent_id, parent_idx)) = path.last().cloned() {
-                let mut parent_page = self.try_page_mut(parent_id)?;
-                let parent_key = parent_page.key(parent_idx);
-                if key > parent_key {
+                let stale = key > self.try_page(parent_id)?.key(parent_idx);
+                if stale {
+                    let mut parent_page = self.try_page_mut(parent_id)?;
                     parent_page.remove(parent_idx);
                     parent_page.put_ref(key, id);
-                    drop(parent_page);
                 }
             }
-            page = self.try_page_mut(id)?;
 
-            let slot_opt = page.slot(idx);
-            if slot_opt.is_none() {
-                return Err(Error::Tree(page.id(), format!("Slot not found: {idx}")));
-            }
-            let slot = slot_opt.unwrap();
+            let slot = slot.ok_or_else(|| Error::Tree(id, format!("Slot not found: {idx}")))?;
 
             if slot.is_leaf() {
                 // If replacing an existing overflow entry, free the old overflow region
-                if slot.is_overflow() && page.key(idx) == key {
-                    let old_ov_page = slot.page;
-                    let old_m = slot.multiplier();
-                    page.remove(idx);
-                    drop(page);
-                    self.free_overflow(old_ov_page, old_m)?;
-                    page = self.try_page_mut(id)?;
+                if slot.is_overflow() && self.try_page(id)?.key(idx) == key {
+                    self.try_page_mut(id)?.remove(idx);
+                    self.free_overflow(slot.page, slot.multiplier())?;
                 }
 
-                let inline_len = (key.len() + val.len()) as u32;
-                if page.fits(inline_len) {
-                    // Fits inline
-                    page.put_val(key, val);
-                    let full = page.full();
-                    drop(page);
-
-                    if full > SPLIT_THRESHOLD {
-                        self.split(id, parent_id)?;
-                    }
-                } else if page.fits(key.len() as u32) {
-                    // Key fits inline, value overflows
-                    drop(page);
-                    let m = Self::overflow_multiplier(self.head.page_bytes, key.len() + val.len());
-                    let ov_page = self.alloc_overflow(m)?;
-                    self.write_overflow(ov_page, key, val, m)?;
-                    let raw_vlen = OVERFLOW_FLAG | m;
-                    let mut page = self.try_page_mut(id)?;
-                    page.put_overflow(key, ov_page, raw_vlen);
-                    let full = page.full();
-                    drop(page);
-
-                    if full > SPLIT_THRESHOLD {
-                        self.split(id, parent_id)?;
-                    }
-                } else {
-                    // Key prefix + overflow
-                    let free = page.free();
-                    let max_prefix = free.saturating_sub(SLOT_BYTES as u32) as usize;
-                    let prefix = &key[..max_prefix.min(key.len())];
-                    drop(page);
-                    let m = Self::overflow_multiplier(self.head.page_bytes, key.len() + val.len());
-                    let ov_page = self.alloc_overflow(m)?;
-                    self.write_overflow(ov_page, key, val, m)?;
-                    let raw_vlen = OVERFLOW_FLAG | m;
-                    let mut page = self.try_page_mut(id)?;
-                    page.put_overflow(prefix, ov_page, raw_vlen);
-                    let full = page.full();
-                    drop(page);
-
-                    if full > SPLIT_THRESHOLD {
-                        self.split(id, parent_id)?;
-                    }
+                let full = self.put_leaf(id, key, val)?;
+                if full > SPLIT_THRESHOLD {
+                    self.split(id, parent_id)?;
                 }
 
                 while let Some((page_id, _)) = path.pop() {
@@ -663,233 +690,163 @@ impl<P: Page> Store for File<P> {
 
                 self.flush()?;
                 return Ok(());
-            } else {
-                path.push((id, idx));
-                seen.insert(id);
-                if seen.contains(&slot.page) {
-                    return Err(Error::Tree(
-                        id,
-                        format!("Cyclic reference detected: {path:?}"),
-                    ));
-                }
-
-                drop(page);
-                let page_opt = self.page_mut(slot.page);
-                if page_opt.is_none() {
-                    return Err(Error::Tree(
-                        slot.page,
-                        format!("Page not found: {}", slot.page),
-                    ));
-                }
-                page = page_opt.unwrap();
             }
+
+            path.push((id, idx));
+            id = slot.page;
         }
     }
 
     fn remove(&self, key: &[u8]) -> Result<()> {
         let _op = self.ops.write();
         debug!("remove: {}", hex(key));
-        let mut page = self.root_mut()?;
-        let mut seen = HashSet::with_capacity(8);
-        let mut path = Vec::with_capacity(8);
+        // Read guards on the way down, as in `insert`: a key that is not there
+        // leaves every page clean.
+        let mut id = ROOT;
+        let mut path: Vec<(u32, u32)> = Vec::with_capacity(8);
         loop {
+            if path.len() >= MAX_DEPTH {
+                return Err(Error::Tree(id, "Cyclic reference detected".to_string()));
+            }
+            let page = self.try_page(id)?;
             let idx_opt = page.ceil(key);
 
             // Handle overflow prefix fallback: scan overflow entries if ceil misses
             if idx_opt.is_none() {
                 let found = self.find_overflow_by_prefix(&page, key)?;
+                drop(page);
                 if let Some((idx, ov_page, m)) = found {
-                    let id = page.id();
-                    page.remove(idx);
-                    drop(page);
+                    self.try_page_mut(id)?.remove(idx);
                     self.free_overflow(ov_page, m)?;
 
                     // Navigate up-tree
                     let mut page_id = id;
                     for (parent_id, idx) in path.iter().cloned().rev() {
-                        let max_opt = {
-                            let p = self.try_page(page_id)?;
-                            if p.len() > 0 {
-                                Some(p.max().to_vec())
-                            } else {
-                                None
-                            }
-                        };
-                        let mut parent = self.try_page_mut(parent_id)?;
-                        if let Some(max) = max_opt {
-                            if max < parent.key(idx).to_vec() {
-                                parent.remove(idx);
-                                parent.put_ref(&max, page_id);
-                            }
-                        } else {
-                            parent.remove(idx);
-                        }
-                        drop(parent);
+                        let max_opt = self.page_max(page_id)?;
+                        self.update_parent_ref(parent_id, idx, page_id, max_opt)?;
                         page_id = parent_id;
                     }
                     self.flush()?;
-                    return Ok(());
                 }
                 return Ok(());
             }
             let idx = idx_opt.unwrap();
 
-            let slot_opt = page.slot(idx);
-            if slot_opt.is_none() {
-                return Err(Error::Tree(page.id(), format!("Slot not found: {idx}")));
+            let slot = page
+                .slot(idx)
+                .ok_or_else(|| Error::Tree(id, format!("Slot not found: {idx}")))?;
+
+            if !slot.is_leaf() {
+                drop(page);
+                path.push((id, idx));
+                id = slot.page;
+                continue;
             }
-            let slot = slot_opt.unwrap();
 
-            let id = page.id();
-            if slot.is_leaf() {
-                // For overflow entries, verify the full key and free the overflow region
-                if slot.is_overflow() {
-                    let ov_page = slot.page;
-                    let m = slot.multiplier();
-                    let (full_key, _) = self.read_overflow(ov_page, m)?;
-                    if full_key.as_slice() != key {
-                        // Ceil'd entry didn't match -- try prefix fallback
-                        let found = self.find_overflow_by_prefix(&page, key)?;
-                        if let Some((ov_idx, ov_p, ov_m)) = found {
-                            page.remove(ov_idx);
-                            drop(page);
-                            self.free_overflow(ov_p, ov_m)?;
-                        } else {
-                            return Ok(()); // not found
-                        }
-                    } else {
-                        debug!(
-                            "remove: key={} page={} idx={} (overflow)",
-                            hex(key),
-                            id,
-                            idx
-                        );
-                        page.remove(idx);
-                        drop(page);
-                        self.free_overflow(ov_page, m)?;
-                    }
-                } else if page.key(idx) != key {
-                    // Regular entry didn't match -- check overflow entries on this page
-                    let found = self.find_overflow_by_prefix(&page, key)?;
-                    if let Some((ov_idx, ov_p, ov_m)) = found {
-                        page.remove(ov_idx);
-                        drop(page);
-                        self.free_overflow(ov_p, ov_m)?;
-                    } else {
-                        return Ok(()); // not found
-                    }
+            // Find the entry to remove, and the overflow region it owns, if any.
+            let target = if slot.is_overflow() {
+                let (full_key, _) = self.read_overflow(slot.page, slot.multiplier())?;
+                if full_key.as_slice() == key {
+                    Some((idx, Some((slot.page, slot.multiplier()))))
                 } else {
-                    debug!("remove: key={} page={} idx={}", hex(key), id, idx);
-                    page.remove(idx);
-                    drop(page);
+                    // Ceil'd entry didn't match -- try prefix fallback
+                    self.find_overflow_by_prefix(&page, key)?
+                        .map(|(idx, ov_page, m)| (idx, Some((ov_page, m))))
                 }
+            } else if page.key(idx) == key {
+                Some((idx, None))
+            } else {
+                // Regular entry didn't match -- check overflow entries on this page
+                self.find_overflow_by_prefix(&page, key)?
+                    .map(|(idx, ov_page, m)| (idx, Some((ov_page, m))))
+            };
+            drop(page);
 
-                // Navigate up-tree and remove/update references if needed
-                let mut page_id = id;
-                for (parent_id, mut idx) in path.iter().cloned().rev() {
-                    let full = self.try_page(page_id)?.full();
-                    if full < MERGE_THRESHOLD {
-                        let peer_id = {
-                            let parent = self.try_page(parent_id)?;
-                            let mut peers = Vec::with_capacity(2);
-                            if idx > 0 {
-                                let peer = parent.slot(idx - 1).unwrap().page;
-                                peers.push(peer);
-                            }
-                            if idx < parent.len() - 1 {
-                                let peer = parent.slot(idx + 1).unwrap().page;
-                                peers.push(peer);
-                            }
-                            drop(parent);
+            let (idx, overflow) = match target {
+                Some(target) => target,
+                None => return Ok(()), // not found
+            };
+            debug!("remove: key={} page={} idx={}", hex(key), id, idx);
+            self.try_page_mut(id)?.remove(idx);
+            if let Some((ov_page, m)) = overflow {
+                self.free_overflow(ov_page, m)?;
+            }
 
-                            // A `for` loop rather than `filter_map`, so that a
-                            // peer that cannot be read fails the operation
-                            // instead of quietly dropping out of the candidates.
-                            let mut candidates = Vec::with_capacity(peers.len());
-                            for peer_id in peers {
-                                let peer = self.try_page(peer_id)?;
-                                let full = peer.full();
-                                if peer.len() > 0 && full < MERGE_THRESHOLD {
-                                    candidates.push((peer_id, full));
-                                }
+            // Navigate up-tree and remove/update references if needed
+            let mut page_id = id;
+            for (parent_id, mut idx) in path.iter().cloned().rev() {
+                let full = self.try_page(page_id)?.full();
+                if full < MERGE_THRESHOLD {
+                    let peer_id = {
+                        let parent = self.try_page(parent_id)?;
+                        let mut peers = Vec::with_capacity(2);
+                        if idx > 0 {
+                            let peer = parent.slot(idx - 1).unwrap().page;
+                            peers.push(peer);
+                        }
+                        if idx < parent.len() - 1 {
+                            let peer = parent.slot(idx + 1).unwrap().page;
+                            peers.push(peer);
+                        }
+                        drop(parent);
+
+                        // A `for` loop rather than `filter_map`, so that a
+                        // peer that cannot be read fails the operation
+                        // instead of quietly dropping out of the candidates.
+                        let mut candidates = Vec::with_capacity(peers.len());
+                        for peer_id in peers {
+                            let peer = self.try_page(peer_id)?;
+                            let full = peer.full();
+                            if peer.len() > 0 && full < MERGE_THRESHOLD {
+                                candidates.push((peer_id, full));
                             }
-                            candidates
-                                .into_iter()
-                                .min_by_key(|(_, full)| *full)
-                                .map(|(peer_id, _)| peer_id)
-                        };
-                        if let Some(peer_id) = peer_id {
-                            trace!(
+                        }
+                        candidates
+                            .into_iter()
+                            .min_by_key(|(_, full)| *full)
+                            .map(|(peer_id, _)| peer_id)
+                    };
+                    if let Some(peer_id) = peer_id {
+                        trace!(
                                 "merge: found peer_id={peer_id} to merge page_id={page_id} (parent_id={parent_id})"
                             );
-                            let peer_max = {
-                                let peer = self.try_page(peer_id)?;
-                                peer.max().to_vec()
-                            };
-                            trace!("\t merge: peer_max={}", hex(&peer_max));
-                            let mut parent = self.try_page_mut(parent_id)?;
-                            parent.remove(idx);
-                            let peer_idx = parent.ceil(&peer_max).unwrap();
-                            trace!("\t merge: parent remove: peer_idx={peer_idx} idx={idx}");
-                            parent.remove(peer_idx);
-                            drop(parent);
-
-                            self.merge(page_id, peer_id)?;
-                            let page_max = {
-                                let peer = self.try_page(peer_id)?;
-                                peer.max().to_vec()
-                            };
-                            trace!("\t merge: page_max={}", hex(&page_max));
-                            let mut parent = self.try_page_mut(parent_id)?;
-                            trace!(
-                                "\t merge: parent insert: page_max={}, peer_id={}",
-                                hex(&page_max),
-                                peer_id
-                            );
-                            parent.put_ref(&page_max, peer_id);
-                            idx = parent.ceil(&page_max).unwrap();
-                            page_id = peer_id;
-                        }
-                    }
-
-                    let max_opt = {
-                        let page = self.try_page(page_id)?;
-                        if page.len() > 0 {
-                            Some(page.max().to_vec())
-                        } else {
-                            None
-                        }
-                    };
-
-                    let mut parent = self.try_page_mut(parent_id)?;
-                    if let Some(max) = max_opt {
-                        if max < parent.key(idx).to_vec() {
-                            parent.remove(idx);
-                            parent.put_ref(&max, page_id);
-                        }
-                    } else {
+                        let peer_max = {
+                            let peer = self.try_page(peer_id)?;
+                            peer.max().to_vec()
+                        };
+                        trace!("\t merge: peer_max={}", hex(&peer_max));
+                        let mut parent = self.try_page_mut(parent_id)?;
                         parent.remove(idx);
+                        let peer_idx = parent.ceil(&peer_max).unwrap();
+                        trace!("\t merge: parent remove: peer_idx={peer_idx} idx={idx}");
+                        parent.remove(peer_idx);
+                        drop(parent);
+
+                        self.merge(page_id, peer_id)?;
+                        let page_max = {
+                            let peer = self.try_page(peer_id)?;
+                            peer.max().to_vec()
+                        };
+                        trace!("\t merge: page_max={}", hex(&page_max));
+                        let mut parent = self.try_page_mut(parent_id)?;
+                        trace!(
+                            "\t merge: parent insert: page_max={}, peer_id={}",
+                            hex(&page_max),
+                            peer_id
+                        );
+                        parent.put_ref(&page_max, peer_id);
+                        idx = parent.ceil(&page_max).unwrap();
+                        page_id = peer_id;
                     }
-                    drop(parent);
-                    page_id = parent_id;
                 }
 
-                self.flush()?;
-                return Ok(());
-            } else {
-                path.push((id, idx));
-                seen.insert(id);
-                if seen.contains(&slot.page) {
-                    return Err(Error::Tree(id, "Cyclic reference detected".to_string()));
-                }
-                drop(page);
-
-                let page_opt = self.page_mut(slot.page);
-                if page_opt.is_none() {
-                    return Err(Error::Tree(id, format!("Page not found: {}", slot.page)));
-                }
-                page = page_opt.unwrap();
+                let max_opt = self.page_max(page_id)?;
+                self.update_parent_ref(parent_id, idx, page_id, max_opt)?;
+                page_id = parent_id;
             }
+
+            self.flush()?;
+            return Ok(());
         }
     }
 
@@ -1087,12 +1044,14 @@ impl<P: Page> Tree<P> for File<P> {
     }
 
     fn page(&self, id: u32) -> Option<MappedRwLockReadGuard<'_, P>> {
-        self.cache(id).ok()?;
         for _ in 0..CACHE_RETRIES {
+            // Borrow first and load only on a miss: a hit, the common case, then
+            // costs a single shared lock acquisition instead of two.
+            //
             // On failure `try_map` hands the guard back: it has to be dropped
             // before `cache()`, which takes the write guard, or this deadlocks
-            // against itself. The page was evicted between `cache()` putting it
-            // there and the borrow below, so load it again and retry.
+            // against itself. The page is either not loaded yet or was evicted
+            // between `cache()` putting it there and the borrow, so load and retry.
             match RwLockReadGuard::try_map(self.cache.read(), |cache| cache.get(&id)) {
                 Ok(page) => return Some(page),
                 Err(guard) => drop(guard),
@@ -1101,11 +1060,6 @@ impl<P: Page> Tree<P> for File<P> {
         }
         error!("Page {id} evicted {CACHE_RETRIES} times while being read");
         None
-    }
-
-    fn root_mut(&self) -> Result<MappedRwLockWriteGuard<'_, P>> {
-        self.mark(ROOT);
-        self.try_page_mut(ROOT)
     }
 
     fn page_mut(&self, id: u32) -> Option<MappedRwLockWriteGuard<'_, P>> {
@@ -1146,8 +1100,9 @@ impl<P: Page> Tree<P> for File<P> {
     }
 
     fn flush(&self) -> crate::api::error::Result<()> {
-        let pages = self.dirty.read().iter().cloned().collect::<Vec<_>>();
-        self.dirty.write().clear();
+        let mut pages = self.dirty.write().drain().collect::<Vec<_>>();
+        // ascending page ids make the writes as sequential as the tree allows
+        pages.sort_unstable();
 
         let mut failed = vec![];
         for id in pages {
@@ -1182,7 +1137,7 @@ impl<P: Page> Tree<P> for File<P> {
             return Ok(id);
         }
 
-        let len = self.file.write().metadata().unwrap().len();
+        let len = self.file.read().metadata()?.len();
         let id = 1 + ((len - HEAD as u64) / self.head.page_bytes as u64) as u32;
         let page = P::create(id, self.head.page_bytes);
         {
@@ -1540,7 +1495,7 @@ mod tests {
         {
             let file: File<Block> = File::make(path, size).unwrap();
             {
-                let mut page = file.root_mut().unwrap();
+                let mut page = file.page_mut(ROOT).unwrap();
                 for (k, v, p, _) in data.iter() {
                     if *p == 0 {
                         page.put_val(k, v);
@@ -3207,5 +3162,67 @@ mod tests {
                 assert!(found.is_some());
             }
         }
+    }
+
+    /// Random inserts, replacements and removes -- some large enough to go to
+    /// overflow pages -- against a `BTreeMap`, through a cache of only a few
+    /// pages so that nearly every step evicts, and writes back, dirty pages.
+    /// Then reopen the file and check that it holds exactly the model.
+    #[test]
+    fn test_tiny_cache_matches_model() {
+        use rand::Rng;
+        use std::collections::BTreeMap;
+
+        let path = Path::new("target/test_tiny_cache_matches_model.tmp");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+        let page_bytes = 256;
+
+        let mut rng = StdRng::seed_from_u64(11);
+        let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        {
+            let file: File<Block> =
+                File::make_with_cache(path, page_bytes, 4 * page_bytes as usize).unwrap();
+            for i in 0..5_000 {
+                let key = format!("{:05}", rng.gen_range(0..1_500)).into_bytes();
+                if rng.gen_bool(0.7) {
+                    let len = if rng.gen_bool(0.05) {
+                        600
+                    } else {
+                        rng.gen_range(1..40)
+                    };
+                    let val = vec![(i % 251) as u8; len];
+                    file.insert(&key, &val).unwrap();
+                    model.insert(key, val);
+                } else {
+                    file.remove(&key).unwrap();
+                    model.remove(&key);
+                }
+                if i % 97 == 0 {
+                    let probe = format!("{:05}", rng.gen_range(0..1_500)).into_bytes();
+                    assert_eq!(file.lookup(&probe).unwrap(), model.get(&probe).cloned());
+                }
+            }
+        }
+
+        let file: File<Block> = File::open(path).unwrap();
+        for (key, val) in model.iter() {
+            assert_eq!(
+                file.lookup(key).unwrap().as_ref(),
+                Some(val),
+                "key={}",
+                hex(key)
+            );
+        }
+        let mut keys = Vec::with_capacity(model.len());
+        let mut next = file.min().unwrap();
+        while let Some(key) = next {
+            next = file.above(&key).unwrap();
+            keys.push(key);
+        }
+        assert_eq!(keys, model.keys().cloned().collect::<Vec<_>>());
+
+        fs::remove_file(path).unwrap();
     }
 }

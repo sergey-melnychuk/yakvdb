@@ -21,10 +21,6 @@ impl Slot {
         }
     }
 
-    pub(crate) fn empty() -> Self {
-        Self::new(0, 0, 0, 0)
-    }
-
     /// Returns true if this slot is an overflow entry (value stored in external pages).
     pub fn is_overflow(&self) -> bool {
         self.vlen & OVERFLOW_FLAG != 0

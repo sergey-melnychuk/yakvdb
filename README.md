@@ -36,12 +36,34 @@ PLAN:
     only a shared lock on the file handle instead of `&mut File` for `seek`
   - measured on 20k keys, 40k lookups, release: 300k op/s flat at any thread
     count before, 487k (1 thread) / 666k (4 threads) after
-- [ ] cut page-cache contention between concurrent readers
-  - every page access calls `LruCache::touch`, which takes `lru.write()` to move
-    the key to the most-recently-used end: one exclusive lock per page read, and
-    now the limit on how far reads scale (8 threads are slower than 4)
-  - wants an approximation that reads can update without excluding each other -
-    a CLOCK/second-chance referenced bit, or sharding the cache by page id
+- [x] cut page-cache contention between concurrent readers
+  - the LRU list is replaced by CLOCK (second chance): a read sets the frame's
+    `referenced` bit with an atomic store instead of moving the key under
+    `lru.write()`, so readers no longer exclude each other, and every access is
+    O(1) instead of a linear scan of the recency list
+  - that made a large cache affordable: the default is 64 MiB (16384 pages of
+    4 KiB) instead of 32 pages, set with `make_with_cache`/`open_with_cache`
+  - measured on 200k keys, 400k lookups, release: 490k/430k/456k/241k op/s at
+    1/2/4/8 threads before, 1.4M/2.9M/2.1M/1.4M after
+- [ ] let reads scale past 2 threads
+  - every lookup acquires `ops` and `cache` read locks about five times, each an
+    atomic RMW on a word all threads share; that line bouncing is now the limit
+  - wants striped locks (shard the cache by page id) or per-page latches
+- [x] write only the pages that change
+  - `insert`/`remove` walked down through `page_mut`, which marks a page dirty
+    on access, so every page on the root-to-leaf path was rewritten by the flush
+  - they now walk down through read guards and take a page mutably only to
+    change it: 3.0 page writes per insert before, 1.03 after
+- [x] tidy up page operations
+  - `put_entry`/`remove` shift slots and data in place with `copy_within`
+    instead of collecting them into `Vec`s and writing them all back
+  - the lowest data offset is cached on `Block` (not on disk: the format is
+    unchanged), so `free`/`fits`/`full` are arithmetic instead of slot scans
+  - measured on 1M keys, release: insert 61k -> 265k op/s, lookup 410k -> 1.19M,
+    remove 65k -> 230k
+- [ ] write-ahead log with group commit - see [doc/wal.md](doc/wal.md)
+  - nothing calls `fsync` today: a write survives a process crash, not a power
+    loss, and a crash mid-split can leave the tree inconsistent
 - [x] sweep `page(id).unwrap()`/`page_mut(id).unwrap()` into typed errors
   - a corrupted file should fail one operation, not the process
   - `try_page`/`try_page_mut` return `Error::Tree` instead of `None`, and all
@@ -74,7 +96,7 @@ Binary search is run for each page (log(K)) and touches at most log(N) pages.
 
 On insert/remove each page performs O(K) cleanup to keep keys ordered, as well as extra housekeeping is performed if necessary (split or merge of pages).
 
-Each insert/remove gets flushed to disk for durability.
+Each insert/remove writes the pages it changed to the file before returning. That hands them to the OS (they survive a process crash), but nothing calls `fsync` yet, so they do not necessarily survive a power loss: see [doc/wal.md](doc/wal.md) for the plan.
 
 ### API
 * [Store](src/api/mod.rs) is the public key-value API (impl: [File](src/disk/file.rs))
@@ -138,6 +160,7 @@ use yakvdb::api::{Store, KV};
 let db: KV = KV::make(Path::new("/tmp/db.yak"), /*page_size=*/ 4096).unwrap();
 // ...or open an existing one:
 // let db: KV = KV::open(Path::new("/tmp/db.yak")).unwrap();
+// Both use a 64 MiB page cache; `make_with_cache`/`open_with_cache` pick the size.
 
 let _: Result<()> = db.insert(b"key", b"val");
 let _: Result<Option<Vec<u8>>> = db.lookup(b"key");
