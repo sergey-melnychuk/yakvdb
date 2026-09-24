@@ -1,11 +1,13 @@
 use std::cmp::Ordering;
 use std::fmt::Debug;
 
-pub(crate) fn bsearch<T: Ord, I: UInt, F: Fn(I) -> T>(key: T, mut lo: I, mut hi: I, f: F) -> I {
+/// Binary search over `lo..=hi`, where `cmp(i)` orders the key sought
+/// against element `i`. Returns the index of an equal element, or where the
+/// search ended: the first element above the key, or `hi` if none is.
+pub(crate) fn bsearch<I: UInt>(mut lo: I, mut hi: I, cmp: impl Fn(I) -> Ordering) -> I {
     while lo < hi {
         let mid = lo + (hi - lo) / I::from(2);
-        let mid_key = f(mid);
-        match Ord::cmp(&key, &mid_key) {
+        match cmp(mid) {
             Ordering::Less => {
                 hi = mid;
             }
