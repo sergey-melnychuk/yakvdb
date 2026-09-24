@@ -35,11 +35,7 @@ impl Slot {
     /// Returns the number of inline value bytes stored in this page.
     /// For overflow entries this is 0 (value lives externally).
     pub fn inline_vlen(&self) -> u32 {
-        if self.is_overflow() {
-            0
-        } else {
-            self.vlen
-        }
+        if self.is_overflow() { 0 } else { self.vlen }
     }
 
     /// Returns true if this is a leaf entry (inline value or overflow value).

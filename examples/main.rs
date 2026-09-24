@@ -216,7 +216,7 @@ mod sharded {
     use std::io;
 
     use yakvdb::{
-        api::{error::Error, Store},
+        api::{Store, error::Error},
         disk::{block::Block, file::File},
     };
 

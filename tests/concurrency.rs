@@ -6,11 +6,11 @@
 //! disk/file.rs) and lost the majority of its keys.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
-use yakvdb::api::{Store, KV};
+use yakvdb::api::{KV, Store};
 
 const PAGE: u32 = 4096;
 

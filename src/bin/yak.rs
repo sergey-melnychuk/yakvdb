@@ -2,28 +2,28 @@ use crossterm::{
     event::{self, Event, KeyCode},
     terminal::{disable_raw_mode, enable_raw_mode},
 };
-use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
 use std::io::{self, Write};
 use std::path::Path;
 
-use yakvdb::api::page::Page;
 use yakvdb::api::Store;
+use yakvdb::api::page::Page;
 use yakvdb::disk::block::Block;
 use yakvdb::disk::file::File;
 
 fn main() {
     // Handle broken pipe errors silently
     std::panic::set_hook(Box::new(|info| {
-        if let Some(s) = info.payload().downcast_ref::<&str>() {
-            if s.contains("Broken pipe") {
-                std::process::exit(0);
-            }
+        if let Some(s) = info.payload().downcast_ref::<&str>()
+            && s.contains("Broken pipe")
+        {
+            std::process::exit(0);
         }
-        if let Some(s) = info.payload().downcast_ref::<String>() {
-            if s.contains("Broken pipe") {
-                std::process::exit(0);
-            }
+        if let Some(s) = info.payload().downcast_ref::<String>()
+            && s.contains("Broken pipe")
+        {
+            std::process::exit(0);
         }
     }));
 
@@ -462,7 +462,9 @@ fn main() {
                                     key_range
                                 };
 
-                                output_lines.push(format!("{id:<6} {page_type:<8} {fill_percent:<6} {truncated_range:<20}"));
+                                output_lines.push(format!(
+                                    "{id:<6} {page_type:<8} {fill_percent:<6} {truncated_range:<20}"
+                                ));
                             }
                         }
 
@@ -490,11 +492,7 @@ fn main() {
                                             break;
                                         }
                                     }
-                                    if is_leaf {
-                                        "LEAF"
-                                    } else {
-                                        "NODE"
-                                    }
+                                    if is_leaf { "LEAF" } else { "NODE" }
                                 };
 
                                 println!("Page Details:");
@@ -586,11 +584,7 @@ fn main() {
                                     break;
                                 }
                             }
-                            if is_leaf {
-                                "LEAF"
-                            } else {
-                                "NODE"
-                            }
+                            if is_leaf { "LEAF" } else { "NODE" }
                         };
 
                         println!("Root Page (ID: 1):");
@@ -667,14 +661,20 @@ fn main() {
                         println!("  min                - Show minimum key");
                         println!("  max                - Show maximum key");
                         println!("  len                - Count total entries (alias: size, count)");
-                        println!("  from <key> <num>   - Show <num> entries starting after <key> (exclusive)");
-                        println!("  till <key> <num>   - Show last <num> entries before <key> (exclusive)");
+                        println!(
+                            "  from <key> <num>   - Show <num> entries starting after <key> (exclusive)"
+                        );
+                        println!(
+                            "  till <key> <num>   - Show last <num> entries before <key> (exclusive)"
+                        );
                         println!("  above <key>        - Show key above the given key");
                         println!("  below <key>        - Show key below the given key");
                         println!(
                             "  mode <str|hex>     - Set value display mode (str: utf8, hex: 0x...)"
                         );
-                        println!("  tree               - Show B-tree structure (pages, types, fill ratios)");
+                        println!(
+                            "  tree               - Show B-tree structure (pages, types, fill ratios)"
+                        );
                         println!("  page <id>          - Show detailed page information");
                         println!("  root               - Show root page details");
                         println!("  exit/quit          - Exit CLI");

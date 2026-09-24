@@ -189,11 +189,7 @@ impl Page for Block {
         }
 
         let k = bsearch(key, 0, n - 1, |i| self.key(i));
-        if self.key(k) == key {
-            Some(k)
-        } else {
-            None
-        }
+        if self.key(k) == key { Some(k) } else { None }
     }
 
     fn ceil(&self, key: &[u8]) -> Option<u32> {
@@ -203,11 +199,7 @@ impl Page for Block {
         }
 
         let k = bsearch(key, 0, n - 1, |i| self.key(i));
-        if self.key(k) >= key {
-            Some(k)
-        } else {
-            None
-        }
+        if self.key(k) >= key { Some(k) } else { None }
     }
 
     fn put_val(&mut self, key: &[u8], val: &[u8]) -> Option<u32> {
@@ -361,7 +353,7 @@ mod tests {
         let len = size * size_of::<u64>() * 4;
 
         let mut keys = (0..size)
-            .map(|_| rng.gen::<u64>().to_be_bytes().to_vec())
+            .map(|_| rng.r#gen::<u64>().to_be_bytes().to_vec())
             .collect::<Vec<_>>();
 
         let mut page = Block::create(42, len as u32);
@@ -390,14 +382,16 @@ mod tests {
         let size = 64;
         let len = size * size_of::<u64>() * 10;
 
-        let keys = (0..size).map(|_| rng.gen::<u64>()).collect::<HashSet<_>>();
+        let keys = (0..size)
+            .map(|_| rng.r#gen::<u64>())
+            .collect::<HashSet<_>>();
 
         let pairs = keys
             .iter()
             .map(|k| {
                 (
                     k.to_be_bytes().to_vec(),
-                    rng.gen::<u64>().to_be_bytes().to_vec(),
+                    rng.r#gen::<u64>().to_be_bytes().to_vec(),
                 )
             })
             .collect::<Vec<_>>();
@@ -423,7 +417,7 @@ mod tests {
 
         let keys = (0..size)
             .map(|_| {
-                let x = rng.gen::<u64>();
+                let x = rng.r#gen::<u64>();
                 x - (x % 100)
             })
             .collect::<Vec<_>>();
@@ -434,7 +428,7 @@ mod tests {
         }
 
         for k in keys.iter() {
-            let r = rng.gen::<u64>() % 100;
+            let r = rng.r#gen::<u64>() % 100;
             let key = &(k - r).to_be_bytes();
 
             let exp = &k.to_be_bytes();
@@ -495,7 +489,9 @@ mod tests {
         assert_eq!(page.buf.len(), len as usize);
         assert_eq!(
             &page.buf[0..HEAD],
-            &[0, 0, 0, id as u8, 0, 0, 0, len as u8, 0, 0, 0, 0, 0xC0, 0xDE, 0xFA, 0xCE,]
+            &[
+                0, 0, 0, id as u8, 0, 0, 0, len as u8, 0, 0, 0, 0, 0xC0, 0xDE, 0xFA, 0xCE,
+            ]
         );
 
         assert_eq!(page.put_val(k1, v1), Some(0));
@@ -697,7 +693,7 @@ mod tests {
                 (0..len).map(|_| rng.gen_range(0..4u8)).collect::<Vec<_>>()
             };
             if rng.gen_bool(0.6) {
-                let val = vec![rng.gen::<u8>(); rng.gen_range(0..64)];
+                let val = vec![rng.r#gen::<u8>(); rng.gen_range(0..64)];
                 if page.put_val(&key, &val).is_some() {
                     model.insert(key, val);
                 } else {

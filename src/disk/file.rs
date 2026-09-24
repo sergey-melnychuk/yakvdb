@@ -1,14 +1,13 @@
-use crate::api::error::{Error, Result};
-use crate::api::page::{Page, OVERFLOW_FLAG};
-use crate::api::tree::Tree;
 use crate::api::Store;
+use crate::api::error::{Error, Result};
+use crate::api::page::{OVERFLOW_FLAG, Page};
+use crate::api::tree::Tree;
 use crate::util::cache::{Cache, ClockCache};
 use crate::util::hex::hex;
 use bytes::{Buf, BufMut, BytesMut};
 use log::{debug, error, trace};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
-use std::convert::TryInto;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
@@ -210,15 +209,15 @@ impl<P: Page> File<P> {
             while id <= total_pages {
                 // Check if this is an overflow leader by reading the 16-byte header
                 let page_offset = this.offset(id);
-                if let Ok((magic, key_len, val_len)) = this.read_overflow_header(page_offset) {
-                    if magic == OVERFLOW_MAGIC {
-                        // This is an overflow region leader -- skip its continuation pages
-                        let data_len = (key_len + val_len) as usize;
-                        let m = Self::overflow_multiplier(this.head.page_bytes, data_len);
-                        debug!("Page id={id} is overflow leader (multiplier={m})");
-                        id += m;
-                        continue;
-                    }
+                if let Ok((magic, key_len, val_len)) = this.read_overflow_header(page_offset)
+                    && magic == OVERFLOW_MAGIC
+                {
+                    // This is an overflow region leader -- skip its continuation pages
+                    let data_len = (key_len + val_len) as usize;
+                    let m = Self::overflow_multiplier(this.head.page_bytes, data_len);
+                    debug!("Page id={id} is overflow leader (multiplier={m})");
+                    id += m;
+                    continue;
                 }
 
                 // Regular page -- check if empty
@@ -451,15 +450,14 @@ impl<P: Page> File<P> {
     fn scan_overflow_entries(&self, page: &P, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let n = page.len();
         for i in 0..n {
-            if let Some(slot) = page.slot(i) {
-                if slot.is_overflow() {
-                    let inline_key = page.key(i);
-                    if key.len() >= inline_key.len() && key.starts_with(inline_key) {
-                        let (full_key, full_val) =
-                            self.read_overflow(slot.page, slot.multiplier())?;
-                        if key == full_key.as_slice() {
-                            return Ok(Some(full_val));
-                        }
+            if let Some(slot) = page.slot(i)
+                && slot.is_overflow()
+            {
+                let inline_key = page.key(i);
+                if key.len() >= inline_key.len() && key.starts_with(inline_key) {
+                    let (full_key, full_val) = self.read_overflow(slot.page, slot.multiplier())?;
+                    if key == full_key.as_slice() {
+                        return Ok(Some(full_val));
                     }
                 }
             }
@@ -472,14 +470,14 @@ impl<P: Page> File<P> {
     fn find_overflow_by_prefix(&self, page: &P, key: &[u8]) -> Result<Option<(u32, u32, u32)>> {
         let n = page.len();
         for i in 0..n {
-            if let Some(slot) = page.slot(i) {
-                if slot.is_overflow() {
-                    let inline_key = page.key(i);
-                    if key.len() >= inline_key.len() && key.starts_with(inline_key) {
-                        let (full_key, _) = self.read_overflow(slot.page, slot.multiplier())?;
-                        if key == full_key.as_slice() {
-                            return Ok(Some((i, slot.page, slot.multiplier())));
-                        }
+            if let Some(slot) = page.slot(i)
+                && slot.is_overflow()
+            {
+                let inline_key = page.key(i);
+                if key.len() >= inline_key.len() && key.starts_with(inline_key) {
+                    let (full_key, _) = self.read_overflow(slot.page, slot.multiplier())?;
+                    if key == full_key.as_slice() {
+                        return Ok(Some((i, slot.page, slot.multiplier())));
                     }
                 }
             }
@@ -812,8 +810,8 @@ impl<P: Page> Store for File<P> {
                     };
                     if let Some(peer_id) = peer_id {
                         trace!(
-                                "merge: found peer_id={peer_id} to merge page_id={page_id} (parent_id={parent_id})"
-                            );
+                            "merge: found peer_id={peer_id} to merge page_id={page_id} (parent_id={parent_id})"
+                        );
                         let peer_max = {
                             let peer = self.try_page(peer_id)?;
                             peer.max().to_vec()
@@ -1464,9 +1462,9 @@ mod tests {
     use crate::disk::block::Block;
     use crate::util;
     use crate::util::hex::hex;
+    use rand::SeedableRng;
     use rand::prelude::StdRng;
     use rand::seq::SliceRandom;
-    use rand::SeedableRng;
     use std::ops::Deref;
 
     fn init_log() {
@@ -2396,7 +2394,7 @@ mod tests {
 
         // Try to remove a key that ceil matches to the overflow entry but isn't equal
         file.remove(b"help").unwrap(); // "help" < "hello", but ceil("help") -> "hello"
-                                       // Original should still be there
+        // Original should still be there
         assert!(file.lookup(b"hello").unwrap().is_some());
     }
 

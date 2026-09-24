@@ -15,7 +15,6 @@
 //! that is the torn tail of the last write before a crash, and nothing after it
 //! was ever acknowledged.
 
-use std::convert::TryInto;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
