@@ -674,6 +674,32 @@ impl<P: Page> File<P> {
         Ok(page.full())
     }
 
+    /// A copy of page `id`, to move entries from while writing to others:
+    /// holding its guard meanwhile would deadlock on the cache.
+    fn snapshot(&self, id: u32) -> Result<P> {
+        let page = self.try_page(id)?;
+        let mut copy = P::reserve(self.head.page_bytes);
+        copy.as_mut().copy_from_slice(page.as_ref());
+        Ok(copy)
+    }
+
+    /// Put the entries of `src` at `range` into page `id`.
+    fn fill(&self, id: u32, src: &P, range: std::ops::Range<u32>) -> Result<()> {
+        if !self.try_page_mut(id)?.extend_from(src, range) {
+            return Err(Error::Tree(id, "Entries do not fit".to_string()));
+        }
+        Ok(())
+    }
+
+    /// The whole key at `idx` of `page`: for an overflow entry the inline one
+    /// may be only a prefix.
+    fn full_key_at(&self, page: &P, idx: u32) -> Result<Vec<u8>> {
+        let slot = page
+            .slot(idx)
+            .ok_or_else(|| Error::Tree(page.id(), format!("Slot not found: {idx}")))?;
+        self.resolve_full_key(page.key(idx), slot.page, slot.vlen)
+    }
+
     /// The largest key in page `id`, or `None` if the page is empty.
     fn page_max(&self, id: u32) -> Result<Option<Vec<u8>>> {
         let page = self.try_page(id)?;
@@ -1500,137 +1526,37 @@ impl<P: Page> Tree<P> for File<P> {
     }
 
     fn split(&self, id: u32, parent_id: u32) -> Result<()> {
+        // One page-sized copy to move entries from, instead of an owned key
+        // and value per entry.
+        let snap = self.snapshot(id)?;
+        let len = snap.len();
+        let half = len / 2;
+
         if id == ROOT {
             let lo_id = self.next_id()?;
             let hi_id = self.next_id()?;
             debug!("split: root={id} into lo={lo_id} and hi={hi_id} (parent={parent_id})");
 
-            let (copy, lo_max, hi_max) = {
-                let page = self.try_page(id)?;
-                let copy = page.copy();
-                let half = page.len() as usize / 2;
-                let (k, _, p, rv) = copy.get(half - 1).unwrap();
-                let lo_max = self.resolve_full_key(k, *p, *rv)?;
-                let (k, _, p, rv) = copy.last().unwrap();
-                let hi_max = self.resolve_full_key(k, *p, *rv)?;
-                (copy, lo_max, hi_max)
-            };
-            let half = copy.len() / 2;
+            let lo_max = self.full_key_at(&snap, half - 1)?;
+            let hi_max = self.full_key_at(&snap, len - 1)?;
+            self.fill(lo_id, &snap, 0..half)?;
+            self.fill(hi_id, &snap, half..len)?;
 
-            {
-                let mut lo = self.try_page_mut(lo_id)?;
-                copy.iter()
-                    .take(half)
-                    .for_each(|(key, val, page_ref, raw_vlen)| {
-                        trace!(
-                            "split: move k={} v={} p={} from {} to {}",
-                            hex(key),
-                            hex(val),
-                            *page_ref,
-                            id,
-                            lo_id
-                        );
-                        if *raw_vlen & OVERFLOW_FLAG != 0 {
-                            lo.put_overflow(key, *page_ref, *raw_vlen);
-                        } else if *page_ref == 0 {
-                            lo.put_val(key, val);
-                        } else {
-                            lo.put_ref(key, *page_ref);
-                        }
-                    });
-            }
-
-            {
-                let mut hi = self.try_page_mut(hi_id)?;
-                copy.iter()
-                    .skip(half)
-                    .for_each(|(key, val, page_ref, raw_vlen)| {
-                        trace!(
-                            "split: move k={} v={} p={} from {} to {}",
-                            hex(key),
-                            hex(val),
-                            *page_ref,
-                            id,
-                            hi_id
-                        );
-                        if *raw_vlen & OVERFLOW_FLAG != 0 {
-                            hi.put_overflow(key, *page_ref, *raw_vlen);
-                        } else if *page_ref == 0 {
-                            hi.put_val(key, val);
-                        } else {
-                            hi.put_ref(key, *page_ref);
-                        }
-                    });
-            }
-
-            {
-                let mut page = self.try_page_mut(id)?;
-                page.clear();
-                page.put_ref(&lo_max, lo_id);
-                page.put_ref(&hi_max, hi_id);
-            }
-
+            let mut page = self.try_page_mut(id)?;
+            page.clear();
+            page.put_ref(&lo_max, lo_id);
+            page.put_ref(&hi_max, hi_id);
             Ok(())
         } else {
-            let (copy, max) = {
-                let page = self.try_page(id)?;
-                let c = page.copy();
-                let (k, _, p, rv) = c.last().unwrap();
-                let full_max = self.resolve_full_key(k, *p, *rv)?;
-                (c, full_max)
-            };
-            let half = copy.len() / 2;
             let peer_id = self.next_id()?;
             debug!("split: page={id} into peer={peer_id} (parent={parent_id})");
 
-            let page_max = {
-                let mut page = self.try_page_mut(id)?;
-                // the upper half moves to the peer: one pass, not one remove per entry
-                page.truncate(half as u32);
-                // Resolve the max key of the remaining half (may be overflow)
-                let last = page.len() - 1;
-                let slot = page.slot(last).unwrap();
-                if slot.is_overflow() {
-                    let (fk, _) = self
-                        .read_overflow(slot.page, slot.multiplier())
-                        .unwrap_or_else(|_| (page.max().to_vec(), vec![]));
-                    fk
-                } else {
-                    page.max().to_vec()
-                }
-            };
-
-            let peer_max = {
-                let mut peer = self.try_page_mut(peer_id)?;
-                copy.iter().skip(half).for_each(|(key, val, p, raw_vlen)| {
-                    trace!(
-                        "split: move k={} v={} p={} from {} to {}",
-                        hex(key),
-                        hex(val),
-                        *p,
-                        id,
-                        peer_id
-                    );
-                    if *raw_vlen & OVERFLOW_FLAG != 0 {
-                        peer.put_overflow(key, *p, *raw_vlen);
-                    } else if *p == 0 {
-                        peer.put_val(key, val);
-                    } else {
-                        peer.put_ref(key, *p);
-                    }
-                });
-                // Resolve the max key of the peer (may be overflow)
-                let last = peer.len() - 1;
-                let slot = peer.slot(last).unwrap();
-                if slot.is_overflow() {
-                    let (fk, _) = self
-                        .read_overflow(slot.page, slot.multiplier())
-                        .unwrap_or_else(|_| (peer.max().to_vec(), vec![]));
-                    fk
-                } else {
-                    peer.max().to_vec()
-                }
-            };
+            // the page keeps the lower half, the peer takes the upper one
+            let max = self.full_key_at(&snap, len - 1)?;
+            let page_max = self.full_key_at(&snap, half - 1)?;
+            let peer_max = max.clone();
+            self.try_page_mut(id)?.truncate(half);
+            self.fill(peer_id, &snap, half..len)?;
 
             {
                 let mut parent = self.try_page_mut(parent_id)?;
@@ -1699,37 +1625,9 @@ impl<P: Page> Tree<P> for File<P> {
 
     fn merge(&self, src_id: u32, dst_id: u32) -> Result<()> {
         debug!("merge: src={src_id} into dst={dst_id}");
-        let src_copy = {
-            let page = self.try_page(src_id)?;
-            page.copy()
-        };
-
-        {
-            let mut page = self.try_page_mut(dst_id)?;
-            for (key, val, p, raw_vlen) in src_copy {
-                trace!(
-                    "merge: move k={} v={} p={} from {} to {}",
-                    hex(&key),
-                    hex(&val),
-                    p,
-                    src_id,
-                    dst_id
-                );
-                if raw_vlen & OVERFLOW_FLAG != 0 {
-                    page.put_overflow(&key, p, raw_vlen);
-                } else if p == 0 {
-                    page.put_val(&key, &val);
-                } else {
-                    page.put_ref(&key, p);
-                }
-            }
-            page.max().to_vec()
-        };
-
-        {
-            let mut page = self.try_page_mut(src_id)?;
-            page.clear();
-        }
+        let src = self.snapshot(src_id)?;
+        self.fill(dst_id, &src, 0..src.len())?;
+        self.try_page_mut(src_id)?.clear();
 
         self.free_id(src_id);
         Ok(())

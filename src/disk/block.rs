@@ -251,6 +251,15 @@ impl Page for Block {
         *self.lo.get_mut() = if n == 1 { self.cap() } else { lo + len };
     }
 
+    fn extend_from(&mut self, other: &Self, range: std::ops::Range<u32>) -> bool {
+        range.into_iter().all(|idx| match other.slot(idx) {
+            Some(slot) => self
+                .put_entry(other.key(idx), other.val(idx), slot.vlen, slot.page)
+                .is_some(),
+            None => false,
+        })
+    }
+
     fn truncate(&mut self, len: u32) {
         let n = self.len();
         if len >= n {
@@ -794,5 +803,33 @@ mod tests {
                 page.cap() - HEAD as u32 - kept as u32 * SLOT as u32 - used
             );
         }
+    }
+
+    #[test]
+    fn test_extend_from() {
+        let mut src = Block::create(1, 512);
+        src.put_val(b"a", b"value-a").unwrap();
+        src.put_ref(b"b", 42).unwrap();
+        src.put_overflow(b"c", 7, crate::api::page::OVERFLOW_FLAG | 3)
+            .unwrap();
+        src.put_val(b"d", b"value-d").unwrap();
+
+        let mut dst = Block::create(2, 512);
+        dst.put_val(b"0", b"zero").unwrap();
+        assert!(dst.extend_from(&src, 1..4));
+        assert_eq!(dst.len(), 4);
+        assert_eq!(dst.key(0), b"0");
+        assert_eq!((dst.key(1), dst.slot(1).unwrap().page), (&b"b"[..], 42));
+        let slot = dst.slot(2).unwrap();
+        assert_eq!(dst.key(2), b"c");
+        assert!(slot.is_overflow());
+        assert_eq!((slot.page, slot.multiplier()), (7, 3));
+        assert_eq!(dst.val(3), b"value-d");
+
+        let mut small = Block::create(3, 64);
+        assert!(
+            !small.extend_from(&src, 0..4),
+            "four entries do not fit 64 bytes"
+        );
     }
 }

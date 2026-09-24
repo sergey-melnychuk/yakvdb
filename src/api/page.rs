@@ -98,6 +98,11 @@ pub trait Page: AsRef<[u8]> + AsMut<[u8]> {
     /// Returns slot index if operation was successful.
     fn put_overflow(&mut self, key: &[u8], overflow_page: u32, raw_vlen: u32) -> Option<u32>;
 
+    /// Put the entries of `other` at `range` into this page, as they are
+    /// (values, page references and overflow references alike). Returns
+    /// false if one did not fit.
+    fn extend_from(&mut self, other: &Self, range: std::ops::Range<u32>) -> bool;
+
     /// Keep the first `len` slots and drop the rest, repacking the data.
     fn truncate(&mut self, len: u32);
 
