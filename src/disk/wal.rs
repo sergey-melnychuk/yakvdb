@@ -32,9 +32,15 @@ const PAGE: u8 = 4;
 const CHECKPOINT: u8 = 5;
 
 /// Initial capacity of the append buffers, and the most a buffer keeps after
-/// a flush: a checkpoint's page images can grow one to the whole dirty set.
+/// a flush.
 const BUFFER_BYTES: usize = 64 * 1024;
 const KEEP_BUFFER_BYTES: usize = 1024 * 1024;
+
+/// A checkpoint writes its page images out whenever this much is buffered,
+/// rather than buffering them all: growing a buffer to the whole dirty set
+/// (up to 128 MiB) one doubling at a time, every checkpoint, left the
+/// allocator holding gigabytes of freed but still resident memory.
+pub(crate) const CHUNK_BYTES: usize = 512 * 1024;
 
 /// Shortest interval of `Durability::Periodic`: less would spin a core.
 const MIN_FLUSH_INTERVAL: Duration = Duration::from_millis(1);
@@ -552,6 +558,11 @@ impl Wal {
             }
         }
         self.flush(lsn, self.commit.sync)
+    }
+
+    /// Bytes appended but not yet written to the OS.
+    pub(crate) fn buffered_bytes(&self) -> usize {
+        self.state.lock().buf.len()
     }
 
     /// Records and bytes appended but not yet written to the OS.

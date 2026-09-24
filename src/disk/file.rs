@@ -869,6 +869,10 @@ impl<P: Page> File<P> {
                 id,
                 bytes: page.as_ref(),
             });
+            drop(page);
+            if self.wal.buffered_bytes() >= wal::CHUNK_BYTES {
+                self.wal.flush_all(false)?;
+            }
         }
         // The file once this checkpoint is done: its page count, and the free
         // pages, the ones freed since the last checkpoint included.
