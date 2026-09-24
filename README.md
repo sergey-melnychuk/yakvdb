@@ -41,8 +41,10 @@ PLAN:
     `referenced` bit with an atomic store instead of moving the key under
     `lru.write()`, so readers no longer exclude each other, and every access is
     O(1) instead of a linear scan of the recency list
-  - that made a large cache affordable: the default is 64 MiB (16384 pages of
-    4 KiB) instead of 32 pages, set with `make_with_cache`/`open_with_cache`
+  - that made a large cache affordable: the default limit is 256 MiB (65536
+    pages of 4 KiB) instead of 32 pages, set with `make_with_cache`/
+    `open_with_cache`; pages are cached as they are read, so memory follows
+    the size of the tree up to that limit instead of being reserved up front
   - measured on 200k keys, 400k lookups, release: 490k/430k/456k/241k op/s at
     1/2/4/8 threads before, 1.4M/2.9M/2.1M/1.4M after
 - [ ] let reads scale past 2 threads
@@ -160,7 +162,8 @@ use yakvdb::api::{Store, KV};
 let db: KV = KV::make(Path::new("/tmp/db.yak"), /*page_size=*/ 4096).unwrap();
 // ...or open an existing one:
 // let db: KV = KV::open(Path::new("/tmp/db.yak")).unwrap();
-// Both use a 64 MiB page cache; `make_with_cache`/`open_with_cache` pick the size.
+// Both cache up to 256 MiB of pages, growing with the tree; `make_with_cache`/
+// `open_with_cache` pick the limit.
 
 let _: Result<()> = db.insert(b"key", b"val");
 let _: Result<Option<Vec<u8>>> = db.lookup(b"key");

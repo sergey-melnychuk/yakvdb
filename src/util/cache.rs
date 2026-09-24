@@ -37,11 +37,14 @@ pub(crate) struct ClockCache<K, V> {
 }
 
 impl<K: Clone + Eq + Hash + Display, V> ClockCache<K, V> {
+    /// A cache of up to `size` entries. Nothing is reserved for them up front:
+    /// the cache grows as entries come in, so a large `size` costs nothing
+    /// until it is used.
     pub(crate) fn new(size: usize) -> Self {
         let cap = size.max(1);
         Self {
-            map: HashMap::with_capacity(cap),
-            frames: Vec::with_capacity(cap),
+            map: HashMap::new(),
+            frames: Vec::new(),
             hand: 0,
             cap,
         }

@@ -49,12 +49,16 @@ pub struct File<P: Page> {
 
 const MAGIC: &[u8] = b"YAKVDB42";
 
-/// Page cache size used by `make` and `open`: 64 MiB, i.e. 16384 pages of 4 KiB.
+/// Upper limit on the page cache used by `make` and `open`: 256 MiB, i.e.
+/// 65536 pages of 4 KiB.
 ///
 /// The cache is the only thing standing between a page access and a `pread`,
 /// and every operation touches a page per tree level, so the more of the tree
-/// it holds the better. Use `make_with_cache`/`open_with_cache` to pick another size.
-pub const DEFAULT_CACHE_BYTES: usize = 64 * 1024 * 1024;
+/// it holds the better. The limit is not allocated up front: a page takes
+/// memory only once it is read or created, so the cache follows the size of
+/// the tree -- a 50 MiB tree costs 50 MiB -- and stops growing here. Use
+/// `make_with_cache`/`open_with_cache` to pick another limit.
+pub const DEFAULT_CACHE_BYTES: usize = 256 * 1024 * 1024;
 
 /// Upper bound on the tree depth, to report a reference cycle in a corrupted
 /// file instead of following it forever. A B-tree with a fan-out of at least 2
