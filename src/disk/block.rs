@@ -267,7 +267,10 @@ impl Page for Block {
 
         put_size(&mut self.buf, size - 1);
 
-        let total: u32 = slots.iter().map(|slot| slot.klen + slot.inline_vlen()).sum();
+        let total: u32 = slots
+            .iter()
+            .map(|slot| slot.klen + slot.inline_vlen())
+            .sum();
         let mut offset = self.cap() - total;
 
         let copy = slots

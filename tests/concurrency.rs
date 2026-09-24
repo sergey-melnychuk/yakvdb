@@ -105,7 +105,11 @@ fn test_concurrent_readers_and_writers() {
         handles.push(thread::spawn(move || {
             for i in (0..n).step_by(2) {
                 // seeded keys must stay visible while writers work
-                assert_eq!(db.lookup(&key(i)).unwrap(), Some(val(i)), "key {i} vanished");
+                assert_eq!(
+                    db.lookup(&key(i)).unwrap(),
+                    Some(val(i)),
+                    "key {i} vanished"
+                );
             }
         }));
     }

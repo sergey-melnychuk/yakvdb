@@ -407,7 +407,9 @@ fn main() {
                                 // Check if all slots are leaf entries (page_ref == 0)
                                 let entries = page.copy();
                                 for (_, _, page_ref, raw_vlen) in entries {
-                                    if page_ref > 0 && raw_vlen & yakvdb::api::page::OVERFLOW_FLAG == 0 {
+                                    if page_ref > 0
+                                        && raw_vlen & yakvdb::api::page::OVERFLOW_FLAG == 0
+                                    {
                                         return "NODE";
                                     }
                                 }
@@ -481,7 +483,9 @@ fn main() {
                                     let entries = page.copy();
                                     let mut is_leaf = true;
                                     for (_, _, page_ref, raw_vlen) in entries {
-                                        if page_ref > 0 && raw_vlen & yakvdb::api::page::OVERFLOW_FLAG == 0 {
+                                        if page_ref > 0
+                                            && raw_vlen & yakvdb::api::page::OVERFLOW_FLAG == 0
+                                        {
                                             is_leaf = false;
                                             break;
                                         }
@@ -508,7 +512,9 @@ fn main() {
                                     println!("{:-<44}", "");
 
                                     let entries = page.copy();
-                                    for (i, (key, val, page_ref, raw_vlen)) in entries.iter().enumerate() {
+                                    for (i, (key, val, page_ref, raw_vlen)) in
+                                        entries.iter().enumerate()
+                                    {
                                         let key_str = match mode {
                                             Mode::Hex => format!("0x{}", hex::encode(key)),
                                             Mode::Str => {
@@ -538,14 +544,16 @@ fn main() {
                                             val_str
                                         };
 
-                                        let val_or_page_ref = if *raw_vlen & yakvdb::api::page::OVERFLOW_FLAG != 0 {
-                                            let m = raw_vlen & !yakvdb::api::page::OVERFLOW_FLAG;
-                                            format!("[OVERFLOW: {m} pages, PAGE: {page_ref}]")
-                                        } else if *page_ref > 0 {
-                                            format!("[PAGE: {page_ref}]")
-                                        } else {
-                                            truncated_val
-                                        };
+                                        let val_or_page_ref =
+                                            if *raw_vlen & yakvdb::api::page::OVERFLOW_FLAG != 0 {
+                                                let m =
+                                                    raw_vlen & !yakvdb::api::page::OVERFLOW_FLAG;
+                                                format!("[OVERFLOW: {m} pages, PAGE: {page_ref}]")
+                                            } else if *page_ref > 0 {
+                                                format!("[PAGE: {page_ref}]")
+                                            } else {
+                                                truncated_val
+                                            };
 
                                         println!(
                                             "{i:<4} {truncated_key:<20} {val_or_page_ref:<20}"
@@ -572,7 +580,8 @@ fn main() {
                             let entries = root_page.copy();
                             let mut is_leaf = true;
                             for (_, _, page_ref, raw_vlen) in entries {
-                                if page_ref > 0 && raw_vlen & yakvdb::api::page::OVERFLOW_FLAG == 0 {
+                                if page_ref > 0 && raw_vlen & yakvdb::api::page::OVERFLOW_FLAG == 0
+                                {
                                     is_leaf = false;
                                     break;
                                 }
@@ -626,14 +635,15 @@ fn main() {
                                     val_str
                                 };
 
-                                let val_or_page_ref = if *raw_vlen & yakvdb::api::page::OVERFLOW_FLAG != 0 {
-                                    let m = raw_vlen & !yakvdb::api::page::OVERFLOW_FLAG;
-                                    format!("[OVERFLOW: {m} pages, PAGE: {page_ref}]")
-                                } else if *page_ref > 0 {
-                                    format!("[PAGE: {page_ref}]")
-                                } else {
-                                    truncated_val
-                                };
+                                let val_or_page_ref =
+                                    if *raw_vlen & yakvdb::api::page::OVERFLOW_FLAG != 0 {
+                                        let m = raw_vlen & !yakvdb::api::page::OVERFLOW_FLAG;
+                                        format!("[OVERFLOW: {m} pages, PAGE: {page_ref}]")
+                                    } else if *page_ref > 0 {
+                                        format!("[PAGE: {page_ref}]")
+                                    } else {
+                                        truncated_val
+                                    };
 
                                 println!("{i:<4} {truncated_key:<20} {val_or_page_ref:<20}");
                             }

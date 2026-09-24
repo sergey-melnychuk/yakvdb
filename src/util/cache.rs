@@ -112,7 +112,11 @@ mod tests {
             cache.put(i, i);
         }
         assert_eq!(cache.map.len(), cap, "map must not grow past capacity");
-        assert_eq!(cache.lru.read().len(), cap, "lru must not grow past capacity");
+        assert_eq!(
+            cache.lru.read().len(),
+            cap,
+            "lru must not grow past capacity"
+        );
         // the most recent `cap` keys survived
         let mut keys = cache.map.keys().cloned().collect::<Vec<_>>();
         keys.sort();

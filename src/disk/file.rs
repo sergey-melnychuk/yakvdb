@@ -8,12 +8,12 @@ use bytes::{Buf, BufMut, BytesMut};
 use log::{debug, error, trace};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
+use std::convert::TryInto;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::ops::Deref;
 use std::path::Path;
-use std::convert::TryInto;
 use std::sync::Arc;
 
 use parking_lot::{
@@ -412,11 +412,7 @@ impl<P: Page> File<P> {
     /// Scan all overflow entries on a leaf page for one whose full key matches `key`.
     /// This handles the case where overflow entries store only a key prefix inline,
     /// causing `ceil()` to miss them (prefix < full_key).
-    fn scan_overflow_entries(
-        &self,
-        page: &P,
-        key: &[u8],
-    ) -> Result<Option<Vec<u8>>> {
+    fn scan_overflow_entries(&self, page: &P, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let n = page.len();
         for i in 0..n {
             if let Some(slot) = page.slot(i) {
@@ -437,19 +433,14 @@ impl<P: Page> File<P> {
 
     /// Find an overflow entry on a page whose full key matches `key`.
     /// Returns (slot_index, overflow_page, multiplier) if found.
-    fn find_overflow_by_prefix(
-        &self,
-        page: &P,
-        key: &[u8],
-    ) -> Result<Option<(u32, u32, u32)>> {
+    fn find_overflow_by_prefix(&self, page: &P, key: &[u8]) -> Result<Option<(u32, u32, u32)>> {
         let n = page.len();
         for i in 0..n {
             if let Some(slot) = page.slot(i) {
                 if slot.is_overflow() {
                     let inline_key = page.key(i);
                     if key.len() >= inline_key.len() && key.starts_with(inline_key) {
-                        let (full_key, _) =
-                            self.read_overflow(slot.page, slot.multiplier())?;
+                        let (full_key, _) = self.read_overflow(slot.page, slot.multiplier())?;
                         if key == full_key.as_slice() {
                             return Ok(Some((i, slot.page, slot.multiplier())));
                         }
@@ -509,8 +500,7 @@ impl<P: Page> Store for File<P> {
             if slot.is_leaf() {
                 if slot.is_overflow() {
                     // Overflow entry: read full key+value from overflow region
-                    let (full_key, full_val) =
-                        self.read_overflow(slot.page, slot.multiplier())?;
+                    let (full_key, full_val) = self.read_overflow(slot.page, slot.multiplier())?;
                     if key == full_key.as_slice() {
                         return Ok(Some(full_val));
                     }
@@ -560,10 +550,7 @@ impl<P: Page> Store for File<P> {
                 } else if page.fits(key.len() as u32) {
                     // Key fits inline but value doesn't -- use overflow
                     drop(page);
-                    let m = Self::overflow_multiplier(
-                        self.head.page_bytes,
-                        key.len() + val.len(),
-                    );
+                    let m = Self::overflow_multiplier(self.head.page_bytes, key.len() + val.len());
                     let ov_page = self.alloc_overflow(m)?;
                     self.write_overflow(ov_page, key, val, m)?;
                     let raw_vlen = OVERFLOW_FLAG | m;
@@ -575,10 +562,7 @@ impl<P: Page> Store for File<P> {
                     let max_prefix = page.free().saturating_sub(SLOT_BYTES as u32) as usize;
                     let prefix = &key[..max_prefix.min(key.len())];
                     drop(page);
-                    let m = Self::overflow_multiplier(
-                        self.head.page_bytes,
-                        key.len() + val.len(),
-                    );
+                    let m = Self::overflow_multiplier(self.head.page_bytes, key.len() + val.len());
                     let ov_page = self.alloc_overflow(m)?;
                     self.write_overflow(ov_page, key, val, m)?;
                     let raw_vlen = OVERFLOW_FLAG | m;
@@ -634,10 +618,7 @@ impl<P: Page> Store for File<P> {
                 } else if page.fits(key.len() as u32) {
                     // Key fits inline, value overflows
                     drop(page);
-                    let m = Self::overflow_multiplier(
-                        self.head.page_bytes,
-                        key.len() + val.len(),
-                    );
+                    let m = Self::overflow_multiplier(self.head.page_bytes, key.len() + val.len());
                     let ov_page = self.alloc_overflow(m)?;
                     self.write_overflow(ov_page, key, val, m)?;
                     let raw_vlen = OVERFLOW_FLAG | m;
@@ -652,14 +633,10 @@ impl<P: Page> Store for File<P> {
                 } else {
                     // Key prefix + overflow
                     let free = page.free();
-                    let max_prefix =
-                        free.saturating_sub(SLOT_BYTES as u32) as usize;
+                    let max_prefix = free.saturating_sub(SLOT_BYTES as u32) as usize;
                     let prefix = &key[..max_prefix.min(key.len())];
                     drop(page);
-                    let m = Self::overflow_multiplier(
-                        self.head.page_bytes,
-                        key.len() + val.len(),
-                    );
+                    let m = Self::overflow_multiplier(self.head.page_bytes, key.len() + val.len());
                     let ov_page = self.alloc_overflow(m)?;
                     self.write_overflow(ov_page, key, val, m)?;
                     let raw_vlen = OVERFLOW_FLAG | m;
@@ -781,7 +758,12 @@ impl<P: Page> Store for File<P> {
                             return Ok(()); // not found
                         }
                     } else {
-                        debug!("remove: key={} page={} idx={} (overflow)", hex(key), id, idx);
+                        debug!(
+                            "remove: key={} page={} idx={} (overflow)",
+                            hex(key),
+                            id,
+                            idx
+                        );
                         page.remove(idx);
                         drop(page);
                         self.free_overflow(ov_page, m)?;
@@ -1012,10 +994,8 @@ impl<P: Page> Store for File<P> {
                                 let slot = page.slot(0).unwrap();
                                 if slot.is_leaf() {
                                     if slot.is_overflow() {
-                                        let (fk, _) = self.read_overflow(
-                                            slot.page,
-                                            slot.multiplier(),
-                                        )?;
+                                        let (fk, _) =
+                                            self.read_overflow(slot.page, slot.multiplier())?;
                                         return Ok(Some(fk));
                                     }
                                     return Ok(Some(page.min().to_vec()));
@@ -1058,8 +1038,7 @@ impl<P: Page> Store for File<P> {
                 if idx > 0 {
                     let prev_slot = page.slot(idx - 1).unwrap();
                     let prev_key = if prev_slot.is_overflow() {
-                        let (fk, _) =
-                            self.read_overflow(prev_slot.page, prev_slot.multiplier())?;
+                        let (fk, _) = self.read_overflow(prev_slot.page, prev_slot.multiplier())?;
                         fk
                     } else {
                         page.key(idx - 1).to_vec()
@@ -1082,10 +1061,8 @@ impl<P: Page> Store for File<P> {
                         let last = page.len() - 1;
                         let last_slot = page.slot(last).unwrap();
                         if last_slot.is_overflow() {
-                            let (fk, _) = self.read_overflow(
-                                last_slot.page,
-                                last_slot.multiplier(),
-                            )?;
+                            let (fk, _) =
+                                self.read_overflow(last_slot.page, last_slot.multiplier())?;
                             return Ok(Some(fk));
                         }
                         return Ok(Some(page.max().to_vec()));
@@ -1241,44 +1218,48 @@ impl<P: Page> Tree<P> for File<P> {
 
             {
                 let mut lo = self.try_page_mut(lo_id)?;
-                copy.iter().take(half).for_each(|(key, val, page_ref, raw_vlen)| {
-                    trace!(
-                        "split: move k={} v={} p={} from {} to {}",
-                        hex(key),
-                        hex(val),
-                        *page_ref,
-                        id,
-                        lo_id
-                    );
-                    if *raw_vlen & OVERFLOW_FLAG != 0 {
-                        lo.put_overflow(key, *page_ref, *raw_vlen);
-                    } else if *page_ref == 0 {
-                        lo.put_val(key, val);
-                    } else {
-                        lo.put_ref(key, *page_ref);
-                    }
-                });
+                copy.iter()
+                    .take(half)
+                    .for_each(|(key, val, page_ref, raw_vlen)| {
+                        trace!(
+                            "split: move k={} v={} p={} from {} to {}",
+                            hex(key),
+                            hex(val),
+                            *page_ref,
+                            id,
+                            lo_id
+                        );
+                        if *raw_vlen & OVERFLOW_FLAG != 0 {
+                            lo.put_overflow(key, *page_ref, *raw_vlen);
+                        } else if *page_ref == 0 {
+                            lo.put_val(key, val);
+                        } else {
+                            lo.put_ref(key, *page_ref);
+                        }
+                    });
             }
 
             {
                 let mut hi = self.try_page_mut(hi_id)?;
-                copy.iter().skip(half).for_each(|(key, val, page_ref, raw_vlen)| {
-                    trace!(
-                        "split: move k={} v={} p={} from {} to {}",
-                        hex(key),
-                        hex(val),
-                        *page_ref,
-                        id,
-                        hi_id
-                    );
-                    if *raw_vlen & OVERFLOW_FLAG != 0 {
-                        hi.put_overflow(key, *page_ref, *raw_vlen);
-                    } else if *page_ref == 0 {
-                        hi.put_val(key, val);
-                    } else {
-                        hi.put_ref(key, *page_ref);
-                    }
-                });
+                copy.iter()
+                    .skip(half)
+                    .for_each(|(key, val, page_ref, raw_vlen)| {
+                        trace!(
+                            "split: move k={} v={} p={} from {} to {}",
+                            hex(key),
+                            hex(val),
+                            *page_ref,
+                            id,
+                            hi_id
+                        );
+                        if *raw_vlen & OVERFLOW_FLAG != 0 {
+                            hi.put_overflow(key, *page_ref, *raw_vlen);
+                        } else if *page_ref == 0 {
+                            hi.put_val(key, val);
+                        } else {
+                            hi.put_ref(key, *page_ref);
+                        }
+                    });
             }
 
             {
@@ -1313,7 +1294,8 @@ impl<P: Page> Tree<P> for File<P> {
                 let last = page.len() - 1;
                 let slot = page.slot(last).unwrap();
                 if slot.is_overflow() {
-                    let (fk, _) = self.read_overflow(slot.page, slot.multiplier())
+                    let (fk, _) = self
+                        .read_overflow(slot.page, slot.multiplier())
                         .unwrap_or_else(|_| (page.max().to_vec(), vec![]));
                     fk
                 } else {
@@ -1344,7 +1326,8 @@ impl<P: Page> Tree<P> for File<P> {
                 let last = peer.len() - 1;
                 let slot = peer.slot(last).unwrap();
                 if slot.is_overflow() {
-                    let (fk, _) = self.read_overflow(slot.page, slot.multiplier())
+                    let (fk, _) = self
+                        .read_overflow(slot.page, slot.multiplier())
                         .unwrap_or_else(|_| (peer.max().to_vec(), vec![]));
                     fk
                 } else {
@@ -2048,11 +2031,7 @@ mod tests {
         // Verify all entries are retrievable
         for (k, v) in all.iter() {
             let found = file.lookup(k).unwrap();
-            assert!(
-                found.is_some(),
-                "Key {} not found",
-                hex(k)
-            );
+            assert!(found.is_some(), "Key {} not found", hex(k));
             assert_eq!(found.unwrap().deref(), v.as_slice());
         }
 
@@ -2458,7 +2437,7 @@ mod tests {
 
         // Try to remove a key that ceil matches to the overflow entry but isn't equal
         file.remove(b"help").unwrap(); // "help" < "hello", but ceil("help") -> "hello"
-        // Original should still be there
+                                       // Original should still be there
         assert!(file.lookup(b"hello").unwrap().is_some());
     }
 
@@ -2514,7 +2493,9 @@ mod tests {
         // Each overflow entry uses ~(key_len + SLOT_BYTES) bytes inline on the page.
         // With page_bytes=256, capacity=240. SPLIT_THRESHOLD=80% → need > 192 bytes.
         // Using 20-byte keys: 20+16=36 bytes each. Need 6 entries → 216 > 192.
-        let keys: Vec<Vec<u8>> = (0..8).map(|i| format!("overflowkey_{:04}", i).into_bytes()).collect();
+        let keys: Vec<Vec<u8>> = (0..8)
+            .map(|i| format!("overflowkey_{:04}", i).into_bytes())
+            .collect();
         for key in &keys {
             file.insert(key, &big_val).unwrap();
         }
@@ -2522,7 +2503,11 @@ mod tests {
         // Verify all entries survived the root split
         for key in &keys {
             let found = file.lookup(key).unwrap();
-            assert!(found.is_some(), "Key {:?} not found after root split", std::str::from_utf8(key));
+            assert!(
+                found.is_some(),
+                "Key {:?} not found after root split",
+                std::str::from_utf8(key)
+            );
             assert_eq!(found.unwrap(), big_val);
         }
 
@@ -2784,7 +2769,10 @@ mod tests {
         file.insert(&big_key, &val).unwrap();
 
         // Verify lookup
-        assert_eq!(file.lookup(&big_key).unwrap().unwrap().deref(), val.as_slice());
+        assert_eq!(
+            file.lookup(&big_key).unwrap().unwrap().deref(),
+            val.as_slice()
+        );
 
         // Remove the big key -- since it's stored with a prefix, ceil won't find it
         // exactly, so the prefix fallback path kicks in
@@ -2794,8 +2782,11 @@ mod tests {
         // All small entries should still be intact
         for i in 0u16..30 {
             let key = format!("entry{:04}", i);
-            assert!(file.lookup(key.as_bytes()).unwrap().is_some(),
-                "Entry {} missing after big key removal", i);
+            assert!(
+                file.lookup(key.as_bytes()).unwrap().is_some(),
+                "Entry {} missing after big key removal",
+                i
+            );
         }
     }
 
@@ -2837,8 +2828,11 @@ mod tests {
             // Verify
             for i in 0u16..20 {
                 let key = format!("n{:04}", i);
-                assert!(file.lookup(key.as_bytes()).unwrap().is_some(),
-                    "Key n{:04} not found", i);
+                assert!(
+                    file.lookup(key.as_bytes()).unwrap().is_some(),
+                    "Key n{:04} not found",
+                    i
+                );
             }
         }
     }
@@ -2915,13 +2909,20 @@ mod tests {
         // Verify all entries
         for i in 0u8..10 {
             let key = format!("base{:03}", i * 10);
-            assert!(file.lookup(key.as_bytes()).unwrap().is_some(),
-                "base entry {} missing", i);
+            assert!(
+                file.lookup(key.as_bytes()).unwrap().is_some(),
+                "base entry {} missing",
+                i
+            );
         }
         for i in 0u8..4 {
             let key = format!("base{:03}", i * 10 + 5);
-            assert_eq!(file.lookup(key.as_bytes()).unwrap().unwrap(), big_val,
-                "overflow entry {} mismatch", i);
+            assert_eq!(
+                file.lookup(key.as_bytes()).unwrap().unwrap(),
+                big_val,
+                "overflow entry {} mismatch",
+                i
+            );
         }
     }
 
@@ -2963,8 +2964,13 @@ mod tests {
 
         for w in keys.windows(2) {
             let above = file.above(w[0].as_bytes()).unwrap();
-            assert_eq!(above, Some(w[1].as_bytes().to_vec()),
-                "above({}) should be {}", w[0], w[1]);
+            assert_eq!(
+                above,
+                Some(w[1].as_bytes().to_vec()),
+                "above({}) should be {}",
+                w[0],
+                w[1]
+            );
         }
         // Last key should have no above
         assert_eq!(file.above(keys.last().unwrap().as_bytes()).unwrap(), None);
@@ -2989,8 +2995,13 @@ mod tests {
 
         for w in keys.windows(2) {
             let below = file.below(w[1].as_bytes()).unwrap();
-            assert_eq!(below, Some(w[0].as_bytes().to_vec()),
-                "below({}) should be {}", w[1], w[0]);
+            assert_eq!(
+                below,
+                Some(w[0].as_bytes().to_vec()),
+                "below({}) should be {}",
+                w[1],
+                w[0]
+            );
         }
         // First key should have no below
         assert_eq!(file.below(keys.first().unwrap().as_bytes()).unwrap(), None);
@@ -3082,26 +3093,35 @@ mod tests {
 
         // Phase 2: Verify all entries
         for key in &all_keys {
-            assert!(file.lookup(key).unwrap().is_some(),
-                "Missing key after insert: {:?}", std::str::from_utf8(key));
+            assert!(
+                file.lookup(key).unwrap().is_some(),
+                "Missing key after insert: {:?}",
+                std::str::from_utf8(key)
+            );
         }
 
         // Phase 3: Test above/below traversal (overflow entries at boundaries)
         for w in all_keys.windows(2) {
             let above = file.above(&w[0]).unwrap();
-            assert_eq!(above, Some(w[1].clone()),
+            assert_eq!(
+                above,
+                Some(w[1].clone()),
                 "above({:?}) should be {:?}",
                 std::str::from_utf8(&w[0]),
-                std::str::from_utf8(&w[1]));
+                std::str::from_utf8(&w[1])
+            );
         }
         assert_eq!(file.above(all_keys.last().unwrap()).unwrap(), None);
 
         for w in all_keys.windows(2) {
             let below = file.below(&w[1]).unwrap();
-            assert_eq!(below, Some(w[0].clone()),
+            assert_eq!(
+                below,
+                Some(w[0].clone()),
                 "below({:?}) should be {:?}",
                 std::str::from_utf8(&w[1]),
-                std::str::from_utf8(&w[0]));
+                std::str::from_utf8(&w[0])
+            );
         }
         assert_eq!(file.below(all_keys.first().unwrap()).unwrap(), None);
 
@@ -3120,11 +3140,17 @@ mod tests {
         for (i, key) in all_keys.iter().enumerate() {
             let found = file.lookup(key).unwrap();
             if i % 2 == 0 {
-                assert!(found.is_none(), "Key {:?} should have been removed",
-                    std::str::from_utf8(key));
+                assert!(
+                    found.is_none(),
+                    "Key {:?} should have been removed",
+                    std::str::from_utf8(key)
+                );
             } else {
-                assert!(found.is_some(), "Key {:?} should still exist",
-                    std::str::from_utf8(key));
+                assert!(
+                    found.is_some(),
+                    "Key {:?} should still exist",
+                    std::str::from_utf8(key)
+                );
             }
         }
     }
