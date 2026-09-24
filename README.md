@@ -78,10 +78,13 @@ PLAN:
     that system call is most of an insert, so buffering trades the last few
     writes on a process crash for speed; 1 record, the default, loses none
   - measured on 1M keys, release, `Durability::Os`, M4 Pro (inserts / removes
-    / lookups, op/s): 1 record 246k / 236k / 1.29M; 10 records 758k / 480k /
-    1.28M; 100 records 900k / 536k / 1.26M; 1000 records no faster than 100,
-    which is already the CPU-bound rate (the insert path alone, without the
-    log write, runs at about 920k/s)
+    / lookups, op/s): 1 record 315k / 248k / 1.39M; 10 records 866k / 527k /
+    1.33M; 100 records 1.07M / 595k / 1.33M; 1000 records no faster than
+    100, where the log write no longer shows and the tree work is all
+- [x] cheaper page work: splits and merges move entries straight between
+  pages instead of through a copy of each (`Page::extend_from`), and the
+  search within a page reads only the key fields and compares the first 8
+  bytes of keys as one integer before `memcmp`
   - measured on 1M keys, release, `Os`: insert 277k/s, lookup 1.19M/s,
     remove 235k/s before, 281k/1.21M/231k after, while no mode can now leave
     the file half-updated; `Sync` on macOS (`F_FULLFSYNC`): 287 inserts/s from
