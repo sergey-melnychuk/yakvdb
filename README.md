@@ -77,6 +77,11 @@ PLAN:
     that hands them to the OS (a number of records, bytes, or an interval):
     that system call is most of an insert, so buffering trades the last few
     writes on a process crash for speed; 1 record, the default, loses none
+  - measured on 1M keys, release, `Durability::Os`, M4 Pro (inserts / removes
+    / lookups, op/s): 1 record 246k / 236k / 1.29M; 10 records 758k / 480k /
+    1.28M; 100 records 900k / 536k / 1.26M; 1000 records no faster than 100,
+    which is already the CPU-bound rate (the insert path alone, without the
+    log write, runs at about 920k/s)
   - measured on 1M keys, release, `Os`: insert 277k/s, lookup 1.19M/s,
     remove 235k/s before, 281k/1.21M/231k after, while no mode can now leave
     the file half-updated; `Sync` on macOS (`F_FULLFSYNC`): 287 inserts/s from
