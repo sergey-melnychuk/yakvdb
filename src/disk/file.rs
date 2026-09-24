@@ -2,6 +2,8 @@ use crate::api::Store;
 use crate::api::error::{Error, Result};
 use crate::api::page::{OVERFLOW_FLAG, Page};
 use crate::api::tree::Tree;
+use crate::api::{Durability, Options};
+use crate::disk::wal::{self, Flusher, Op, Record, Wal};
 use crate::util::cache::{Cache, ClockCache};
 use crate::util::hex::hex;
 use bytes::{Buf, BufMut, BytesMut};
@@ -11,12 +13,12 @@ use std::collections::{BinaryHeap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
-use std::ops::Deref;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::{
-    MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
+    MappedRwLockReadGuard, MappedRwLockWriteGuard, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
 
 pub struct File<P: Page> {
@@ -44,6 +46,30 @@ pub struct File<P: Page> {
     /// a page is evicted out from under it, and page reads are positional, so they
     /// only need a shared lock on the file handle.
     ops: Arc<RwLock<()>>,
+
+    /// The write-ahead log: every write is logged here before it returns, and
+    /// modified pages reach the file only through `checkpoint`. See `doc/wal.md`.
+    wal: Arc<Wal>,
+    /// Fsyncs the log in the background, for `Durability::Periodic`.
+    _flusher: Option<Flusher>,
+    /// Pages of overflow regions freed since the last checkpoint. They go back
+    /// to the free list only once a checkpoint has written a tree that no
+    /// longer refers to them: until then the file on disk still does.
+    pending_free: Mutex<Vec<u32>>,
+    /// Pages were written straight to the file (new pages, overflow regions)
+    /// since the last checkpoint, which has to make them durable first.
+    file_dirty: AtomicBool,
+    /// Checkpoint when this many pages are dirty, or the log segment this big.
+    max_dirty: usize,
+    checkpoint_wal_bytes: u64,
+    /// A write or a checkpoint failed half-way. The cache may hold part of a
+    /// change the log does not, so nothing more may be written or checkpointed:
+    /// reopening recovers the last committed state from the file and the log.
+    poisoned: AtomicBool,
+    /// Test hook: fail a checkpoint after writing this many pages in place
+    /// (`usize::MAX`: never).
+    #[cfg(test)]
+    crash_after_pages: std::sync::atomic::AtomicUsize,
 }
 
 const MAGIC: &[u8] = b"YAKVDB42";
@@ -56,7 +82,7 @@ const MAGIC: &[u8] = b"YAKVDB42";
 /// it holds the better. The limit is not allocated up front: a page takes
 /// memory only once it is read or created, so the cache follows the size of
 /// the tree -- a 50 MiB tree costs 50 MiB -- and stops growing here. Use
-/// `make_with_cache`/`open_with_cache` to pick another limit.
+/// `Options::cache_bytes` to pick another limit.
 pub const DEFAULT_CACHE_BYTES: usize = 256 * 1024 * 1024;
 
 /// Upper bound on the tree depth, to report a reference cycle in a corrupted
@@ -99,18 +125,29 @@ struct Head {
 }
 
 impl<P: Page> File<P> {
-    /// Create a new database file, with the default page cache size.
+    /// Create a new database file, with default `Options`.
     pub fn make(path: &Path, page_bytes: u32) -> io::Result<Self> {
-        Self::make_with_cache(path, page_bytes, DEFAULT_CACHE_BYTES)
+        Self::make_with(path, page_bytes, Options::default())
     }
 
-    /// Open an existing database file, with the default page cache size.
+    /// Open an existing database file, with default `Options`.
     pub fn open(path: &Path) -> io::Result<Self> {
-        Self::open_with_cache(path, DEFAULT_CACHE_BYTES)
+        Self::open_with(path, Options::default())
     }
 
-    fn new(file: fs::File, head: Head, cache_bytes: usize) -> Self {
-        let pages = (cache_bytes / head.page_bytes as usize).max(1);
+    fn new(file: fs::File, head: Head, options: &Options, wal: Wal) -> Self {
+        let page_bytes = head.page_bytes as usize;
+        let pages = (options.cache_bytes / page_bytes).max(1);
+        // Dirty pages are pinned in the cache until a checkpoint: keep them to
+        // half of it, so that reads always have room.
+        let max_dirty = (options.checkpoint_dirty_bytes / page_bytes)
+            .min(pages / 2)
+            .max(1);
+        let wal = Arc::new(wal);
+        let flusher = match options.durability {
+            Durability::Periodic(interval) => Some(Flusher::start(wal.clone(), interval)),
+            Durability::Os | Durability::Sync => None,
+        };
         Self {
             file: Arc::new(RwLock::new(file)),
             head,
@@ -118,13 +155,28 @@ impl<P: Page> File<P> {
             dirty: Arc::new(RwLock::new(HashSet::with_capacity(32))),
             empty: Arc::new(RwLock::new(BinaryHeap::with_capacity(32))),
             ops: Arc::new(RwLock::new(())),
+            wal,
+            _flusher: flusher,
+            pending_free: Mutex::new(Vec::new()),
+            file_dirty: AtomicBool::new(false),
+            max_dirty,
+            checkpoint_wal_bytes: options.checkpoint_wal_bytes,
+            poisoned: AtomicBool::new(false),
+            #[cfg(test)]
+            crash_after_pages: std::sync::atomic::AtomicUsize::new(usize::MAX),
         }
     }
 
-    /// Create a new database file whose page cache holds up to `cache_bytes`.
-    pub fn make_with_cache(path: &Path, page_bytes: u32, cache_bytes: usize) -> io::Result<Self> {
+    /// Create a new database file.
+    pub fn make_with(path: &Path, page_bytes: u32, options: Options) -> io::Result<Self> {
         if path.exists() {
             return Err(io::Error::other(format!("File exists: {path:?}")));
+        }
+        // A log without its database belongs to one that was deleted, and
+        // would otherwise be replayed onto this one the next time it opens.
+        let wal_dir = wal_dir(path);
+        if wal_dir.exists() {
+            fs::remove_dir_all(&wal_dir)?;
         }
 
         let mut file = OpenOptions::new()
@@ -148,13 +200,15 @@ impl<P: Page> File<P> {
         buf.put_slice(root.as_ref());
 
         file.write_all(buf.as_ref())?;
-        file.flush()?;
+        file.sync_all()?;
 
-        Ok(Self::new(file, head, cache_bytes))
+        let wal = Wal::create(&wal_dir, 1, 1, options.durability == Durability::Sync)?;
+        Ok(Self::new(file, head, &options, wal))
     }
 
-    /// Open an existing database file whose page cache holds up to `cache_bytes`.
-    pub fn open_with_cache(path: &Path, cache_bytes: usize) -> io::Result<Self> {
+    /// Open an existing database file, recovering it from its log if it was
+    /// not closed cleanly.
+    pub fn open_with(path: &Path, options: Options) -> io::Result<Self> {
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -195,12 +249,41 @@ impl<P: Page> File<P> {
             ));
         }
 
+        // Recovery, first half: put the pages of the last complete checkpoint
+        // back in place, in case a crash interrupted it.
+        let wal_dir = wal_dir(path);
+        let segments = wal::segments(&wal_dir)?;
+        let logs = segments
+            .iter()
+            .map(|(_, path)| fs::read(path))
+            .collect::<io::Result<Vec<_>>>()?;
+        let plan = wal::recovery_plan(&logs);
+        for (id, bytes) in &plan.images {
+            if *id == 0 || bytes.len() != head.page_bytes as usize {
+                return Err(io::Error::other(format!(
+                    "Log page image {id} has {} bytes",
+                    bytes.len()
+                )));
+            }
+            let offset = HEAD as u64 + (*id as u64 - 1) * head.page_bytes as u64;
+            write_at(&file, offset, bytes)?;
+        }
+        if !plan.images.is_empty() {
+            debug!("Recovery: restored {} page images", plan.images.len());
+            file.sync_data()?;
+        }
+        let len = file.metadata()?.len() as usize;
+        file.seek(SeekFrom::Start(HEAD as u64))?;
+
         let mut root = P::reserve(head.page_bytes);
         file.read_exact(root.as_mut())?;
 
-        let this = Self::new(file, head, cache_bytes);
+        let next_segment = segments.last().map(|(id, _)| id + 1).unwrap_or(1);
+        let sync = options.durability == Durability::Sync;
+        let wal = Wal::create(&wal_dir, next_segment, plan.last_lsn + 1, sync)?;
+        let this = Self::new(file, head, &options, wal);
 
-        let _ = this.cache.write().put(ROOT, root);
+        let _ = this.cache.write().put(ROOT, root, |_| false);
 
         let total_pages = (len - HEAD) as u32 / this.head.page_bytes;
         debug!("Processing pages for compaction: {total_pages}");
@@ -231,6 +314,26 @@ impl<P: Page> File<P> {
                 }
                 id += 1;
             }
+        }
+
+        // Recovery, second half: replay what was committed after that
+        // checkpoint, then checkpoint it, which also clears the old segments.
+        if plan.ops.is_empty() {
+            for (_, path) in &segments {
+                fs::remove_file(path)?;
+            }
+            if !segments.is_empty() {
+                wal::sync_dir(&wal_dir)?;
+            }
+        } else {
+            debug!("Recovery: replaying {} records", plan.ops.len());
+            let _op = this.ops.write();
+            for ops in &plan.ops {
+                for op in ops {
+                    this.apply(op).map_err(io::Error::other)?;
+                }
+            }
+            this.checkpoint().map_err(io::Error::other)?;
         }
         Ok(this)
     }
@@ -269,17 +372,7 @@ impl<P: Page> File<P> {
 
     /// Write all of `buf` starting at `offset`: one `pwrite` instead of `seek` + `write`.
     fn write_all_at(&self, offset: u64, buf: &[u8]) -> io::Result<()> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::FileExt;
-            self.file.read().write_all_at(buf, offset)
-        }
-        #[cfg(not(unix))]
-        {
-            let mut file = self.file.write();
-            file.seek(SeekFrom::Start(offset))?;
-            file.write_all(buf)
-        }
+        write_at(&self.file.read(), offset, buf)
     }
 
     fn offset(&self, id: u32) -> usize {
@@ -335,14 +428,12 @@ impl<P: Page> File<P> {
         Tree::dump(self)
     }
 
-    /// Write every page modified so far to disk.
-    ///
-    /// `insert` and `remove` already flush on their own; this is for callers
-    /// that want to force it. It takes the operation lock, unlike the internal
-    /// `Tree::flush`, which assumes the caller is already holding it.
+    /// Make every write so far durable, whatever the `Durability`: flush the
+    /// log and checkpoint, so that the file holds everything and the log is empty.
     pub fn sync(&self) -> Result<()> {
         let _op = self.ops.write();
-        Tree::flush(self)
+        self.writable()?;
+        self.checkpoint()
     }
 
     // ---- Overflow I/O ----
@@ -365,6 +456,7 @@ impl<P: Page> File<P> {
             f.seek(SeekFrom::End(0))?;
             f.write_all(&zeroes)?;
         }
+        self.file_dirty.store(true, Ordering::Relaxed);
         debug!("alloc_overflow: id={id} multiplier={multiplier}");
         Ok(id)
     }
@@ -426,21 +518,14 @@ impl<P: Page> File<P> {
         Ok((key, val))
     }
 
-    /// Free all pages in an overflow region and return them to the free list.
+    /// Free all pages in an overflow region. They are wiped and go back to the
+    /// free list at the next checkpoint: until then the tree on disk may still
+    /// refer to them, and recovery would need them intact.
     fn free_overflow(&self, start_page: u32, multiplier: u32) -> Result<()> {
         debug!("free_overflow: page={start_page} multiplier={multiplier}");
-        for i in 0..multiplier {
-            let page_id = start_page + i;
-            // Write an empty Block header so open() can recognize it as free
-            let empty = P::create(page_id, self.head.page_bytes);
-            let offset = self.offset(page_id) as u64;
-            {
-                let mut f = self.file.write();
-                f.seek(SeekFrom::Start(offset))?;
-                f.write_all(empty.as_ref())?;
-            }
-            self.free_id(page_id);
-        }
+        self.pending_free
+            .lock()
+            .extend(start_page..start_page + multiplier);
         Ok(())
     }
 
@@ -572,63 +657,146 @@ impl<P: Page> File<P> {
     }
 }
 
-impl<P: Page> Store for File<P> {
-    fn lookup(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let _op = self.ops.read();
-        debug!("lookup: {}", hex(key));
-        let mut page = self.root()?;
-        for _ in 0..MAX_DEPTH {
-            let idx_opt = page.ceil(key);
-
-            // When ceil returns None, the search key is greater than all inline keys.
-            // But an overflow entry with a prefix key (shorter than full key) might still
-            // match -- scan overflow entries as a fallback.
-            if idx_opt.is_none() {
-                return self.scan_overflow_entries(&page, key);
-            }
-            let idx = idx_opt.unwrap();
-
-            let slot_opt = page.slot(idx);
-            if slot_opt.is_none() {
-                return Err(Error::Tree(page.id(), format!("Slot not found: {idx}")));
-            }
-            let slot = slot_opt.unwrap();
-
-            if slot.is_leaf() {
-                if slot.is_overflow() {
-                    // Overflow entry: read full key+value from overflow region
-                    let (full_key, full_val) = self.read_overflow(slot.page, slot.multiplier())?;
-                    if key == full_key.as_slice() {
-                        return Ok(Some(full_val));
+impl<P: Page> File<P> {
+    /// Apply `ops` and log them as one record under the operation lock, then
+    /// wait for the commit outside it, so that concurrent writers can share an fsync.
+    fn write(&self, ops: &[Op<'_>]) -> Result<()> {
+        let lsn = {
+            let _op = self.ops.write();
+            self.writable()?;
+            let mut changed = false;
+            for op in ops {
+                match self.apply(op) {
+                    Ok(applied) => changed |= applied,
+                    Err(e) => {
+                        // The cache may now hold part of the change. Keep it
+                        // from ever reaching the file.
+                        self.poisoned.store(true, Ordering::Release);
+                        return Err(e);
                     }
-                    // The ceil'd entry didn't match -- scan other overflow entries
-                    return self.scan_overflow_entries(&page, key);
-                } else {
-                    return if key == page.key(idx) {
-                        Ok(Some(page.val(idx).to_vec()))
-                    } else {
-                        // Also check overflow entries at lower indices
-                        self.scan_overflow_entries(&page, key)
-                    };
                 }
-            } else {
-                let id = page.id();
-                drop(page);
-                let page_opt = self.page(slot.page);
-                if page_opt.is_none() {
-                    return Err(Error::Tree(id, format!("Page not found: {}", slot.page)));
-                }
-                page = page_opt.unwrap();
             }
-        }
-        Err(Error::Tree(
-            page.id(),
-            "Cyclic reference detected".to_string(),
-        ))
+            if !changed {
+                return Ok(());
+            }
+            let lsn = match ops {
+                [op] => self.wal.append(&Record::Op(*op)),
+                _ => self.wal.append(&Record::Batch(ops.to_vec())),
+            };
+            self.maybe_checkpoint()?;
+            lsn
+        };
+        self.wal.commit(lsn)?;
+        Ok(())
     }
 
-    fn insert(&self, key: &[u8], val: &[u8]) -> Result<()> {
-        let _op = self.ops.write();
+    /// Apply one operation to the tree. Returns whether anything changed.
+    fn apply(&self, op: &Op<'_>) -> Result<bool> {
+        match *op {
+            Op::Insert(key, val) => self.insert_locked(key, val).map(|()| true),
+            Op::Remove(key) => self.remove_locked(key),
+        }
+    }
+
+    fn writable(&self) -> Result<()> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(Error::Other(
+                "An earlier write failed half-way: reopen the database to recover".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn maybe_checkpoint(&self) -> Result<()> {
+        let dirty = self.dirty.read().len();
+        if dirty >= self.max_dirty || self.wal.segment_bytes() >= self.checkpoint_wal_bytes {
+            self.checkpoint()?;
+        }
+        Ok(())
+    }
+
+    /// Write every modified page to the file, crash-safely, and start a new
+    /// log segment. The caller holds `ops` exclusively.
+    ///
+    /// The pages go into the log first, and only once that is durable are they
+    /// written in place, so that a crash half-way through the in-place writes
+    /// is repaired on open by writing the images again.
+    fn checkpoint(&self) -> Result<()> {
+        let result = self.checkpoint_inner();
+        if result.is_err() {
+            self.poisoned.store(true, Ordering::Release);
+        }
+        result
+    }
+
+    fn checkpoint_inner(&self) -> Result<()> {
+        let lsn = self.wal.last_lsn();
+        let mut ids = self.dirty.read().iter().copied().collect::<Vec<_>>();
+        // ascending page ids make the writes as sequential as the tree allows
+        ids.sort_unstable();
+        let freed = std::mem::take(&mut *self.pending_free.lock());
+        debug!(
+            "checkpoint: lsn={lsn} pages={} freed={}",
+            ids.len(),
+            freed.len()
+        );
+
+        // New pages and overflow regions went straight to the file: they must
+        // be durable before any image that refers to them is.
+        if self.file_dirty.swap(false, Ordering::Relaxed) {
+            self.file.read().sync_data()?;
+        }
+
+        for &id in &ids {
+            let page = self.try_page(id)?;
+            self.wal.append(&Record::Page {
+                id,
+                bytes: page.as_ref(),
+            });
+        }
+        self.wal.append(&Record::Checkpoint {
+            lsn,
+            pages: ids.len() as u32,
+        });
+        self.wal.flush_all(true)?;
+
+        for &id in &ids {
+            #[cfg(test)]
+            self.crash_point()?;
+            let page = self.try_page(id)?;
+            self.save(&page)?;
+        }
+        // Nothing on disk refers to the freed pages any more: wipe them, so
+        // that `open` finds them empty.
+        for &id in &freed {
+            self.save(&P::create(id, self.head.page_bytes))?;
+        }
+        self.file.read().sync_data()?;
+
+        self.dirty.write().clear();
+        for id in freed {
+            self.free_id(id);
+        }
+        self.wal.rotate()?;
+        Ok(())
+    }
+
+    /// Counts down the pages `crash_after_pages` lets through, then fails.
+    #[cfg(test)]
+    fn crash_point(&self) -> Result<()> {
+        match self.crash_after_pages.load(Ordering::Relaxed) {
+            usize::MAX => Ok(()),
+            0 => Err(Error::Other("Injected crash".to_string())),
+            left => {
+                self.crash_after_pages.store(left - 1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+    }
+
+    /// `insert` without the locking, logging and commit: the caller holds
+    /// `ops` exclusively.
+    fn insert_locked(&self, key: &[u8], val: &[u8]) -> Result<()> {
         debug!("insert: {} -> {}", hex(key), hex(val));
         // Walk down through read guards: a page is taken mutably -- and so
         // marked dirty and written out by the next flush -- only once it is
@@ -649,7 +817,6 @@ impl<P: Page> Store for File<P> {
                 if page.len() == 0 {
                     drop(page);
                     self.put_leaf(id, key, val)?;
-                    self.flush()?;
                     return Ok(());
                 }
                 let idx = page.ceil(key).unwrap_or_else(|| page.len() - 1);
@@ -690,7 +857,6 @@ impl<P: Page> Store for File<P> {
                     }
                 }
 
-                self.flush()?;
                 return Ok(());
             }
 
@@ -699,8 +865,9 @@ impl<P: Page> Store for File<P> {
         }
     }
 
-    fn remove(&self, key: &[u8]) -> Result<()> {
-        let _op = self.ops.write();
+    /// `remove` without the locking, logging and commit: the caller holds
+    /// `ops` exclusively. Returns whether the key was there.
+    fn remove_locked(&self, key: &[u8]) -> Result<bool> {
         debug!("remove: {}", hex(key));
         // Read guards on the way down, as in `insert`: a key that is not there
         // leaves every page clean.
@@ -728,9 +895,9 @@ impl<P: Page> Store for File<P> {
                         self.update_parent_ref(parent_id, idx, page_id, max_opt)?;
                         page_id = parent_id;
                     }
-                    self.flush()?;
+                    return Ok(true);
                 }
-                return Ok(());
+                return Ok(false);
             }
             let idx = idx_opt.unwrap();
 
@@ -766,7 +933,7 @@ impl<P: Page> Store for File<P> {
 
             let (idx, overflow) = match target {
                 Some(target) => target,
-                None => return Ok(()), // not found
+                None => return Ok(false), // not found
             };
             debug!("remove: key={} page={} idx={}", hex(key), id, idx);
             self.try_page_mut(id)?.remove(idx);
@@ -847,9 +1014,76 @@ impl<P: Page> Store for File<P> {
                 page_id = parent_id;
             }
 
-            self.flush()?;
-            return Ok(());
+            return Ok(true);
         }
+    }
+}
+
+impl<P: Page> Store for File<P> {
+    fn lookup(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let _op = self.ops.read();
+        debug!("lookup: {}", hex(key));
+        let mut page = self.root()?;
+        for _ in 0..MAX_DEPTH {
+            let idx_opt = page.ceil(key);
+
+            // When ceil returns None, the search key is greater than all inline keys.
+            // But an overflow entry with a prefix key (shorter than full key) might still
+            // match -- scan overflow entries as a fallback.
+            if idx_opt.is_none() {
+                return self.scan_overflow_entries(&page, key);
+            }
+            let idx = idx_opt.unwrap();
+
+            let slot_opt = page.slot(idx);
+            if slot_opt.is_none() {
+                return Err(Error::Tree(page.id(), format!("Slot not found: {idx}")));
+            }
+            let slot = slot_opt.unwrap();
+
+            if slot.is_leaf() {
+                if slot.is_overflow() {
+                    // Overflow entry: read full key+value from overflow region
+                    let (full_key, full_val) = self.read_overflow(slot.page, slot.multiplier())?;
+                    if key == full_key.as_slice() {
+                        return Ok(Some(full_val));
+                    }
+                    // The ceil'd entry didn't match -- scan other overflow entries
+                    return self.scan_overflow_entries(&page, key);
+                } else {
+                    return if key == page.key(idx) {
+                        Ok(Some(page.val(idx).to_vec()))
+                    } else {
+                        // Also check overflow entries at lower indices
+                        self.scan_overflow_entries(&page, key)
+                    };
+                }
+            } else {
+                let id = page.id();
+                drop(page);
+                let page_opt = self.page(slot.page);
+                if page_opt.is_none() {
+                    return Err(Error::Tree(id, format!("Page not found: {}", slot.page)));
+                }
+                page = page_opt.unwrap();
+            }
+        }
+        Err(Error::Tree(
+            page.id(),
+            "Cyclic reference detected".to_string(),
+        ))
+    }
+
+    fn insert(&self, key: &[u8], val: &[u8]) -> Result<()> {
+        self.write(&[Op::Insert(key, val)])
+    }
+
+    fn remove(&self, key: &[u8]) -> Result<()> {
+        self.write(&[Op::Remove(key)])
+    }
+
+    fn write_batch(&self, ops: &[Op<'_>]) -> Result<()> {
+        self.write(ops)
     }
 
     fn is_empty(&self) -> bool {
@@ -1082,16 +1316,19 @@ impl<P: Page> Tree<P> for File<P> {
         let has_id = self.cache.read().has(&id);
         if !has_id {
             let page = self.load(self.offset(id), self.head.page_bytes)?;
-            let evicted = self.cache.write().put(id, page);
-            // An evicted page may still hold unflushed changes: write it back
-            // rather than dropping it, otherwise the modification is lost and a
-            // later read silently resurrects the stale on-disk version.
-            if let Some((evicted_id, evicted_page)) = evicted {
-                let was_dirty = self.dirty.write().remove(&evicted_id);
-                if was_dirty {
-                    debug!("Writing back dirty page {evicted_id} on eviction");
-                    self.save(&evicted_page)?;
-                }
+            // Dirty pages are pinned: one written in place before a checkpoint
+            // could leave the file half-updated after a crash, beyond what
+            // the log can repair.
+            let evicted = {
+                let dirty = self.dirty.read();
+                self.cache.write().put(id, page, |id| dirty.contains(id))
+            };
+            if let Some((evicted_id, evicted_page)) = evicted
+                && self.dirty.write().remove(&evicted_id)
+            {
+                // Cannot happen with the pin above; losing the change would be worse.
+                error!("Dirty page {evicted_id} evicted: writing it back");
+                self.save(&evicted_page)?;
             }
         }
         Ok(())
@@ -1099,34 +1336,6 @@ impl<P: Page> Tree<P> for File<P> {
 
     fn mark(&self, id: u32) {
         self.dirty.write().insert(id);
-    }
-
-    fn flush(&self) -> crate::api::error::Result<()> {
-        let mut pages = self.dirty.write().drain().collect::<Vec<_>>();
-        // ascending page ids make the writes as sequential as the tree allows
-        pages.sort_unstable();
-
-        let mut failed = vec![];
-        for id in pages {
-            if let Some(page) = self.page(id) {
-                self.save(page.deref())?;
-                debug!("flush: page={id}");
-            } else {
-                failed.push(id);
-                error!("flush: no such page={id}");
-            }
-        }
-
-        if failed.is_empty() {
-            Ok(())
-        } else {
-            let pages = failed
-                .into_iter()
-                .map(|id| format!("{id}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            Err(Error::Other(format!("Missing pages: {pages}")))
-        }
     }
 
     fn next_id(&self) -> Result<u32> {
@@ -1147,6 +1356,7 @@ impl<P: Page> Tree<P> for File<P> {
             f.seek(SeekFrom::End(0))?;
             f.write_all(page.as_ref())?;
         }
+        self.file_dirty.store(true, Ordering::Relaxed);
 
         Ok(id)
     }
@@ -1453,6 +1663,42 @@ impl<P: Page> Tree<P> for File<P> {
         let mut acc = String::with_capacity(1024);
         dump_page(self, ROOT, 0, &mut acc, "".to_string(), "\t".to_string());
         acc
+    }
+}
+
+impl<P: Page> Drop for File<P> {
+    /// Checkpoint on close, leaving the log empty and the next open quick.
+    /// Skipped after a failed write: then the next open recovers instead.
+    fn drop(&mut self) {
+        if self.poisoned.load(Ordering::Acquire) {
+            return;
+        }
+        let _op = self.ops.write();
+        if let Err(e) = self.checkpoint() {
+            error!("Checkpoint on close failed: {e}");
+        }
+    }
+}
+
+/// The log of the database at `path`: the directory `<path>.wal`.
+fn wal_dir(path: &Path) -> PathBuf {
+    let mut dir = path.as_os_str().to_owned();
+    dir.push(".wal");
+    PathBuf::from(dir)
+}
+
+/// Write all of `buf` at `offset` without moving the file position (on unix).
+fn write_at(file: &fs::File, offset: u64, buf: &[u8]) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.write_all_at(buf, offset)
+    }
+    #[cfg(not(unix))]
+    {
+        let mut file = file;
+        file.seek(SeekFrom::Start(offset))?;
+        file.write_all(buf)
     }
 }
 
@@ -3184,8 +3430,15 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(11);
         let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
         {
-            let file: File<Block> =
-                File::make_with_cache(path, page_bytes, 4 * page_bytes as usize).unwrap();
+            let file: File<Block> = File::make_with(
+                path,
+                page_bytes,
+                Options {
+                    cache_bytes: 64 * page_bytes as usize,
+                    ..Options::default()
+                },
+            )
+            .unwrap();
             for i in 0..5_000 {
                 let key = format!("{:05}", rng.gen_range(0..1_500)).into_bytes();
                 if rng.gen_bool(0.7) {
@@ -3226,5 +3479,393 @@ mod tests {
         assert_eq!(keys, model.keys().cloned().collect::<Vec<_>>());
 
         fs::remove_file(path).unwrap();
+    }
+
+    // ---- write-ahead log and recovery ----
+
+    type Model = std::collections::BTreeMap<Vec<u8>, Vec<u8>>;
+
+    fn fresh(name: &str) -> PathBuf {
+        let path = PathBuf::from(format!("target/{name}.tmp"));
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(wal_dir(&path));
+        path
+    }
+
+    fn cleanup(path: &Path) {
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir_all(wal_dir(path));
+    }
+
+    /// Leave the file and its log exactly as a killed process would: no
+    /// checkpoint on close, nothing flushed beyond what was committed.
+    fn crash<P: Page>(file: File<P>) {
+        std::mem::forget(file);
+    }
+
+    fn assert_matches(file: &File<Block>, model: &Model) {
+        for (key, val) in model.iter() {
+            assert_eq!(
+                file.lookup(key).unwrap().as_ref(),
+                Some(val),
+                "key={}",
+                hex(key)
+            );
+        }
+        let mut keys = Vec::with_capacity(model.len());
+        let mut next = file.min().unwrap();
+        while let Some(key) = next {
+            next = file.above(&key).unwrap();
+            keys.push(key);
+        }
+        assert_eq!(keys, model.keys().cloned().collect::<Vec<_>>());
+    }
+
+    /// Inserts, some big enough for overflow pages, replacements and removes.
+    fn workload(file: &File<Block>, model: &mut Model, seed: u64, n: usize) {
+        use rand::Rng;
+        let mut rng = StdRng::seed_from_u64(seed);
+        for i in 0..n {
+            let key = format!("{:05}", rng.gen_range(0..n as u32)).into_bytes();
+            if rng.gen_bool(0.75) {
+                let len = if rng.gen_bool(0.05) {
+                    700
+                } else {
+                    rng.gen_range(1..60)
+                };
+                let val = vec![(i % 251) as u8; len];
+                file.insert(&key, &val).unwrap();
+                model.insert(key, val);
+            } else {
+                file.remove(&key).unwrap();
+                model.remove(&key);
+            }
+        }
+    }
+
+    #[test]
+    fn test_recovery_replays_log_after_crash() {
+        let path = fresh("test_recovery_replays_log_after_crash");
+        let mut model = Model::new();
+        {
+            let file: File<Block> = File::make(&path, 256).unwrap();
+            workload(&file, &mut model, 1, 2_000);
+            crash(file);
+        }
+
+        let file: File<Block> = File::open(&path).unwrap();
+        assert_matches(&file, &model);
+        // recovery checkpointed what it replayed: only a fresh segment is left
+        assert_eq!(wal::segments(&wal_dir(&path)).unwrap().len(), 1);
+
+        // and the database carries on normally after it
+        workload(&file, &mut model, 2, 500);
+        drop(file);
+        let file: File<Block> = File::open(&path).unwrap();
+        assert_matches(&file, &model);
+        drop(file);
+        cleanup(&path);
+    }
+
+    /// A crash after the page images are durable but part-way through writing
+    /// the pages in place: every stopping point must recover the same state.
+    #[test]
+    fn test_recovery_from_crash_mid_checkpoint() {
+        for crash_after in [0, 1, 2, 5, 10, 25] {
+            let path = fresh(&format!("test_recovery_mid_checkpoint_{crash_after}"));
+            let mut model = Model::new();
+            {
+                let file: File<Block> = File::make(&path, 256).unwrap();
+                workload(&file, &mut model, 3, 600);
+                file.sync().unwrap();
+                workload(&file, &mut model, 4, 600);
+                let dirty = file.dirty.read().len();
+                assert!(dirty > 25, "only {dirty} dirty pages");
+
+                file.crash_after_pages
+                    .store(crash_after, std::sync::atomic::Ordering::Relaxed);
+                assert!(file.sync().is_err());
+                assert!(
+                    file.insert(b"after", b"crash").is_err(),
+                    "a failed checkpoint must stop further writes"
+                );
+                crash(file);
+            }
+
+            let file: File<Block> = File::open(&path).unwrap();
+            assert_matches(&file, &model);
+            drop(file);
+            cleanup(&path);
+        }
+    }
+
+    /// Cut the log at many points, as a power loss can: every cut must recover
+    /// exactly the operations whose records were complete before it.
+    #[test]
+    fn test_recovery_from_torn_log() {
+        let path = fresh("test_recovery_from_torn_log");
+        let mut snapshots = vec![Model::new()];
+        {
+            let file: File<Block> = File::make(&path, 256).unwrap();
+            let mut model = Model::new();
+            for i in 0..120u32 {
+                let lsn = file.wal.last_lsn();
+                let key = format!("{:03}", i % 70).into_bytes();
+                if i % 5 == 4 {
+                    file.remove(&key).unwrap();
+                    model.remove(&key);
+                } else {
+                    let val = vec![i as u8; if i % 17 == 0 { 600 } else { 20 }];
+                    file.insert(&key, &val).unwrap();
+                    model.insert(key, val);
+                }
+                // removing a missing key logs nothing: one snapshot per record
+                if file.wal.last_lsn() != lsn {
+                    snapshots.push(model.clone());
+                }
+            }
+            crash(file);
+        }
+
+        let segments = wal::segments(&wal_dir(&path)).unwrap();
+        assert_eq!(segments.len(), 1);
+        let log = fs::read(&segments[0].1).unwrap();
+        let db = fs::read(&path).unwrap();
+
+        for cut in (0..log.len()).step_by(97).chain([log.len()]) {
+            let copy = fresh("test_recovery_from_torn_log_copy");
+            fs::write(&copy, &db).unwrap();
+            fs::create_dir_all(wal_dir(&copy)).unwrap();
+            fs::write(wal::segment_path(&wal_dir(&copy), 1), &log[..cut]).unwrap();
+
+            let complete = wal::frames(&log[..cut]).count();
+            let file: File<Block> = File::open(&copy).unwrap();
+            assert_matches(&file, &snapshots[complete]);
+            drop(file);
+            cleanup(&copy);
+        }
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_write_batch_is_one_record() {
+        let path = fresh("test_write_batch_is_one_record");
+        {
+            let file: File<Block> = File::make(&path, 256).unwrap();
+            file.insert(b"b", b"old").unwrap();
+            let before = file.wal.last_lsn();
+            file.write_batch(&[
+                Op::Insert(b"a", b"1"),
+                Op::Remove(b"b"),
+                Op::Insert(b"c", b"3"),
+            ])
+            .unwrap();
+            assert_eq!(file.wal.last_lsn(), before + 1);
+            crash(file);
+        }
+        let file: File<Block> = File::open(&path).unwrap();
+        let model = Model::from([
+            (b"a".to_vec(), b"1".to_vec()),
+            (b"c".to_vec(), b"3".to_vec()),
+        ]);
+        assert_matches(&file, &model);
+        drop(file);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_removing_missing_key_logs_nothing() {
+        let path = fresh("test_removing_missing_key_logs_nothing");
+        let file: File<Block> = File::make(&path, 256).unwrap();
+        file.insert(b"a", b"1").unwrap();
+        let lsn = file.wal.last_lsn();
+        file.remove(b"missing").unwrap();
+        assert_eq!(file.wal.last_lsn(), lsn);
+        assert!(
+            file.dirty.read().len() <= 1,
+            "only the root, from the insert"
+        );
+        drop(file);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_sync_durability_shares_fsyncs() {
+        let path = fresh("test_sync_durability_shares_fsyncs");
+        let options = Options {
+            durability: Durability::Sync,
+            ..Options::default()
+        };
+        let threads = 8;
+        let per_thread = 25;
+        {
+            let file = Arc::new(File::<Block>::make_with(&path, 256, options.clone()).unwrap());
+            let handles = (0..threads)
+                .map(|t| {
+                    let file = file.clone();
+                    std::thread::spawn(move || {
+                        for i in 0..per_thread {
+                            let key = format!("{t}-{i:03}");
+                            file.insert(key.as_bytes(), b"v").unwrap();
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+            let syncs = file.wal.syncs();
+            assert!(syncs >= 1);
+            assert!(
+                syncs < (threads * per_thread) as u64,
+                "{syncs} fsyncs for {} commits: none were shared",
+                threads * per_thread
+            );
+            // every commit returned only once fsynced: all of it survives
+            crash(Arc::try_unwrap(file).ok().unwrap());
+        }
+        let file: File<Block> = File::open_with(&path, options).unwrap();
+        let mut model = Model::new();
+        for t in 0..threads {
+            for i in 0..per_thread {
+                model.insert(format!("{t}-{i:03}").into_bytes(), b"v".to_vec());
+            }
+        }
+        assert_matches(&file, &model);
+        drop(file);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_periodic_durability_fsyncs_in_background() {
+        let path = fresh("test_periodic_durability_fsyncs_in_background");
+        let options = Options {
+            durability: Durability::Periodic(std::time::Duration::from_millis(5)),
+            ..Options::default()
+        };
+        let file: File<Block> = File::make_with(&path, 256, options).unwrap();
+        file.insert(b"a", b"1").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while file.wal.syncs() == 0 {
+            assert!(std::time::Instant::now() < deadline, "never fsynced");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        drop(file);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_make_discards_stale_log() {
+        let path = fresh("test_make_discards_stale_log");
+        {
+            let file: File<Block> = File::make(&path, 256).unwrap();
+            file.insert(b"stale", b"value").unwrap();
+            crash(file);
+        }
+        fs::remove_file(&path).unwrap();
+
+        let file: File<Block> = File::make(&path, 256).unwrap();
+        drop(file);
+        let file: File<Block> = File::open(&path).unwrap();
+        assert!(file.is_empty());
+        drop(file);
+        cleanup(&path);
+    }
+
+    /// Replacing an overflow value frees the old region. It must stay intact
+    /// until a checkpoint: if a power loss takes the replacement's record
+    /// from the log, the tree on disk still points at the old region.
+    #[test]
+    fn test_freed_overflow_survives_until_checkpoint() {
+        let path = fresh("test_freed_overflow_survives_until_checkpoint");
+        let old = vec![1u8; 2_000];
+        let new = vec![2u8; 3_000];
+        {
+            let file: File<Block> = File::make(&path, 256).unwrap();
+            file.insert(b"big", &old).unwrap();
+            file.sync().unwrap();
+            file.insert(b"big", &new).unwrap();
+            assert!(!file.pending_free.lock().is_empty());
+            crash(file);
+        }
+
+        // lose the replacement's record, as an unsynced write can be lost
+        let segments = wal::segments(&wal_dir(&path)).unwrap();
+        let (_, segment) = segments.last().unwrap();
+        let log = fs::read(segment).unwrap();
+        assert_eq!(wal::frames(&log).count(), 1);
+        fs::write(segment, b"").unwrap();
+
+        let file: File<Block> = File::open(&path).unwrap();
+        assert_eq!(file.lookup(b"big").unwrap(), Some(old));
+        drop(file);
+        cleanup(&path);
+    }
+
+    /// With a cache of a few dozen pages, checkpoints are frequent and clean
+    /// pages are evicted all the time: dirty ones must never reach the file
+    /// between checkpoints, or replaying the log on top of them breaks the tree.
+    #[test]
+    fn test_recovery_with_small_cache() {
+        let path = fresh("test_recovery_with_small_cache");
+        let options = Options {
+            cache_bytes: 32 * 256,
+            ..Options::default()
+        };
+        let mut model = Model::new();
+        {
+            let file: File<Block> = File::make_with(&path, 256, options.clone()).unwrap();
+            workload(&file, &mut model, 5, 1_500);
+            crash(file);
+        }
+        let file: File<Block> = File::open_with(&path, options).unwrap();
+        assert_matches(&file, &model);
+        drop(file);
+        cleanup(&path);
+    }
+
+    /// Between checkpoints no page already in the file may change, however
+    /// hard the cache is churned: only appended pages are new. A dirty page
+    /// evicted and written back in place would break that, and with it what
+    /// recovery assumes about the file.
+    #[test]
+    fn test_no_page_written_in_place_between_checkpoints() {
+        let path = fresh("test_no_page_written_in_place_between_checkpoints");
+        let options = Options {
+            cache_bytes: 32 * 256,
+            ..Options::default()
+        };
+        let file: File<Block> = File::make_with(&path, 256, options).unwrap();
+        let mut model = Model::new();
+        workload(&file, &mut model, 6, 400);
+        file.sync().unwrap();
+        let segment = wal::segments(&wal_dir(&path)).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        for i in 0..4u8 {
+            let key = format!("{:05}", 90_000 + i as u32).into_bytes();
+            file.insert(&key, &[i; 40]).unwrap();
+            model.insert(key, vec![i; 40]);
+            for key in model.keys() {
+                file.lookup(key).unwrap();
+            }
+        }
+        assert!(!file.dirty.read().is_empty());
+        assert_eq!(
+            wal::segments(&wal_dir(&path)).unwrap(),
+            segment,
+            "a checkpoint ran: the test needs fewer writes"
+        );
+
+        let after = fs::read(&path).unwrap();
+        assert!(after.len() >= before.len());
+        let changed = (0..before.len() / 256)
+            .filter(|i| before[i * 256..(i + 1) * 256] != after[i * 256..(i + 1) * 256])
+            .count();
+        assert_eq!(changed, 0, "{changed} blocks of the file changed in place");
+
+        assert_matches(&file, &model);
+        drop(file);
+        cleanup(&path);
     }
 }

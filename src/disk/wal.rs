@@ -15,9 +15,15 @@
 //! that is the torn tail of the last write before a crash, and nothing after it
 //! was ever acknowledged.
 
+use log::{debug, error};
+use parking_lot::{Condvar, Mutex, MutexGuard};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 const INSERT: u8 = 1;
 const REMOVE: u8 = 2;
@@ -173,6 +179,7 @@ fn decode_op<'a>(kind: u8, r: &mut Reader<'a>) -> Option<Op<'a>> {
 
 /// The intact frames at the start of `buf`, in order, up to the first torn or
 /// corrupted one.
+#[cfg(test)]
 pub(crate) fn frames(buf: &[u8]) -> impl Iterator<Item = Frame<'_>> {
     let mut pos = 0;
     std::iter::from_fn(move || {
@@ -184,6 +191,7 @@ pub(crate) fn frames(buf: &[u8]) -> impl Iterator<Item = Frame<'_>> {
 
 /// Length of the intact prefix of `buf`: where the next frame should go when
 /// appending to a segment whose tail may be torn.
+#[cfg(test)]
 pub(crate) fn valid_len(buf: &[u8]) -> usize {
     let mut pos = 0;
     while let Some((_, len)) = decode(&buf[pos..]) {
@@ -221,32 +229,12 @@ fn put_u32(buf: &mut Vec<u8>, val: u32) {
     buf.extend_from_slice(&val.to_be_bytes());
 }
 
-/// CRC-32C (Castagnoli), table-driven.
+/// CRC-32C (Castagnoli), with the CPU's CRC instructions where there are any.
+///
+/// Every page image a checkpoint logs goes through this, so a byte-at-a-time
+/// table was the single biggest cost of a checkpoint.
 fn crc32c(data: &[u8]) -> u32 {
-    const TABLE: [u32; 256] = {
-        let mut table = [0u32; 256];
-        let mut i = 0;
-        while i < 256 {
-            let mut crc = i as u32;
-            let mut bit = 0;
-            while bit < 8 {
-                crc = if crc & 1 != 0 {
-                    (crc >> 1) ^ 0x82F6_3B78
-                } else {
-                    crc >> 1
-                };
-                bit += 1;
-            }
-            table[i] = crc;
-            i += 1;
-        }
-        table
-    };
-    let mut crc = !0u32;
-    for &byte in data {
-        crc = TABLE[((crc ^ byte as u32) & 0xFF) as usize] ^ (crc >> 8);
-    }
-    !crc
+    crc32c::crc32c(data)
 }
 
 /// The segments in `dir`, ordered by id. A missing directory has none.
@@ -283,18 +271,16 @@ pub(crate) struct Segment {
 }
 
 impl Segment {
-    /// Create segment `id` in `dir`, which is created if missing. The segment
-    /// and the directory entry pointing at it are synced before this returns,
-    /// so that a later `sync_data` of the segment is enough to make its frames
-    /// durable.
+    /// Create segment `id` in `dir`, which is created if missing.
+    ///
+    /// The caller syncs `dir` before relying on the segment: `sync_data` of
+    /// the segment makes its contents durable, but not the entry naming it.
     pub(crate) fn create(dir: &Path, id: u64) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
         let file = OpenOptions::new()
             .create_new(true)
             .append(true)
             .open(segment_path(dir, id))?;
-        file.sync_all()?;
-        sync_dir(dir)?;
         Ok(Self { id, file })
     }
 
@@ -302,10 +288,318 @@ impl Segment {
         self.id
     }
 
-    /// Append `frames` (whole encoded frames) and make them durable.
-    pub(crate) fn append(&mut self, frames: &[u8]) -> io::Result<()> {
-        self.file.write_all(frames)?;
+    /// Append `frames`, whole encoded frames, handing them to the OS.
+    pub(crate) fn write_all(&mut self, frames: &[u8]) -> io::Result<()> {
+        self.file.write_all(frames)
+    }
+
+    /// Make everything written so far durable.
+    pub(crate) fn sync(&mut self) -> io::Result<()> {
         self.file.sync_data()
+    }
+}
+
+/// What `open` has to do to bring a database back to its last committed state.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Plan<'a> {
+    /// Page images of the last complete checkpoint, to write in place.
+    pub(crate) images: Vec<(u32, &'a [u8])>,
+    /// Operations logged after that checkpoint, to replay in order; each
+    /// entry is one record, applied atomically.
+    pub(crate) ops: Vec<Vec<Op<'a>>>,
+    /// The highest LSN seen, so that new records continue after it.
+    pub(crate) last_lsn: u64,
+}
+
+/// Work out recovery from the contents of the segments, in segment order.
+///
+/// Reading stops at the first torn or corrupted frame, and ignores every
+/// segment after it: a segment is only started by a checkpoint, after the
+/// previous one was fsynced whole, so a later segment cannot legitimately
+/// follow a torn one.
+pub(crate) fn recovery_plan(segments: &[Vec<u8>]) -> Plan<'_> {
+    let mut all = vec![];
+    for buf in segments {
+        let mut pos = 0;
+        while let Some((frame, len)) = decode(&buf[pos..]) {
+            pos += len;
+            all.push(frame);
+        }
+        if pos < buf.len() {
+            break;
+        }
+    }
+
+    // The last CHECKPOINT whose page images all made it: the `pages` frames
+    // right before it must be exactly its PAGE frames.
+    let mut start = 0;
+    let mut images = vec![];
+    let mut checkpoint_lsn = 0;
+    for (idx, frame) in all.iter().enumerate() {
+        if let Record::Checkpoint { lsn, pages } = frame.record {
+            let pages = pages as usize;
+            let complete = idx >= pages
+                && all[idx - pages..idx]
+                    .iter()
+                    .all(|frame| matches!(frame.record, Record::Page { .. }));
+            if complete {
+                images = all[idx - pages..idx]
+                    .iter()
+                    .filter_map(|frame| match frame.record {
+                        Record::Page { id, bytes } => Some((id, bytes)),
+                        _ => None,
+                    })
+                    .collect();
+                start = idx + 1;
+                checkpoint_lsn = lsn;
+            }
+        }
+    }
+
+    let ops = all[start..]
+        .iter()
+        .filter(|frame| frame.lsn > checkpoint_lsn)
+        .filter_map(|frame| match &frame.record {
+            Record::Op(op) => Some(vec![*op]),
+            Record::Batch(ops) => Some(ops.clone()),
+            // images of a checkpoint that did not complete
+            Record::Page { .. } | Record::Checkpoint { .. } => None,
+        })
+        .collect();
+
+    Plan {
+        images,
+        ops,
+        last_lsn: all.iter().map(|frame| frame.lsn).max().unwrap_or(0),
+    }
+}
+
+struct State {
+    /// Frames appended since the last write, and a spare buffer swapped in
+    /// when a leader takes `buf`, so that neither is reallocated every time.
+    buf: Vec<u8>,
+    spare: Vec<u8>,
+    next_lsn: u64,
+    /// LSN of the last record appended, written to the OS, and fsynced.
+    appended: u64,
+    written: u64,
+    synced: u64,
+    /// A leader is writing or syncing: others wait for it instead of starting their own.
+    flushing: bool,
+    /// A write or sync failed. The segment may now end in a torn frame, and
+    /// frames appended after it would be unreachable on recovery, so the log
+    /// refuses everything from here on.
+    failed: bool,
+    /// Bytes appended to the current segment, buffered or not.
+    segment_bytes: u64,
+}
+
+/// The write-ahead log of an open database, with group commit.
+///
+/// Writers `append` a record while holding the database's operation lock,
+/// which keeps log order the same as apply order, then release that lock and
+/// wait in `flush` for their record to be written (and, if asked, fsynced).
+/// The first to arrive while nothing is in flight becomes the leader: it takes
+/// everything appended so far and writes it with a single write and a single
+/// fsync, on behalf of every writer waiting at that moment.
+pub(crate) struct Wal {
+    dir: PathBuf,
+    sync_on_commit: bool,
+    state: Mutex<State>,
+    cond: Condvar,
+    /// Only ever locked by a leader or by `rotate`, so never contended by writers.
+    segment: Mutex<Segment>,
+    syncs: AtomicU64,
+}
+
+impl Wal {
+    /// Start a log in `dir` at a new segment `segment_id`, numbering records from `next_lsn`.
+    ///
+    /// `sync_on_commit` decides what `commit` waits for: the fsync, or only the
+    /// write to the OS.
+    pub(crate) fn create(
+        dir: &Path,
+        segment_id: u64,
+        next_lsn: u64,
+        sync_on_commit: bool,
+    ) -> io::Result<Self> {
+        let segment = Segment::create(dir, segment_id)?;
+        sync_dir(dir)?;
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            sync_on_commit,
+            state: Mutex::new(State {
+                buf: Vec::with_capacity(64 * 1024),
+                spare: Vec::with_capacity(64 * 1024),
+                next_lsn,
+                appended: next_lsn - 1,
+                written: next_lsn - 1,
+                synced: next_lsn - 1,
+                flushing: false,
+                failed: false,
+                segment_bytes: 0,
+            }),
+            cond: Condvar::new(),
+            segment: Mutex::new(segment),
+            syncs: AtomicU64::new(0),
+        })
+    }
+
+    /// Buffer `record` and return its LSN. Nothing is written until a `flush`.
+    pub(crate) fn append(&self, record: &Record<'_>) -> u64 {
+        let mut st = self.state.lock();
+        let lsn = st.next_lsn;
+        st.next_lsn += 1;
+        let before = st.buf.len();
+        encode(&mut st.buf, lsn, record);
+        st.segment_bytes += (st.buf.len() - before) as u64;
+        st.appended = lsn;
+        lsn
+    }
+
+    /// Wait until record `lsn` is as durable as this log promises on commit.
+    pub(crate) fn commit(&self, lsn: u64) -> io::Result<()> {
+        self.flush(lsn, self.sync_on_commit)
+    }
+
+    /// Write, and if `sync` also fsync, everything appended so far.
+    pub(crate) fn flush_all(&self, sync: bool) -> io::Result<()> {
+        let lsn = self.state.lock().appended;
+        self.flush(lsn, sync)
+    }
+
+    /// Wait until record `lsn` is written, or fsynced if `sync`, leading the
+    /// flush if no one else is.
+    pub(crate) fn flush(&self, lsn: u64, sync: bool) -> io::Result<()> {
+        let mut st = self.state.lock();
+        loop {
+            let done = if sync { st.synced } else { st.written };
+            if done >= lsn {
+                return Ok(());
+            }
+            if st.failed {
+                return Err(io::Error::other(
+                    "the write-ahead log failed earlier and accepts no more writes",
+                ));
+            }
+            if st.flushing {
+                self.cond.wait(&mut st);
+                continue;
+            }
+
+            // Lead: take everything appended so far, write it with the lock released.
+            st.flushing = true;
+            let upto = st.appended;
+            let spare = std::mem::take(&mut st.spare);
+            let mut batch = std::mem::replace(&mut st.buf, spare);
+            let res = MutexGuard::unlocked(&mut st, || -> io::Result<()> {
+                let mut segment = self.segment.lock();
+                if !batch.is_empty() {
+                    segment.write_all(&batch)?;
+                }
+                if sync {
+                    segment.sync()?;
+                    self.syncs.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(())
+            });
+            batch.clear();
+            st.spare = batch;
+            st.flushing = false;
+            self.cond.notify_all();
+            match res {
+                Ok(()) => {
+                    st.written = upto;
+                    if sync {
+                        st.synced = upto;
+                    }
+                }
+                Err(e) => {
+                    error!("WAL write failed: {e}");
+                    st.failed = true;
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    /// LSN of the last record appended.
+    pub(crate) fn last_lsn(&self) -> u64 {
+        self.state.lock().appended
+    }
+
+    /// Bytes appended to the current segment.
+    pub(crate) fn segment_bytes(&self) -> u64 {
+        self.state.lock().segment_bytes
+    }
+
+    /// Number of fsyncs of the log so far.
+    #[cfg(test)]
+    pub(crate) fn syncs(&self) -> u64 {
+        self.syncs.load(Ordering::Relaxed)
+    }
+
+    /// Start the next segment and delete the ones before it, with a single
+    /// directory sync for both.
+    ///
+    /// Only for a checkpoint, once it has made the tree file durable: nothing
+    /// in the older segments is needed after that, so losing them to a crash
+    /// before the sync is harmless. The caller must have flushed everything
+    /// appended, and must keep new appends out meanwhile.
+    pub(crate) fn rotate(&self) -> io::Result<()> {
+        let old = {
+            let mut segment = self.segment.lock();
+            let old = segment.id();
+            *segment = Segment::create(&self.dir, old + 1)?;
+            old
+        };
+        self.state.lock().segment_bytes = 0;
+        for (id, path) in segments(&self.dir)? {
+            if id <= old {
+                fs::remove_file(path)?;
+            }
+        }
+        sync_dir(&self.dir)?;
+        debug!("WAL rotated to segment {}", old + 1);
+        Ok(())
+    }
+}
+
+/// Background thread that fsyncs the log every `interval`: `Durability::Periodic`.
+pub(crate) struct Flusher {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Flusher {
+    pub(crate) fn start(wal: Arc<Wal>, interval: Duration) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = {
+            let stop = stop.clone();
+            thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    thread::park_timeout(interval);
+                    if let Err(e) = wal.flush_all(true) {
+                        error!("WAL flusher stopped: {e}");
+                        break;
+                    }
+                }
+            })
+        };
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for Flusher {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            handle.thread().unpark();
+            let _ = handle.join();
+        }
     }
 }
 
@@ -437,8 +731,9 @@ mod tests {
             let mut segment = Segment::create(&dir, id).unwrap();
             assert_eq!(segment.id(), id);
             segment
-                .append(&encode_all(&records[..id as usize]))
+                .write_all(&encode_all(&records[..id as usize]))
                 .unwrap();
+            segment.sync().unwrap();
         }
         fs::write(dir.join("notes.txt"), b"not a segment").unwrap();
         assert!(
@@ -456,6 +751,139 @@ mod tests {
             assert_eq!(frames(&buf).count(), id as usize);
         }
 
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn insert(key: &'static [u8]) -> Record<'static> {
+        Record::Op(Op::Insert(key, b"v"))
+    }
+
+    fn page(id: u32) -> Record<'static> {
+        Record::Page {
+            id,
+            bytes: &[1u8; 16],
+        }
+    }
+
+    #[test]
+    fn test_recovery_plan_without_checkpoint() {
+        let seg = encode_all(&[(1, insert(b"a")), (2, Record::Op(Op::Remove(b"a")))]);
+        let plan = recovery_plan(std::slice::from_ref(&seg));
+        assert!(plan.images.is_empty());
+        assert_eq!(
+            plan.ops,
+            vec![vec![Op::Insert(b"a", b"v")], vec![Op::Remove(b"a")]]
+        );
+        assert_eq!(plan.last_lsn, 2);
+    }
+
+    #[test]
+    fn test_recovery_plan_replays_after_last_complete_checkpoint() {
+        let seg = encode_all(&[
+            (1, insert(b"a")),
+            (2, page(7)),
+            (3, Record::Checkpoint { lsn: 1, pages: 1 }),
+            (4, insert(b"b")),
+            (5, page(8)),
+            (6, page(9)),
+            (7, Record::Checkpoint { lsn: 4, pages: 2 }),
+            (8, insert(b"c")),
+            (9, Record::Batch(vec![Op::Remove(b"b")])),
+        ]);
+        let plan = recovery_plan(std::slice::from_ref(&seg));
+        assert_eq!(
+            plan.images.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![8, 9]
+        );
+        assert_eq!(
+            plan.ops,
+            vec![vec![Op::Insert(b"c", b"v")], vec![Op::Remove(b"b")]]
+        );
+        assert_eq!(plan.last_lsn, 9);
+    }
+
+    /// A crash while a checkpoint appends its images leaves no CHECKPOINT:
+    /// the partial images are ignored and the earlier records replayed.
+    #[test]
+    fn test_recovery_plan_ignores_incomplete_checkpoint() {
+        let mut seg = encode_all(&[(1, insert(b"a")), (2, page(3)), (3, page(4))]);
+        let whole = seg.len();
+        encode(&mut seg, 4, &Record::Checkpoint { lsn: 1, pages: 2 });
+        seg.truncate(whole + 5); // torn CHECKPOINT
+        let plan = recovery_plan(std::slice::from_ref(&seg));
+        assert!(plan.images.is_empty());
+        assert_eq!(plan.ops, vec![vec![Op::Insert(b"a", b"v")]]);
+
+        // a CHECKPOINT claiming more images than precede it is not complete either
+        let seg = encode_all(&[
+            (1, insert(b"a")),
+            (2, page(3)),
+            (3, Record::Checkpoint { lsn: 1, pages: 2 }),
+        ]);
+        let plan = recovery_plan(std::slice::from_ref(&seg));
+        assert!(plan.images.is_empty());
+        assert_eq!(plan.ops, vec![vec![Op::Insert(b"a", b"v")]]);
+    }
+
+    #[test]
+    fn test_recovery_plan_across_segments_stops_at_torn_one() {
+        let one = encode_all(&[(1, insert(b"a")), (2, insert(b"b"))]);
+        let mut two = encode_all(&[(3, insert(b"c"))]);
+        two.push(0xFF); // torn tail
+        let three = encode_all(&[(4, insert(b"d"))]);
+        let segments = [one, two, three];
+        let plan = recovery_plan(&segments);
+        assert_eq!(plan.ops.len(), 3, "the segment after a torn one is ignored");
+        assert_eq!(plan.last_lsn, 3);
+    }
+
+    #[test]
+    fn test_group_commit() {
+        let dir = PathBuf::from("target/test_wal_group_commit");
+        let _ = fs::remove_dir_all(&dir);
+        let wal = Arc::new(Wal::create(&dir, 1, 1, true).unwrap());
+
+        let threads = 8;
+        let per_thread = 50;
+        let handles = (0..threads)
+            .map(|_| {
+                let wal = wal.clone();
+                thread::spawn(move || {
+                    for _ in 0..per_thread {
+                        let lsn = wal.append(&insert(b"key"));
+                        wal.commit(lsn).unwrap();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let total = (threads * per_thread) as u64;
+        assert_eq!(wal.last_lsn(), total);
+        assert!(
+            wal.syncs() < total,
+            "{} fsyncs for {} commits: none were shared",
+            wal.syncs(),
+            total
+        );
+
+        let buf = fs::read(segment_path(&dir, 1)).unwrap();
+        assert_eq!(frames(&buf).count() as u64, total);
+        let lsns = frames(&buf).map(|frame| frame.lsn).collect::<Vec<_>>();
+        assert_eq!(lsns, (1..=total).collect::<Vec<_>>(), "in LSN order");
+
+        wal.rotate().unwrap();
+        assert_eq!(
+            segments(&dir)
+                .unwrap()
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_eq!(wal.segment_bytes(), 0);
         fs::remove_dir_all(&dir).unwrap();
     }
 }

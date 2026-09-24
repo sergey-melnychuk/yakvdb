@@ -24,9 +24,6 @@ pub(crate) trait Tree<P: Page> {
     /// Mark page with given id as dirty and thus eligible for flushing to the disk.
     fn mark(&self, id: u32);
 
-    /// Flush all pages marked as dirty to the disk.
-    fn flush(&self) -> Result<()>;
-
     /// Reserve the provided page id - such id will never be returned by `next_id` until freed.
     fn next_id(&self) -> Result<u32>;
 

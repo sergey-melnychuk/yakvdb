@@ -3,7 +3,7 @@ use sled::Db;
 use std::cell::RefCell;
 use std::path::Path;
 use std::time::SystemTime;
-use yakvdb::api::Store;
+use yakvdb::api::{Durability, Options, Store};
 
 use yakvdb::disk::block::Block;
 use yakvdb::disk::file::File;
@@ -309,13 +309,28 @@ fn main() {
 
     if target == "self" {
         let path = Path::new("target/main_1M.tmp");
+        let wal = Path::new("target/main_1M.tmp.wal");
         std::fs::remove_file(path).ok();
+        std::fs::remove_dir_all(wal).ok();
         let size: u32 = 4096;
-        let file: File<Block> = File::make(path, size).unwrap();
-        info!("target={target} file={path:?} count={count} page={size}");
+        // DURABILITY=os (default) | sync | periodic:<millis>
+        let durability = match std::env::var("DURABILITY").as_deref() {
+            Ok("sync") => Durability::Sync,
+            Ok(p) if p.starts_with("periodic:") => Durability::Periodic(
+                std::time::Duration::from_millis(p["periodic:".len()..].parse().unwrap()),
+            ),
+            _ => Durability::Os,
+        };
+        let options = Options {
+            durability,
+            ..Options::default()
+        };
+        let file: File<Block> = File::make_with(path, size, options).unwrap();
+        info!("target={target} file={path:?} count={count} page={size} durability={durability:?}");
 
         benchmark(SelfStorage(file), count);
         std::fs::remove_file(path).ok();
+        std::fs::remove_dir_all(wal).ok();
     }
 
     if target == "lskv" {

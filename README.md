@@ -42,9 +42,9 @@ PLAN:
     `lru.write()`, so readers no longer exclude each other, and every access is
     O(1) instead of a linear scan of the recency list
   - that made a large cache affordable: the default limit is 256 MiB (65536
-    pages of 4 KiB) instead of 32 pages, set with `make_with_cache`/
-    `open_with_cache`; pages are cached as they are read, so memory follows
-    the size of the tree up to that limit instead of being reserved up front
+    pages of 4 KiB) instead of 32 pages, set with `Options::cache_bytes`;
+    pages are cached as they are read, so memory follows the size of the tree
+    up to that limit instead of being reserved up front
   - measured on 200k keys, 400k lookups, release: 490k/430k/456k/241k op/s at
     1/2/4/8 threads before, 1.4M/2.9M/2.1M/1.4M after
 - [ ] let reads scale past 2 threads
@@ -63,9 +63,23 @@ PLAN:
     unchanged), so `free`/`fits`/`full` are arithmetic instead of slot scans
   - measured on 1M keys, release: insert 61k -> 265k op/s, lookup 410k -> 1.19M,
     remove 65k -> 230k
-- [ ] write-ahead log with group commit - see [doc/wal.md](doc/wal.md)
-  - nothing calls `fsync` today: a write survives a process crash, not a power
-    loss, and a crash mid-split can leave the tree inconsistent
+- [x] write-ahead log with group commit - see [doc/wal.md](doc/wal.md)
+  - every write is logged before it returns; modified pages stay in the cache
+    (never evicted) until a checkpoint logs their images, fsyncs, writes them
+    in place and fsyncs again, so a crash at any point is recovered on `open`
+  - `Durability::Os` (default): survives a process crash, a power loss loses
+    the writes since the last checkpoint; `Periodic(interval)`: fsyncs the log
+    in the background; `Sync`: returns once fsynced, sharing one fsync among
+    the writers committing at the same time; `write_batch` is atomic
+  - measured on 1M keys, release, `Os`: insert 277k/s, lookup 1.19M/s,
+    remove 235k/s before, 281k/1.21M/231k after, while no mode can now leave
+    the file half-updated; `Sync` on macOS (`F_FULLFSYNC`): 287 inserts/s from
+    one thread, 7.3k/s from 64
+  - a byte-at-a-time CRC was the biggest cost of a checkpoint, before the
+    hardware one; the second was checkpointing often: the dirty limit defaults
+    to half the cache, so the working set fits between two checkpoints
+- [ ] crash tests that kill a real process (step 6 of doc/wal.md)
+- [ ] unreferenced overflow regions left by a crash are skipped, never reused
 - [x] sweep `page(id).unwrap()`/`page_mut(id).unwrap()` into typed errors
   - a corrupted file should fail one operation, not the process
   - `try_page`/`try_page_mut` return `Error::Tree` instead of `None`, and all
@@ -98,7 +112,7 @@ Binary search is run for each page (log(K)) and touches at most log(N) pages.
 
 On insert/remove each page performs O(K) cleanup to keep keys ordered, as well as extra housekeeping is performed if necessary (split or merge of pages).
 
-Each insert/remove writes the pages it changed to the file before returning. That hands them to the OS (they survive a process crash), but nothing calls `fsync` yet, so they do not necessarily survive a power loss: see [doc/wal.md](doc/wal.md) for the plan.
+Each insert/remove is written to a write-ahead log before it returns, and modified pages reach the file through checkpoints that can be redone after a crash, so the file is never left half-updated. How many of the latest writes survive a power loss is set by `Options::durability`: see [doc/wal.md](doc/wal.md).
 
 ### API
 * [Store](src/api/mod.rs) is the public key-value API (impl: [File](src/disk/file.rs))
@@ -156,14 +170,15 @@ $ RUST_LOG=info cargo run --release
 use std::path::Path;
 use std::sync::Arc;
 use yakvdb::api::error::Result;
-use yakvdb::api::{Store, KV};
+use yakvdb::api::{Durability, Op, Options, Store, KV};
 
 // Create a new database with the given page size...
 let db: KV = KV::make(Path::new("/tmp/db.yak"), /*page_size=*/ 4096).unwrap();
-// ...or open an existing one:
+// ...or open an existing one, recovering it if it was not closed cleanly:
 // let db: KV = KV::open(Path::new("/tmp/db.yak")).unwrap();
-// Both cache up to 256 MiB of pages, growing with the tree; `make_with_cache`/
-// `open_with_cache` pick the limit.
+// `make_with`/`open_with` take `Options`: the page cache limit (256 MiB by
+// default, growing with the tree) and the `Durability`:
+// let db = KV::open_with(path, Options { durability: Durability::Sync, ..Options::default() });
 
 let _: Result<()> = db.insert(b"key", b"val");
 let _: Result<Option<Vec<u8>>> = db.lookup(b"key");
@@ -171,7 +186,10 @@ let _: Result<()> = db.remove(b"key");
 
 // To iterate: db.min(), db.max(), db.above(b"key"), db.below(b"key")
 
-// `insert` and `remove` flush on their own, `sync` forces it:
+// Several writes at once, atomically, with a single commit:
+let _: Result<()> = db.write_batch(&[Op::Insert(b"a", b"1"), Op::Remove(b"b")]);
+
+// Make everything durable now, whatever the `Durability` (a checkpoint):
 let _: Result<()> = db.sync();
 
 // Every method takes `&self` and `KV` is `Send + Sync`, so one handle can

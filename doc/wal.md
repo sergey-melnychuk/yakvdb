@@ -1,6 +1,7 @@
 # Write-ahead log with group commit: design
 
-Status: proposal, not implemented.
+Status: implemented (steps 1-5 and 7 of the plan below). The design is kept
+as written; [As built](#as-built) at the end lists where the code differs.
 
 ## Why
 
@@ -269,3 +270,46 @@ Each step lands on its own, with tests:
    kills it at random points (or injects I/O failures through a file wrapper),
    reopens the file and compares it against a model of the acknowledged writes.
 7. `Options`, `Durability`, `write_batch`, README.
+
+## As built
+
+What the implementation does differently from the design above, or adds:
+
+- **Durability modes.** `Durability::Os` (the default), `Periodic(interval)`
+  and `Sync`, instead of `Sync`/`Async`. `Os` writes the record to the OS
+  before the write returns and never fsyncs it; `Periodic` adds a background
+  fsync. Checkpoints fsync in every mode, so no mode can leave the file
+  half-updated: they differ only in how many recent writes a power loss takes.
+  `Os` matches what the store promised before the WAL (a write survives a
+  process crash), at about the same speed.
+- **Fewer fsyncs per checkpoint.** A new segment is not fsynced on creation;
+  one directory sync after rotation covers the new segment and the deleted old
+  ones. Step (0), the fsync of the tree file before the images, only runs if
+  pages were written straight to the file (`next_id`, `alloc_overflow`)
+  since the last checkpoint. The rest is as designed: the log fsync after the
+  images, and the tree file fsync after the in-place writes.
+- **Poisoning.** If applying a write fails half-way (a corrupted page, an
+  I/O error), or a checkpoint fails, the cache may hold part of a change that
+  the log does not. The database then refuses further writes and skips the
+  checkpoint on close, so the partial change never reaches the file; reopening
+  recovers the last committed state.
+- **No-op removes are not logged.** Removing a key that is not there changes
+  nothing, dirties nothing, and does not wait for a commit.
+- **Recovery cleans up.** After replaying, `open` checkpoints, which also
+  deletes the old segments. With nothing to replay it deletes them directly.
+- **`make` deletes a stale log.** A `<path>.wal` directory without its
+  database belongs to one that was deleted, and would be replayed onto the new one.
+- **Known leak.** A crash after an overflow region was written, but before a
+  checkpoint made the tree refer to it, leaves the region unreferenced in the
+  file. `open` recognises it as an overflow region, so it is skipped, not
+  corrupted, but its pages are not reused. The same goes for freed overflow
+  pages whose checkpoint never ran.
+- **Tests.** Besides the unit tests of the frame format and recovery plan:
+  crash recovery by dropping a `File` without its closing checkpoint
+  (`mem::forget`), a crash at several points during a checkpoint's in-place
+  writes (a test hook), the log cut at many byte offsets, a freed overflow
+  region needed after a lost record, and a check that no page already in the
+  file changes between checkpoints however hard the cache is churned. Removing
+  the image redo, the pinning of dirty pages, the deferred frees or the replay
+  makes the corresponding test fail. Killing a real child process (step 6) is
+  not done yet.
