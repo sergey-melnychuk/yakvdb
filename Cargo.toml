@@ -33,5 +33,5 @@ crc32c = "0.6"
 rustc-hash = "2"
 
 [dev-dependencies]
-sled = "0.34.7"
+sled = "1.0.0-alpha.124"
 tokio = { version = "1.26.0", features = ["rt-multi-thread", "sync", "macros"] }

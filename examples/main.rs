@@ -326,7 +326,14 @@ fn main() {
             .ok()
             .and_then(|b| b.parse().ok())
             .unwrap_or(1);
+        // CACHE_MB=<megabytes>: page cache limit (256)
+        let cache_bytes = std::env::var("CACHE_MB")
+            .ok()
+            .and_then(|mb| mb.parse::<usize>().ok())
+            .map(|mb| mb << 20)
+            .unwrap_or(yakvdb::api::DEFAULT_CACHE_BYTES);
         let options = Options {
+            cache_bytes,
             durability,
             write_buffer: WriteBuffer {
                 records,
