@@ -71,6 +71,8 @@ PLAN:
     the writes since the last checkpoint; `Periodic(interval)`: fsyncs the log
     in the background; `Sync`: returns once fsynced, sharing one fsync among
     the writers committing at the same time; `write_batch` is atomic
+  - a database is open through one handle at a time: `make`/`open` lock the
+    file, since opening replays and rotates the log
   - measured on 1M keys, release, `Os`: insert 277k/s, lookup 1.19M/s,
     remove 235k/s before, 281k/1.21M/231k after, while no mode can now leave
     the file half-updated; `Sync` on macOS (`F_FULLFSYNC`): 287 inserts/s from

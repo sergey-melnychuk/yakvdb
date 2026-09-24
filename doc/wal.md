@@ -289,10 +289,22 @@ What the implementation does differently from the design above, or adds:
   since the last checkpoint. The rest is as designed: the log fsync after the
   images, and the tree file fsync after the in-place writes.
 - **Poisoning.** If applying a write fails half-way (a corrupted page, an
-  I/O error), or a checkpoint fails, the cache may hold part of a change that
-  the log does not. The database then refuses further writes and skips the
-  checkpoint on close, so the partial change never reaches the file; reopening
-  recovers the last committed state.
+  I/O error), a commit fails, a checkpoint fails, or a record fails to replay
+  during recovery, the cache may hold part of a change that the log does not.
+  The database then refuses further writes and reads, and skips the checkpoint
+  on close, so the partial change is neither seen nor written to the file;
+  reopening recovers the last committed state.
+- **Checkpoint before the write that triggers it.** A write checks the
+  thresholds before applying itself, not after: a failed checkpoint then fails
+  a write that changed nothing, rather than one whose record it had already
+  made durable, and that recovery would bring back.
+- **One handle at a time.** `make` and `open` take an exclusive lock on the
+  database file (`File::try_lock`): opening replays and rotates the log, which
+  would delete it out from under a handle that is still using it.
+- **Idle checkpoints are skipped.** With nothing logged since the last one,
+  nothing dirty and nothing freed, closing or `sync` does no I/O.
+- **Bounded buffers.** A checkpoint's page images go through the append
+  buffer, which is given back after a flush if it grew past 1 MiB.
 - **No-op removes are not logged.** Removing a key that is not there changes
   nothing, dirties nothing, and does not wait for a commit.
 - **Recovery cleans up.** After replaying, `open` checkpoints, which also

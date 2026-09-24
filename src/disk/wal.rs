@@ -31,6 +31,14 @@ const BATCH: u8 = 3;
 const PAGE: u8 = 4;
 const CHECKPOINT: u8 = 5;
 
+/// Initial capacity of the append buffers, and the most a buffer keeps after
+/// a flush: a checkpoint's page images can grow one to the whole dirty set.
+const BUFFER_BYTES: usize = 64 * 1024;
+const KEEP_BUFFER_BYTES: usize = 1024 * 1024;
+
+/// Shortest interval of `Durability::Periodic`: less would spin a core.
+const MIN_FLUSH_INTERVAL: Duration = Duration::from_millis(1);
+
 /// `len` and `crc`, which precede what the CRC covers.
 const PREFIX: usize = 8;
 /// `lsn` and `kind`: the smallest possible frame body.
@@ -410,6 +418,9 @@ pub(crate) struct Wal {
     /// Only ever locked by a leader or by `rotate`, so never contended by writers.
     segment: Mutex<Segment>,
     syncs: AtomicU64,
+    /// Test hook: fail every fsync.
+    #[cfg(test)]
+    pub(crate) fail_syncs: AtomicBool,
 }
 
 impl Wal {
@@ -429,8 +440,8 @@ impl Wal {
             dir: dir.to_path_buf(),
             sync_on_commit,
             state: Mutex::new(State {
-                buf: Vec::with_capacity(64 * 1024),
-                spare: Vec::with_capacity(64 * 1024),
+                buf: Vec::with_capacity(BUFFER_BYTES),
+                spare: Vec::with_capacity(BUFFER_BYTES),
                 next_lsn,
                 appended: next_lsn - 1,
                 written: next_lsn - 1,
@@ -442,6 +453,8 @@ impl Wal {
             cond: Condvar::new(),
             segment: Mutex::new(segment),
             syncs: AtomicU64::new(0),
+            #[cfg(test)]
+            fail_syncs: AtomicBool::new(false),
         })
     }
 
@@ -498,12 +511,19 @@ impl Wal {
                     segment.write_all(&batch)?;
                 }
                 if sync {
+                    #[cfg(test)]
+                    if self.fail_syncs.load(Ordering::Relaxed) {
+                        return Err(io::Error::other("Injected fsync failure"));
+                    }
                     segment.sync()?;
                     self.syncs.fetch_add(1, Ordering::Relaxed);
                 }
                 Ok(())
             });
             batch.clear();
+            if batch.capacity() > KEEP_BUFFER_BYTES {
+                batch = Vec::with_capacity(BUFFER_BYTES);
+            }
             st.spare = batch;
             st.flushing = false;
             self.cond.notify_all();
@@ -573,6 +593,7 @@ pub(crate) struct Flusher {
 
 impl Flusher {
     pub(crate) fn start(wal: Arc<Wal>, interval: Duration) -> Self {
+        let interval = interval.max(MIN_FLUSH_INTERVAL);
         let stop = Arc::new(AtomicBool::new(false));
         let handle = {
             let stop = stop.clone();
@@ -884,6 +905,23 @@ mod tests {
             vec![2]
         );
         assert_eq!(wal.segment_bytes(), 0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_buffers_shrink_after_big_flush() {
+        let dir = PathBuf::from("target/test_wal_buffers_shrink");
+        let _ = fs::remove_dir_all(&dir);
+        let wal = Wal::create(&dir, 1, 1, false).unwrap();
+        let big = vec![0u8; 4 * 1024 * 1024];
+        wal.append(&Record::Page { id: 1, bytes: &big });
+        wal.flush_all(false).unwrap();
+        wal.append(&insert(b"k"));
+        wal.flush_all(false).unwrap();
+        let st = wal.state.lock();
+        assert!(st.buf.capacity() <= KEEP_BUFFER_BYTES);
+        assert!(st.spare.capacity() <= KEEP_BUFFER_BYTES);
+        drop(st);
         fs::remove_dir_all(&dir).unwrap();
     }
 }

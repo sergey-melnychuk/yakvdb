@@ -15,7 +15,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use parking_lot::{
     MappedRwLockReadGuard, MappedRwLockWriteGuard, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard,
@@ -59,6 +59,10 @@ pub struct File<P: Page> {
     /// Pages were written straight to the file (new pages, overflow regions)
     /// since the last checkpoint, which has to make them durable first.
     file_dirty: AtomicBool,
+    /// LSN of the last record the last checkpoint covered: with nothing
+    /// logged since, nothing dirty and nothing freed, a checkpoint has nothing
+    /// to do and is skipped.
+    checkpointed_lsn: AtomicU64,
     /// Checkpoint when this many pages are dirty, or the log segment this big.
     max_dirty: usize,
     checkpoint_wal_bytes: u64,
@@ -143,6 +147,7 @@ impl<P: Page> File<P> {
         let max_dirty = (options.checkpoint_dirty_bytes / page_bytes)
             .min(pages / 2)
             .max(1);
+        let checkpointed_lsn = AtomicU64::new(wal.last_lsn());
         let wal = Arc::new(wal);
         let flusher = match options.durability {
             Durability::Periodic(interval) => Some(Flusher::start(wal.clone(), interval)),
@@ -159,6 +164,7 @@ impl<P: Page> File<P> {
             _flusher: flusher,
             pending_free: Mutex::new(Vec::new()),
             file_dirty: AtomicBool::new(false),
+            checkpointed_lsn,
             max_dirty,
             checkpoint_wal_bytes: options.checkpoint_wal_bytes,
             poisoned: AtomicBool::new(false),
@@ -185,6 +191,7 @@ impl<P: Page> File<P> {
             .write(true)
             .read(true)
             .open(path)?;
+        lock(&file, path)?;
 
         let head = Head {
             page_bytes,
@@ -215,6 +222,8 @@ impl<P: Page> File<P> {
             .read(true)
             .write(true)
             .open(path)?;
+        // Before reading the log: a live handle elsewhere owns it.
+        lock(&file, path)?;
 
         let len = file.metadata()?.len() as usize;
         if len < HEAD {
@@ -330,7 +339,12 @@ impl<P: Page> File<P> {
             let _op = this.ops.write();
             for ops in &plan.ops {
                 for op in ops {
-                    this.apply(op).map_err(io::Error::other)?;
+                    if let Err(e) = this.apply(op) {
+                        // Otherwise dropping `this` would checkpoint the
+                        // partial replay and delete the log still holding the rest.
+                        this.poisoned.store(true, Ordering::Release);
+                        return Err(io::Error::other(e));
+                    }
                 }
             }
             this.checkpoint().map_err(io::Error::other)?;
@@ -409,6 +423,7 @@ impl<P: Page> File<P> {
     /// memory and keeps both problems inside the crate.
     pub fn read_page(&self, id: u32) -> Option<P> {
         let _op = self.ops.read();
+        self.usable().ok()?;
         let page = self.page(id)?;
         let mut copy = P::reserve(self.head.page_bytes);
         copy.as_mut().copy_from_slice(page.as_ref());
@@ -432,7 +447,7 @@ impl<P: Page> File<P> {
     /// log and checkpoint, so that the file holds everything and the log is empty.
     pub fn sync(&self) -> Result<()> {
         let _op = self.ops.write();
-        self.writable()?;
+        self.usable()?;
         self.checkpoint()
     }
 
@@ -451,11 +466,7 @@ impl<P: Page> File<P> {
         let id = 1 + ((len - HEAD as u64) / self.head.page_bytes as u64) as u32;
         let region_bytes = multiplier as usize * self.head.page_bytes as usize;
         let zeroes = vec![0u8; region_bytes];
-        {
-            let mut f = self.file.write();
-            f.seek(SeekFrom::End(0))?;
-            f.write_all(&zeroes)?;
-        }
+        self.write_all_at(len, &zeroes)?;
         self.file_dirty.store(true, Ordering::Relaxed);
         debug!("alloc_overflow: id={id} multiplier={multiplier}");
         Ok(id)
@@ -481,12 +492,7 @@ impl<P: Page> File<P> {
         // Pad remainder with zeroes
         buf.extend_from_slice(&vec![0u8; region_bytes - buf.len()]);
 
-        let offset = self.offset(start_page) as u64;
-        {
-            let mut f = self.file.write();
-            f.seek(SeekFrom::Start(offset))?;
-            f.write_all(&buf)?;
-        }
+        self.write_all_at(self.offset(start_page) as u64, &buf)?;
         debug!(
             "write_overflow: page={start_page} multiplier={multiplier} key_len={} val_len={}",
             key.len(),
@@ -663,7 +669,11 @@ impl<P: Page> File<P> {
     fn write(&self, ops: &[Op<'_>]) -> Result<()> {
         let lsn = {
             let _op = self.ops.write();
-            self.writable()?;
+            self.usable()?;
+            // Before applying rather than after: a checkpoint that fails then
+            // fails a write that changed nothing, instead of one whose record
+            // it has already made durable, and that recovery would bring back.
+            self.maybe_checkpoint()?;
             let mut changed = false;
             for op in ops {
                 match self.apply(op) {
@@ -679,29 +689,36 @@ impl<P: Page> File<P> {
             if !changed {
                 return Ok(());
             }
-            let lsn = match ops {
+            match ops {
                 [op] => self.wal.append(&Record::Op(*op)),
                 _ => self.wal.append(&Record::Batch(ops.to_vec())),
-            };
-            self.maybe_checkpoint()?;
-            lsn
+            }
         };
-        self.wal.commit(lsn)?;
+        if let Err(e) = self.wal.commit(lsn) {
+            // The change is in the cache, its record maybe not in the file, and
+            // the log takes nothing more: as unusable as after a failed apply.
+            self.poisoned.store(true, Ordering::Release);
+            return Err(e.into());
+        }
         Ok(())
     }
 
     /// Apply one operation to the tree. Returns whether anything changed.
     fn apply(&self, op: &Op<'_>) -> Result<bool> {
+        #[cfg(test)]
+        tests::fail_point()?;
         match *op {
             Op::Insert(key, val) => self.insert_locked(key, val).map(|()| true),
             Op::Remove(key) => self.remove_locked(key),
         }
     }
 
-    fn writable(&self) -> Result<()> {
+    /// Fails once a write or checkpoint failed half-way: the cache may hold
+    /// part of a change, which neither writes nor reads may build on.
+    fn usable(&self) -> Result<()> {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(Error::Other(
-                "An earlier write failed half-way: reopen the database to recover".to_string(),
+                "A write failed half-way: reopen the database to recover".to_string(),
             ));
         }
         Ok(())
@@ -731,6 +748,13 @@ impl<P: Page> File<P> {
 
     fn checkpoint_inner(&self) -> Result<()> {
         let lsn = self.wal.last_lsn();
+        let idle = lsn == self.checkpointed_lsn.load(Ordering::Relaxed)
+            && self.dirty.read().is_empty()
+            && self.pending_free.lock().is_empty()
+            && !self.file_dirty.load(Ordering::Relaxed);
+        if idle {
+            return Ok(());
+        }
         let mut ids = self.dirty.read().iter().copied().collect::<Vec<_>>();
         // ascending page ids make the writes as sequential as the tree allows
         ids.sort_unstable();
@@ -778,6 +802,7 @@ impl<P: Page> File<P> {
             self.free_id(id);
         }
         self.wal.rotate()?;
+        self.checkpointed_lsn.store(lsn, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1022,6 +1047,7 @@ impl<P: Page> File<P> {
 impl<P: Page> Store for File<P> {
     fn lookup(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let _op = self.ops.read();
+        self.usable()?;
         debug!("lookup: {}", hex(key));
         let mut page = self.root()?;
         for _ in 0..MAX_DEPTH {
@@ -1090,11 +1116,16 @@ impl<P: Page> Store for File<P> {
         let _op = self.ops.read();
         // A root that cannot be read is not an empty tree: report the file as
         // non-empty so a caller does not mistake a broken one for a fresh one.
+        // The same goes for one poisoned by a failed write.
+        if self.usable().is_err() {
+            return false;
+        }
         self.root().map(|page| page.len() == 0).unwrap_or(false)
     }
 
     fn min(&self) -> Result<Option<Vec<u8>>> {
         let _op = self.ops.read();
+        self.usable()?;
         let mut page = self.root()?;
         if page.len() == 0 {
             return Ok(None);
@@ -1117,6 +1148,7 @@ impl<P: Page> Store for File<P> {
 
     fn max(&self) -> Result<Option<Vec<u8>>> {
         let _op = self.ops.read();
+        self.usable()?;
         let mut page = self.root()?;
         if page.len() == 0 {
             return Ok(None);
@@ -1140,6 +1172,7 @@ impl<P: Page> Store for File<P> {
 
     fn above(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let _op = self.ops.read();
+        self.usable()?;
         debug!("above: {}", hex(key));
 
         let mut path = Vec::with_capacity(8);
@@ -1214,6 +1247,7 @@ impl<P: Page> Store for File<P> {
 
     fn below(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let _op = self.ops.read();
+        self.usable()?;
         debug!("below: {}", hex(key));
 
         let mut path = Vec::with_capacity(8);
@@ -1351,11 +1385,7 @@ impl<P: Page> Tree<P> for File<P> {
         let len = self.file.read().metadata()?.len();
         let id = 1 + ((len - HEAD as u64) / self.head.page_bytes as u64) as u32;
         let page = P::create(id, self.head.page_bytes);
-        {
-            let mut f = self.file.write();
-            f.seek(SeekFrom::End(0))?;
-            f.write_all(page.as_ref())?;
-        }
+        self.write_all_at(len, page.as_ref())?;
         self.file_dirty.store(true, Ordering::Relaxed);
 
         Ok(id)
@@ -1621,6 +1651,9 @@ impl<P: Page> Tree<P> for File<P> {
             let page = file.page(page_id).unwrap();
             let copy = page.copy();
             let full = page.full();
+            // Loading a child may need the cache's write lock: holding this
+            // read guard across the recursion would deadlock on a cache miss.
+            drop(page);
 
             acc.push_str(&if copy.is_empty() {
                 format!("{prefix}page={page_id}: empty")
@@ -1678,6 +1711,20 @@ impl<P: Page> Drop for File<P> {
             error!("Checkpoint on close failed: {e}");
         }
     }
+}
+
+/// Take an exclusive lock on the database file, released when it is closed.
+///
+/// Opening replays, checkpoints and rotates the log: done to a database that
+/// is open elsewhere, it would delete the log out from under that handle.
+fn lock(file: &fs::File, path: &Path) -> io::Result<()> {
+    file.try_lock().map_err(|e| match e {
+        fs::TryLockError::WouldBlock => io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!("Database is open elsewhere: {path:?}"),
+        ),
+        fs::TryLockError::Error(e) => e,
+    })
 }
 
 /// The log of the database at `path`: the directory `<path>.wal`.
@@ -2019,6 +2066,7 @@ mod tests {
             file.insert(k, v).unwrap();
         }
 
+        drop(file);
         let file: File<Block> = File::open(path).unwrap();
 
         for (k, v) in data.iter() {
@@ -3500,7 +3548,26 @@ mod tests {
     /// Leave the file and its log exactly as a killed process would: no
     /// checkpoint on close, nothing flushed beyond what was committed.
     fn crash<P: Page>(file: File<P>) {
+        // the OS drops the lock of a process that dies
+        file.file.read().unlock().unwrap();
         std::mem::forget(file);
+    }
+
+    thread_local! {
+        /// Operations `apply` lets through before failing (`usize::MAX`: all).
+        static FAIL_APPLY_AFTER: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(usize::MAX) };
+    }
+
+    pub(super) fn fail_point() -> Result<()> {
+        FAIL_APPLY_AFTER.with(|left| match left.get() {
+            usize::MAX => Ok(()),
+            0 => Err(Error::Other("Injected apply failure".to_string())),
+            n => {
+                left.set(n - 1);
+                Ok(())
+            }
+        })
     }
 
     fn assert_matches(file: &File<Block>, model: &Model) {
@@ -3866,6 +3933,175 @@ mod tests {
 
         assert_matches(&file, &model);
         drop(file);
+        cleanup(&path);
+    }
+
+    // ---- review fixes ----
+
+    /// A replay that fails must leave the log alone, so that a later open can
+    /// still recover everything from it.
+    #[test]
+    fn test_failed_replay_keeps_the_log() {
+        let path = fresh("test_failed_replay_keeps_the_log");
+        let mut model = Model::new();
+        {
+            let file: File<Block> = File::make(&path, 256).unwrap();
+            workload(&file, &mut model, 7, 300);
+            crash(file);
+        }
+
+        FAIL_APPLY_AFTER.with(|left| left.set(20));
+        assert!(File::<Block>::open(&path).is_err());
+        FAIL_APPLY_AFTER.with(|left| left.set(usize::MAX));
+
+        let file: File<Block> = File::open(&path).unwrap();
+        assert_matches(&file, &model);
+        drop(file);
+        cleanup(&path);
+    }
+
+    /// Once a commit fails, later writes must fail before changing anything.
+    #[test]
+    fn test_failed_commit_stops_writes() {
+        let path = fresh("test_failed_commit_stops_writes");
+        let options = Options {
+            durability: Durability::Sync,
+            ..Options::default()
+        };
+        let file: File<Block> = File::make_with(&path, 256, options).unwrap();
+        file.insert(b"a", b"1").unwrap();
+
+        file.wal
+            .fail_syncs
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(file.insert(b"b", b"2").is_err());
+        let lsn = file.wal.last_lsn();
+        assert!(file.insert(b"c", b"3").is_err());
+        assert_eq!(file.wal.last_lsn(), lsn, "the second write was logged");
+        assert!(
+            file.lookup(b"a").is_err(),
+            "reads go on after a failed write"
+        );
+        drop(file);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_second_open_is_refused() {
+        let path = fresh("test_second_open_is_refused");
+        let file: File<Block> = File::make(&path, 256).unwrap();
+        let err = File::<Block>::open(&path).err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        drop(file);
+        let file: File<Block> = File::open(&path).unwrap();
+        drop(file);
+        cleanup(&path);
+    }
+
+    /// A write whose checkpoint fails must not come back after a reopen.
+    #[test]
+    fn test_failed_checkpoint_fails_an_unapplied_write() {
+        let path = fresh("test_failed_checkpoint_fails_an_unapplied_write");
+        let options = Options {
+            checkpoint_dirty_bytes: 2 * 256,
+            ..Options::default()
+        };
+        {
+            let file: File<Block> = File::make_with(&path, 256, options).unwrap();
+            let mut model = Model::new();
+            workload(&file, &mut model, 8, 100);
+            file.sync().unwrap();
+            // bounded: were the checkpoint to run after each write instead of
+            // before it, the dirty count would never get there
+            for i in 0..1_000 {
+                if file.dirty.read().len() >= file.max_dirty {
+                    break;
+                }
+                file.insert(format!("fill-{i}").as_bytes(), b"v").unwrap();
+            }
+
+            file.crash_after_pages
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            assert!(file.insert(b"lost", b"v").is_err());
+            crash(file);
+        }
+        let file: File<Block> = File::open(&path).unwrap();
+        assert_eq!(file.lookup(b"lost").unwrap(), None);
+        drop(file);
+        cleanup(&path);
+    }
+
+    /// After a batch fails half-way, its first half must not be readable.
+    #[test]
+    fn test_reads_refused_after_failed_write() {
+        let path = fresh("test_reads_refused_after_failed_write");
+        let file: File<Block> = File::make(&path, 256).unwrap();
+        file.insert(b"c", b"3").unwrap();
+
+        FAIL_APPLY_AFTER.with(|left| left.set(1));
+        let result = file.write_batch(&[
+            Op::Insert(b"a", b"1"),
+            Op::Insert(b"b", b"2"),
+            Op::Remove(b"c"),
+        ]);
+        FAIL_APPLY_AFTER.with(|left| left.set(usize::MAX));
+        assert!(result.is_err());
+
+        assert!(file.lookup(b"a").is_err());
+        assert!(file.min().is_err());
+        assert!(file.above(b"").is_err());
+        assert!(!file.is_empty());
+        assert!(file.read_root().is_none());
+        drop(file);
+        cleanup(&path);
+    }
+
+    /// Opening and closing without writing must not checkpoint or rotate.
+    #[test]
+    fn test_idle_close_skips_checkpoint() {
+        let path = fresh("test_idle_close_skips_checkpoint");
+        let ids = |path: &Path| {
+            wal::segments(&wal_dir(path))
+                .unwrap()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect::<Vec<_>>()
+        };
+        let file: File<Block> = File::make(&path, 256).unwrap();
+        file.remove(b"missing").unwrap();
+        drop(file);
+        assert_eq!(ids(&path), vec![1]);
+
+        let file: File<Block> = File::open(&path).unwrap();
+        file.lookup(b"a").unwrap();
+        drop(file);
+        assert_eq!(ids(&path), vec![2], "open starts a segment, close keeps it");
+        cleanup(&path);
+    }
+
+    /// `dump` on a tree bigger than the cache must not deadlock on a miss.
+    #[test]
+    fn test_dump_with_small_cache() {
+        let path = fresh("test_dump_with_small_cache");
+        let options = Options {
+            cache_bytes: 8 * 256,
+            ..Options::default()
+        };
+        let file = Arc::new(File::<Block>::make_with(&path, 256, options).unwrap());
+        let mut model = Model::new();
+        workload(&file, &mut model, 9, 300);
+        file.sync().unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        {
+            let file = file.clone();
+            std::thread::spawn(move || tx.send(file.dump().len()).unwrap());
+        }
+        let len = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("dump deadlocked");
+        assert!(len > 0);
+        drop(Arc::try_unwrap(file).ok().unwrap());
         cleanup(&path);
     }
 }
