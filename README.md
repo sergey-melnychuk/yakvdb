@@ -90,7 +90,16 @@ PLAN:
     hardware one; the second was checkpointing often: the dirty limit defaults
     to half the cache, so the working set fits between two checkpoints
 - [ ] crash tests that kill a real process (step 6 of doc/wal.md)
-- [ ] unreferenced overflow regions left by a crash are skipped, never reused
+- [x] open without scanning the file
+  - `page_count` is kept in memory and in the header, and new pages
+    (overflow regions: `multiplier` pages at once) are allocated after it;
+    checkpoints record it with the free list, in the log and in a trailer
+    after the last page, so `open` reads the free list instead of loading
+    every page: 551 MB file, 185 ms -> 6 ms
+  - pages written by writes a crash lost lie past the checkpoint's page
+    count, so recovery reuses them instead of leaking them
+  - a leaf emptied by a remove goes back to the free list; it used to be
+    dropped from its parent and found again only by that scan
 - [x] sweep `page(id).unwrap()`/`page_mut(id).unwrap()` into typed errors
   - a corrupted file should fail one operation, not the process
   - `try_page`/`try_page_mut` return `Error::Tree` instead of `None`, and all

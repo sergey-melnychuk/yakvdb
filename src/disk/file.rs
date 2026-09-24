@@ -17,7 +17,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use parking_lot::{
     MappedRwLockReadGuard, MappedRwLockWriteGuard, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard,
@@ -58,6 +58,15 @@ pub struct File<P: Page> {
     /// to the free list only once a checkpoint has written a tree that no
     /// longer refers to them: until then the file on disk still does.
     pending_free: Mutex<Vec<u32>>,
+    /// Pages in the file, the root and every page of every overflow region
+    /// included: the next page allocated is `page_count + 1`.
+    page_count: AtomicU32,
+    /// The header's page count and the free-list trailer on disk describe the
+    /// file as it is, so that the next open need not scan it.
+    layout_saved: AtomicBool,
+    /// Test hook: set when `open` had to scan the file for free pages.
+    #[cfg(test)]
+    scanned: AtomicBool,
     /// Pages were written straight to the file (new pages, overflow regions)
     /// since the last checkpoint, which has to make them durable first.
     file_dirty: AtomicBool,
@@ -97,6 +106,12 @@ pub const DEFAULT_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_DEPTH: usize = 64;
 
 const HEAD: usize = MAGIC.len() + size_of::<Head>();
+/// Where the header keeps the page count: after the magic and the page size.
+const PAGE_COUNT_OFFSET: usize = MAGIC.len() + 4;
+
+/// Starts the free-list trailer a checkpoint writes after the last page:
+/// `[magic][count: u32][count page ids: u32][crc: u32]`, the CRC over all before it.
+const FREE_MAGIC: &[u8] = b"YAKFREE1";
 const ROOT: u32 = 1;
 
 /// How many times `page`/`page_mut` reload a page that was evicted between
@@ -142,6 +157,7 @@ impl<P: Page> File<P> {
     }
 
     fn new(file: fs::File, head: Head, options: &Options, wal: Wal) -> Self {
+        let page_count = head.page_count;
         let page_bytes = head.page_bytes as usize;
         let pages = (options.cache_bytes / page_bytes).max(1);
         // Dirty pages are pinned in the cache until a checkpoint: keep them to
@@ -169,6 +185,10 @@ impl<P: Page> File<P> {
             _flusher: flusher,
             pending_free: Mutex::new(Vec::new()),
             file_dirty: AtomicBool::new(false),
+            page_count: AtomicU32::new(page_count),
+            layout_saved: AtomicBool::new(true),
+            #[cfg(test)]
+            scanned: AtomicBool::new(false),
             checkpointed_lsn,
             max_dirty,
             checkpoint_wal_bytes: options.checkpoint_wal_bytes,
@@ -303,9 +323,33 @@ impl<P: Page> File<P> {
 
         let _ = this.cache.write().put(ROOT, root, |_| false);
 
-        let total_pages = (len - HEAD) as u32 / this.head.page_bytes;
-        debug!("Processing pages for compaction: {total_pages}");
-        if this.head.page_count < total_pages {
+        // Which pages the file has and which are free: from the checkpoint
+        // recovery just redid, or from the header and the free-list trailer a
+        // checkpoint left, or else -- an older file, or a crash that made the
+        // trailer stale -- by scanning every page.
+        let layout = match plan.layout.clone() {
+            Some(layout) => {
+                // after redoing a checkpoint's images, the header and trailer
+                // on disk may predate it
+                if !plan.images.is_empty() {
+                    this.layout_saved.store(false, Ordering::Relaxed);
+                }
+                Some(layout)
+            }
+            None => read_layout(&this.file.read(), &this.head, len)
+                .map(|free| (this.head.page_count, free)),
+        };
+        if let Some((page_count, free)) = layout {
+            debug!("Layout: {page_count} pages, {} free", free.len());
+            this.page_count.store(page_count, Ordering::Relaxed);
+            this.empty.write().extend(free.into_iter().map(Reverse));
+        } else {
+            let total_pages = (len - HEAD) as u32 / this.head.page_bytes;
+            debug!("Scanning {total_pages} pages for free ones");
+            this.page_count.store(total_pages, Ordering::Relaxed);
+            this.layout_saved.store(false, Ordering::Relaxed);
+            #[cfg(test)]
+            this.scanned.store(true, Ordering::Relaxed);
             let mut id = 2u32;
             while id <= total_pages {
                 // Check if this is an overflow leader by reading the 16-byte header
@@ -335,8 +379,9 @@ impl<P: Page> File<P> {
         }
 
         // Recovery, second half: replay what was committed after that
-        // checkpoint, then checkpoint it, which also clears the old segments.
-        if plan.ops.is_empty() {
+        // checkpoint, then checkpoint it, which also clears the old segments
+        // and saves the layout if it was not.
+        if plan.ops.is_empty() && this.layout_saved.load(Ordering::Relaxed) {
             for (_, path) in &segments {
                 fs::remove_file(path)?;
             }
@@ -423,6 +468,11 @@ impl<P: Page> File<P> {
         self.head.page_bytes
     }
 
+    /// Pages in the file, the root and the pages of overflow regions included.
+    pub fn page_count(&self) -> u32 {
+        self.page_count.load(Ordering::Relaxed)
+    }
+
     /// A copy of the page with the given `id`, or `None` if it cannot be read.
     ///
     /// Inspection tools -- the `yak` CLI -- need to look at raw pages. Handing
@@ -471,11 +521,11 @@ impl<P: Page> File<P> {
     /// Allocate `multiplier` contiguous pages at the end of the file.
     /// Returns the starting page id.
     fn alloc_overflow(&self, multiplier: u32) -> Result<u32> {
-        let len = self.file.read().metadata()?.len();
-        let id = 1 + ((len - HEAD as u64) / self.head.page_bytes as u64) as u32;
+        // one id per page of the region: the next allocation starts after it
+        let id = self.page_count.fetch_add(multiplier, Ordering::Relaxed) + 1;
         let region_bytes = multiplier as usize * self.head.page_bytes as usize;
         let zeroes = vec![0u8; region_bytes];
-        self.write_all_at(len, &zeroes)?;
+        self.write_all_at(self.offset(id) as u64, &zeroes)?;
         self.file_dirty.store(true, Ordering::Relaxed);
         debug!("alloc_overflow: id={id} multiplier={multiplier}");
         Ok(id)
@@ -653,8 +703,15 @@ impl<P: Page> File<P> {
         if stale {
             let mut parent = self.try_page_mut(parent_id)?;
             parent.remove(idx);
-            if let Some(max) = max {
-                parent.put_ref(&max, page_id);
+            match max {
+                Some(max) => {
+                    parent.put_ref(&max, page_id);
+                }
+                // nothing refers to the empty page any more: reuse it
+                None => {
+                    drop(parent);
+                    self.free_id(page_id);
+                }
             }
         }
         Ok(())
@@ -759,7 +816,8 @@ impl<P: Page> File<P> {
         let idle = lsn == self.checkpointed_lsn.load(Ordering::Relaxed)
             && self.dirty.read().is_empty()
             && self.pending_free.lock().is_empty()
-            && !self.file_dirty.load(Ordering::Relaxed);
+            && !self.file_dirty.load(Ordering::Relaxed)
+            && self.layout_saved.load(Ordering::Relaxed);
         if idle {
             return Ok(());
         }
@@ -786,9 +844,22 @@ impl<P: Page> File<P> {
                 bytes: page.as_ref(),
             });
         }
+        // The file once this checkpoint is done: its page count, and the free
+        // pages, the ones freed since the last checkpoint included.
+        let page_count = self.page_count.load(Ordering::Relaxed);
+        let mut free = self
+            .empty
+            .read()
+            .iter()
+            .map(|Reverse(id)| *id)
+            .chain(freed.iter().copied())
+            .collect::<Vec<_>>();
+        free.sort_unstable();
         self.wal.append(&Record::Checkpoint {
             lsn,
             pages: ids.len() as u32,
+            page_count,
+            free: free.clone(),
         });
         self.wal.flush_all(true)?;
 
@@ -803,6 +874,17 @@ impl<P: Page> File<P> {
         for &id in &freed {
             self.save(&P::create(id, self.head.page_bytes))?;
         }
+        // The header and the free-list trailer after the last page, so that
+        // the next open needs no scan. Whatever lies past the trailer -- pages
+        // of a crash's lost writes -- is beyond `page_count`: cut it off.
+        {
+            let file = self.file.read();
+            write_at(&file, PAGE_COUNT_OFFSET as u64, &page_count.to_be_bytes())?;
+            let end = HEAD as u64 + page_count as u64 * self.head.page_bytes as u64;
+            let trailer = encode_trailer(&free);
+            write_at(&file, end, &trailer)?;
+            file.set_len(end + trailer.len() as u64)?;
+        }
         self.file.read().sync_data()?;
 
         self.dirty.write().clear();
@@ -810,6 +892,17 @@ impl<P: Page> File<P> {
             self.free_id(id);
         }
         self.wal.rotate()?;
+        // Open the new segment with the layout, as a checkpoint without page
+        // images. The trailer tells a clean open the same, but the first page
+        // allocated after this overwrites it: recovery reads it from here.
+        self.wal.append(&Record::Checkpoint {
+            lsn,
+            pages: 0,
+            page_count,
+            free,
+        });
+        self.wal.flush_all(true)?;
+        self.layout_saved.store(true, Ordering::Relaxed);
         self.checkpointed_lsn.store(lsn, Ordering::Relaxed);
         Ok(())
     }
@@ -1394,10 +1487,9 @@ impl<P: Page> Tree<P> for File<P> {
             return Ok(id);
         }
 
-        let len = self.file.read().metadata()?.len();
-        let id = 1 + ((len - HEAD as u64) / self.head.page_bytes as u64) as u32;
+        let id = self.page_count.fetch_add(1, Ordering::Relaxed) + 1;
         let page = P::create(id, self.head.page_bytes);
-        self.write_all_at(len, page.as_ref())?;
+        self.write_all_at(self.offset(id) as u64, page.as_ref())?;
         self.file_dirty.store(true, Ordering::Relaxed);
 
         Ok(id)
@@ -1738,6 +1830,62 @@ fn lock(file: &fs::File, path: &Path) -> io::Result<()> {
         ),
         fs::TryLockError::Error(e) => e,
     })
+}
+
+fn encode_trailer(free: &[u32]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(FREE_MAGIC.len() + 8 + free.len() * 4);
+    buf.extend_from_slice(FREE_MAGIC);
+    buf.extend_from_slice(&(free.len() as u32).to_be_bytes());
+    for id in free {
+        buf.extend_from_slice(&id.to_be_bytes());
+    }
+    let crc = wal::crc32c(&buf);
+    buf.extend_from_slice(&crc.to_be_bytes());
+    buf
+}
+
+/// The free pages recorded by the last checkpoint, if the file is exactly as
+/// it left it: `page_count` pages, then an intact trailer -- or no trailer at
+/// all and no free pages, as `make` leaves a file. Anything else, and the
+/// caller scans.
+fn read_layout(file: &fs::File, head: &Head, len: usize) -> Option<Vec<u32>> {
+    let end = HEAD + head.page_count as usize * head.page_bytes as usize;
+    if len == end {
+        return Some(vec![]);
+    }
+    let mut buf = vec![0u8; len.checked_sub(end)?];
+    if buf.len() < FREE_MAGIC.len() + 8 {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(&mut buf, end as u64).ok()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let mut file = file;
+        file.seek(SeekFrom::Start(end as u64)).ok()?;
+        file.read_exact(&mut buf).ok()?;
+    }
+    let (body, crc) = buf.split_at(buf.len() - 4);
+    if !body.starts_with(FREE_MAGIC) || wal::crc32c(body).to_be_bytes() != crc {
+        return None;
+    }
+    let body = &body[FREE_MAGIC.len()..];
+    let count = u32::from_be_bytes(body[..4].try_into().ok()?) as usize;
+    let ids = &body[4..];
+    if ids.len() != count * 4 {
+        return None;
+    }
+    let free = ids
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|id| u32::from_be_bytes(*id))
+        .collect::<Vec<_>>();
+    let valid = free.iter().all(|&id| id > 1 && id <= head.page_count);
+    valid.then_some(free)
 }
 
 /// What a commit waits for, from the options.
@@ -3886,8 +4034,10 @@ mod tests {
         let segments = wal::segments(&wal_dir(&path)).unwrap();
         let (_, segment) = segments.last().unwrap();
         let log = fs::read(segment).unwrap();
-        assert_eq!(wal::frames(&log).count(), 1);
-        fs::write(segment, b"").unwrap();
+        // the checkpoint's layout frame, then the replacement's record
+        assert_eq!(wal::frames(&log).count(), 2);
+        let (_, first) = wal::decode(&log).unwrap();
+        fs::write(segment, &log[..first]).unwrap();
 
         let file: File<Block> = File::open(&path).unwrap();
         assert_eq!(file.lookup(b"big").unwrap(), Some(old));
@@ -4229,6 +4379,151 @@ mod tests {
         let file: File<Block> = File::open(&path).unwrap();
         assert_eq!(keys_present(&file, 10).len(), 10);
         assert_eq!(file.lookup(b"failed").unwrap(), None);
+        drop(file);
+        cleanup(&path);
+    }
+
+    // ---- page count and free-list trailer ----
+
+    fn free_pages(file: &File<Block>) -> Vec<u32> {
+        let mut free = file
+            .empty
+            .read()
+            .iter()
+            .map(|Reverse(id)| *id)
+            .collect::<Vec<_>>();
+        free.extend(file.pending_free.lock().iter().copied());
+        free.sort_unstable();
+        free
+    }
+
+    /// Big values (overflow regions of several pages) and enough removes to
+    /// free pages: a close must leave a file the next open reads without a scan.
+    #[test]
+    fn test_open_reads_free_list_without_scan() {
+        let path = fresh("test_open_reads_free_list_without_scan");
+        let mut model = Model::new();
+        let (page_count, free) = {
+            let file: File<Block> = File::make(&path, 256).unwrap();
+            workload(&file, &mut model, 10, 3_000);
+            file.sync().unwrap();
+            (file.page_count(), free_pages(&file))
+        };
+        assert!(!free.is_empty(), "the workload should leave free pages");
+
+        let file: File<Block> = File::open(&path).unwrap();
+        assert!(
+            !file.scanned.load(Ordering::Relaxed),
+            "open scanned the file"
+        );
+        assert_eq!(file.page_count(), page_count);
+        assert_eq!(free_pages(&file), free);
+        let len = fs::metadata(&path).unwrap().len() as usize;
+        assert_eq!(
+            len,
+            HEAD + page_count as usize * 256 + encode_trailer(&free).len(),
+            "the file ends right after the trailer"
+        );
+
+        // a cleanly closed file needs no log: copied alone, it opens the same
+        drop(file);
+        fs::remove_dir_all(wal_dir(&path)).unwrap();
+        let file: File<Block> = File::open(&path).unwrap();
+        assert!(
+            !file.scanned.load(Ordering::Relaxed),
+            "open without the log scanned"
+        );
+        assert_eq!(free_pages(&file), free);
+
+        // pages keep coming from the free list and after `page_count`, never
+        // from the middle of an overflow region
+        workload(&file, &mut model, 11, 3_000);
+        drop(file);
+        let file: File<Block> = File::open(&path).unwrap();
+        assert!(!file.scanned.load(Ordering::Relaxed));
+        assert_matches(&file, &model);
+        drop(file);
+        cleanup(&path);
+    }
+
+    /// A file from before the trailer (or with a broken one) is scanned once,
+    /// and the next close saves the layout.
+    #[test]
+    fn test_file_without_trailer_is_scanned_once() {
+        let path = fresh("test_file_without_trailer_is_scanned_once");
+        let mut model = Model::new();
+        let free = {
+            let file: File<Block> = File::make(&path, 256).unwrap();
+            workload(&file, &mut model, 12, 2_000);
+            file.sync().unwrap();
+            free_pages(&file)
+        };
+        // as an older version would have left it: header count 1, no trailer
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let len = HEAD as u64 + {
+            let reopened: File<Block> = File::open(&path).unwrap();
+            reopened.page_count() as u64 * 256
+        };
+        write_at(&file, PAGE_COUNT_OFFSET as u64, &1u32.to_be_bytes()).unwrap();
+        file.set_len(len).unwrap();
+        drop(file);
+
+        let file: File<Block> = File::open(&path).unwrap();
+        assert!(file.scanned.load(Ordering::Relaxed));
+        assert_eq!(
+            free_pages(&file),
+            free,
+            "the scan finds the same free pages"
+        );
+        assert_matches(&file, &model);
+        drop(file);
+
+        let file: File<Block> = File::open(&path).unwrap();
+        assert!(
+            !file.scanned.load(Ordering::Relaxed),
+            "the layout was saved"
+        );
+        drop(file);
+        cleanup(&path);
+    }
+
+    /// After a crash, pages allocated since the last checkpoint lie beyond its
+    /// page count: recovery reuses them instead of leaking them, and the next
+    /// checkpoint cuts off what is left.
+    #[test]
+    fn test_crash_leaves_no_pages_behind() {
+        let path = fresh("test_crash_leaves_no_pages_behind");
+        let mut model = Model::new();
+        let (checkpointed, at_crash) = {
+            let file: File<Block> = File::make(&path, 256).unwrap();
+            workload(&file, &mut model, 13, 500);
+            file.sync().unwrap();
+            let checkpointed = file.page_count();
+            // big values only: new overflow regions after the checkpoint
+            for i in 0..20u32 {
+                let key = format!("big-{i}").into_bytes();
+                let val = vec![i as u8; 2_000];
+                file.insert(&key, &val).unwrap();
+                model.insert(key, val);
+            }
+            let at_crash = file.page_count();
+            assert!(at_crash > checkpointed + 100);
+            crash(file);
+            (checkpointed, at_crash)
+        };
+        let file: File<Block> = File::open(&path).unwrap();
+        assert!(
+            !file.scanned.load(Ordering::Relaxed),
+            "recovery scanned the file"
+        );
+        assert_matches(&file, &model);
+        // replaying allocates exactly what the lost writes had: from the same
+        // page count and free list, the pages past the checkpoint are reused
+        assert_eq!(
+            file.page_count(),
+            at_crash,
+            "{checkpointed} pages at the checkpoint"
+        );
         drop(file);
         cleanup(&path);
     }

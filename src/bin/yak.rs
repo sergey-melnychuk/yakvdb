@@ -43,15 +43,8 @@ fn main() {
         std::process::exit(1);
     };
 
-    // Calculate total pages from file size
-    let Ok(file_meta) = std::fs::metadata(path) else {
-        eprintln!("Failed to read file metadata: {}", path.display());
-        std::process::exit(1);
-    };
-    let file_size = file_meta.len();
-    let head_size = 16; // MAGIC(8) + HEAD(8)
-    let page_size = file.page_size() as u64;
-    let page_count = ((file_size - head_size) / page_size) as u32;
+    let page_size = file.page_size();
+    let page_count = file.page_count();
 
     println!("YAK CLI started. Type 'help' for commands. Type 'exit' to quit.");
     println!("Page size: {page_size} bytes. Total pages: {page_count}.");

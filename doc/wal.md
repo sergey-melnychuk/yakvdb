@@ -320,11 +320,19 @@ What the implementation does differently from the design above, or adds:
   deletes the old segments. With nothing to replay it deletes them directly.
 - **`make` deletes a stale log.** A `<path>.wal` directory without its
   database belongs to one that was deleted, and would be replayed onto the new one.
-- **Known leak.** A crash after an overflow region was written, but before a
-  checkpoint made the tree refer to it, leaves the region unreferenced in the
-  file. `open` recognises it as an overflow region, so it is skipped, not
-  corrupted, but its pages are not reused. The same goes for freed overflow
-  pages whose checkpoint never ran.
+- **Page count and free list.** The file's page count lives in memory and in
+  the header: new pages (and overflow regions, `multiplier` pages at a time)
+  are allocated after it rather than at the end of the file. Each checkpoint
+  records the page count and the free pages in its CHECKPOINT record, writes
+  them to the header and to a checksummed trailer after the last page, cuts
+  the file there, and opens the new segment with a CHECKPOINT carrying the
+  same layout and no page images. Recovery takes the layout of the checkpoint
+  it redoes (or of that first frame); a clean open reads the trailer, so it
+  no longer scans the file -- 6 ms instead of 185 ms for a 551 MB file. Files
+  without a valid trailer (older ones) are scanned once and then saved.
+  Pages allocated after the last checkpoint by writes a crash lost lie past
+  its page count, so replaying reuses them: the leak of unreferenced overflow
+  regions this design used to accept is gone.
 - **Tests.** Besides the unit tests of the frame format and recovery plan:
   crash recovery by dropping a `File` without its closing checkpoint
   (`mem::forget`), a crash at several points during a checkpoint's in-place

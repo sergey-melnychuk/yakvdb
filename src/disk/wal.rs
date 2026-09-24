@@ -62,10 +62,14 @@ pub(crate) enum Record<'a> {
         bytes: &'a [u8],
     },
     /// Closes a checkpoint: the `pages` frames before it are its page images,
-    /// and together they hold the tree as of `lsn`.
+    /// and together they hold the tree as of `lsn`. `page_count` and `free`
+    /// describe the file that tree lives in: how many pages it has, and which
+    /// of them are free for reuse.
     Checkpoint {
         lsn: u64,
         pages: u32,
+        page_count: u32,
+        free: Vec<u32>,
     },
 }
 
@@ -95,10 +99,20 @@ pub(crate) fn encode(buf: &mut Vec<u8>, lsn: u64, record: &Record<'_>) {
             put_u32(buf, *id);
             buf.extend_from_slice(bytes);
         }
-        Record::Checkpoint { lsn, pages } => {
+        Record::Checkpoint {
+            lsn,
+            pages,
+            page_count,
+            free,
+        } => {
             buf.push(CHECKPOINT);
             buf.extend_from_slice(&lsn.to_be_bytes());
             put_u32(buf, *pages);
+            put_u32(buf, *page_count);
+            put_u32(buf, free.len() as u32);
+            for id in free {
+                put_u32(buf, *id);
+            }
         }
     }
     let len = (buf.len() - start - 4) as u32;
@@ -158,10 +172,22 @@ pub(crate) fn decode(buf: &[u8]) -> Option<(Frame<'_>, usize)> {
                 bytes: r.take(r.0.len())?,
             }
         }
-        CHECKPOINT => Record::Checkpoint {
-            lsn: r.u64()?,
-            pages: r.u32()?,
-        },
+        CHECKPOINT => {
+            let lsn = r.u64()?;
+            let pages = r.u32()?;
+            let page_count = r.u32()?;
+            let count = r.u32()? as usize;
+            let mut free = Vec::with_capacity(count.min(r.0.len() / 4));
+            for _ in 0..count {
+                free.push(r.u32()?);
+            }
+            Record::Checkpoint {
+                lsn,
+                pages,
+                page_count,
+                free,
+            }
+        }
         kind => Record::Op(decode_op(kind, &mut r)?),
     };
     if !r.0.is_empty() {
@@ -241,7 +267,7 @@ fn put_u32(buf: &mut Vec<u8>, val: u32) {
 ///
 /// Every page image a checkpoint logs goes through this, so a byte-at-a-time
 /// table was the single biggest cost of a checkpoint.
-fn crc32c(data: &[u8]) -> u32 {
+pub(crate) fn crc32c(data: &[u8]) -> u32 {
     crc32c::crc32c(data)
 }
 
@@ -317,6 +343,9 @@ pub(crate) struct Plan<'a> {
     pub(crate) ops: Vec<Vec<Op<'a>>>,
     /// The highest LSN seen, so that new records continue after it.
     pub(crate) last_lsn: u64,
+    /// Page count and free pages of the file as of that checkpoint, if any:
+    /// they go with the images, and the header on disk may be older.
+    pub(crate) layout: Option<(u32, Vec<u32>)>,
 }
 
 /// Work out recovery from the contents of the segments, in segment order.
@@ -343,9 +372,16 @@ pub(crate) fn recovery_plan(segments: &[Vec<u8>]) -> Plan<'_> {
     let mut start = 0;
     let mut images = vec![];
     let mut checkpoint_lsn = 0;
+    let mut layout = None;
     for (idx, frame) in all.iter().enumerate() {
-        if let Record::Checkpoint { lsn, pages } = frame.record {
-            let pages = pages as usize;
+        if let Record::Checkpoint {
+            lsn,
+            pages,
+            page_count,
+            free,
+        } = &frame.record
+        {
+            let (lsn, pages) = (*lsn, *pages as usize);
             let complete = idx >= pages
                 && all[idx - pages..idx]
                     .iter()
@@ -360,6 +396,7 @@ pub(crate) fn recovery_plan(segments: &[Vec<u8>]) -> Plan<'_> {
                     .collect();
                 start = idx + 1;
                 checkpoint_lsn = lsn;
+                layout = Some((*page_count, free.clone()));
             }
         }
     }
@@ -379,6 +416,7 @@ pub(crate) fn recovery_plan(segments: &[Vec<u8>]) -> Plan<'_> {
         images,
         ops,
         last_lsn: all.iter().map(|frame| frame.lsn).max().unwrap_or(0),
+        layout,
     }
 }
 
@@ -707,6 +745,15 @@ pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    fn checkpoint(lsn: u64, pages: u32) -> Record<'static> {
+        Record::Checkpoint {
+            lsn,
+            pages,
+            page_count: 40 + lsn as u32,
+            free: vec![3, 5, 8],
+        }
+    }
+
     fn sample() -> Vec<(u64, Record<'static>)> {
         vec![
             (1, Record::Op(Op::Insert(b"key", b"value"))),
@@ -728,7 +775,7 @@ mod tests {
                     bytes: &[7u8; 256],
                 },
             ),
-            (7, Record::Checkpoint { lsn: 5, pages: 1 }),
+            (7, checkpoint(5, 1)),
         ]
     }
 
@@ -869,11 +916,11 @@ mod tests {
         let seg = encode_all(&[
             (1, insert(b"a")),
             (2, page(7)),
-            (3, Record::Checkpoint { lsn: 1, pages: 1 }),
+            (3, checkpoint(1, 1)),
             (4, insert(b"b")),
             (5, page(8)),
             (6, page(9)),
-            (7, Record::Checkpoint { lsn: 4, pages: 2 }),
+            (7, checkpoint(4, 2)),
             (8, insert(b"c")),
             (9, Record::Batch(vec![Op::Remove(b"b")])),
         ]);
@@ -887,6 +934,11 @@ mod tests {
             vec![vec![Op::Insert(b"c", b"v")], vec![Op::Remove(b"b")]]
         );
         assert_eq!(plan.last_lsn, 9);
+        assert_eq!(
+            plan.layout,
+            Some((44, vec![3, 5, 8])),
+            "the last checkpoint's"
+        );
     }
 
     /// A crash while a checkpoint appends its images leaves no CHECKPOINT:
@@ -895,18 +947,14 @@ mod tests {
     fn test_recovery_plan_ignores_incomplete_checkpoint() {
         let mut seg = encode_all(&[(1, insert(b"a")), (2, page(3)), (3, page(4))]);
         let whole = seg.len();
-        encode(&mut seg, 4, &Record::Checkpoint { lsn: 1, pages: 2 });
+        encode(&mut seg, 4, &checkpoint(1, 2));
         seg.truncate(whole + 5); // torn CHECKPOINT
         let plan = recovery_plan(std::slice::from_ref(&seg));
         assert!(plan.images.is_empty());
         assert_eq!(plan.ops, vec![vec![Op::Insert(b"a", b"v")]]);
 
         // a CHECKPOINT claiming more images than precede it is not complete either
-        let seg = encode_all(&[
-            (1, insert(b"a")),
-            (2, page(3)),
-            (3, Record::Checkpoint { lsn: 1, pages: 2 }),
-        ]);
+        let seg = encode_all(&[(1, insert(b"a")), (2, page(3)), (3, checkpoint(1, 2))]);
         let plan = recovery_plan(std::slice::from_ref(&seg));
         assert!(plan.images.is_empty());
         assert_eq!(plan.ops, vec![vec![Op::Insert(b"a", b"v")]]);
